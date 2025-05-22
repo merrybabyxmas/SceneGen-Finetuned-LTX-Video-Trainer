@@ -300,6 +300,35 @@ class HubConfig(ConfigBaseModel):
         return self
 
 
+class WandbConfig(ConfigBaseModel):
+    """Configuration for Weights & Biases logging"""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable W&B logging",
+    )
+
+    project: str = Field(
+        default="ltxv-trainer",
+        description="W&B project name",
+    )
+
+    entity: str | None = Field(
+        default=None,
+        description="W&B username or team",
+    )
+
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Tags to add to the W&B run",
+    )
+
+    log_validation_videos: bool = Field(
+        default=True,
+        description="Whether to log validation videos to W&B",
+    )
+
+
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
@@ -328,6 +357,7 @@ class LtxvTrainerConfig(ConfigBaseModel):
     checkpoints: CheckpointsConfig = Field(default_factory=CheckpointsConfig)
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
+    wandb: WandbConfig = Field(default_factory=WandbConfig)
 
     # General configuration
     seed: int = Field(

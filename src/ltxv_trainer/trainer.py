@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import rich
 import torch
+import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers.utils import export_to_video
@@ -105,7 +106,48 @@ class LtxvTrainer:
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
+        self._init_wandb()
         self._training_strategy = get_training_strategy(self._config.conditioning)
+
+    def _init_wandb(self) -> None:
+        """Initialize Weights & Biases run."""
+        if not self._config.wandb.enabled or not IS_MAIN_PROCESS:
+            self._wandb_run = None
+            return
+
+        wandb_config = self._config.wandb
+        run = wandb.init(
+            project=wandb_config.project,
+            entity=wandb_config.entity,
+            name=Path(self._config.output_dir).name,
+            tags=wandb_config.tags,
+            config=self._config.model_dump(),
+        )
+        self._wandb_run = run
+
+    def _log_metrics(self, metrics: dict[str, float]) -> None:
+        """Log metrics to Weights & Biases."""
+        if self._wandb_run is not None:
+            self._wandb_run.log(metrics)
+
+    def _log_validation_videos(self, video_paths: list[Path], prompts: list[str]) -> None:
+        """Log validation videos to Weights & Biases."""
+        if not self._config.wandb.log_validation_videos or self._wandb_run is None:
+            return
+
+        # Create lists of videos with their captions
+        validation_videos = [
+            wandb.Video(str(video_path), caption=prompt)
+            for video_path, prompt in zip(video_paths, prompts, strict=False)
+        ]
+
+        # Log all videos at once
+        self._wandb_run.log(
+            {
+                "validation_videos": validation_videos,
+            },
+            step=self._global_step,
+        )
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -243,6 +285,8 @@ class LtxvTrainer:
                         and IS_MAIN_PROCESS
                     ):
                         sampled_videos_paths = self._sample_videos(sample_progress)
+                        if sampled_videos_paths and self._config.wandb.log_validation_videos:
+                            self._log_validation_videos(sampled_videos_paths, cfg.validation.prompts)
 
                     # Save checkpoint if needed
                     if (
@@ -282,6 +326,17 @@ class LtxvTrainer:
                             step_time=step_time,
                             total_time=total_time,
                         )
+
+                        # Log metrics to W&B
+                        self._log_metrics(
+                            {
+                                "train/loss": loss.item(),
+                                "train/learning_rate": current_lr,
+                                "train/step_time": step_time,
+                                "train/global_step": self._global_step,
+                            }
+                        )
+
                         if disable_progress_bars and self._global_step % 20 == 0:
                             logger.info(
                                 f"Step {self._global_step}/{cfg.optimization.steps} - "
@@ -331,12 +386,30 @@ class LtxvTrainer:
                 to_comfy=True,
                 output_path=str(comfy_path),
             )
+
+            # Log the training statistics
+            self._log_training_stats(stats)
+
             # Upload artifacts to hub if enabled
             if cfg.hub.push_to_hub:
                 push_to_hub(saved_path, comfy_path, sampled_videos_paths, self._config)
 
-            # Log the training statistics
-            self._log_training_stats(stats)
+            if cfg.hub.push_to_hub:
+                push_to_hub(saved_path, sampled_videos_paths, self._config)
+
+            # Log final stats to W&B
+            if self._wandb_run is not None:
+                self._log_metrics(
+                    {
+                        "stats/total_time_minutes": stats.total_time_seconds / 60,
+                        "stats/training_time_minutes": stats.training_time / 60,
+                        "stats/compilation_time_seconds": stats.compilation_time_seconds,
+                        "stats/steps_per_second": stats.steps_per_second,
+                        "stats/samples_per_second": stats.samples_per_second,
+                        "stats/peak_gpu_memory_gb": stats.peak_gpu_memory_gb,
+                    }
+                )
+                self._wandb_run.finish()
 
         self._accelerator.end_training()
 

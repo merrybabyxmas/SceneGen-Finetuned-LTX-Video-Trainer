@@ -13,6 +13,7 @@ dependencies = [
     "bitsandbytes >=0.45.2; sys_platform == 'linux'",
     "decord >=0.6.0; sys_platform == 'linux'",
     "diffusers>=0.32.1",
+    "gradio==5.33.0",
     "imageio>=2.37.0",
     "imageio-ffmpeg>=0.6.0",
     "opencv-python>=4.11.0.86",
@@ -30,7 +31,7 @@ dependencies = [
     "torch>=2.6.0",
     "torchvision>=0.21.0",
     "typer>=0.15.1",
-    "gradio==5.33.0",
+    "wandb>=0.19.11",
 ]
 
 [dependency-groups]

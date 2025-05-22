@@ -76,6 +76,14 @@ hub:
   push_to_hub: false # Whether to push the model weights to the Hugging Face Hub
   hub_model_id: null # Hugging Face Hub repository ID (e.g., 'username/repo-name'). Must be provided if `push_to_hub` is set to True
 
+# W&B configuration
+wandb:
+  enabled: false  # Set to true to enable W&B logging
+  project: "ltxv-trainer"
+  entity: null  # Your W&B username or team
+  tags: []
+  log_validation_videos: true
+
 # General configuration
 seed: 42
 output_dir: "outputs/squish_lora_13b"
