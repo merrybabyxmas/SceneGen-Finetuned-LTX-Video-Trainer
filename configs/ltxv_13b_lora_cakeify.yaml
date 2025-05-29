@@ -17,6 +17,11 @@ lora:
     - "to_v"
     - "to_out.0"
 
+# Conditioning configuration
+conditioning:
+  mode: "none" # Options: "none", "reference_video"
+  first_frame_conditioning_p: 0.5
+
 # Optimization configuration
 optimization:
   learning_rate: 2e-4
@@ -28,7 +33,6 @@ optimization:
   scheduler_type: "linear" # Options: "constant", "linear", "cosine", "cosine_with_restarts", "polynomial"
   scheduler_params: {}
   enable_gradient_checkpointing: true
-  first_frame_conditioning_p: 0.5
 
 # Acceleration optimization
 acceleration:

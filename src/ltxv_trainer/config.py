@@ -71,6 +71,27 @@ class LoraConfig(ConfigBaseModel):
     )
 
 
+class ConditioningConfig(ConfigBaseModel):
+    """Configuration for conditioning during training"""
+
+    mode: Literal["none", "reference_video"] = Field(
+        default="none",
+        description="Type of conditioning to use during training",
+    )
+
+    first_frame_conditioning_p: float = Field(
+        default=0.1,
+        description="Probability of conditioning on the first frame during training",
+        ge=0.0,
+        le=1.0,
+    )
+
+    reference_latents_dir: str = Field(
+        default="ref_latents",
+        description="Directory name for latents of reference videos when using reference_video mode",
+    )
+
+
 class OptimizationConfig(ConfigBaseModel):
     """Configuration for optimization parameters"""
 
@@ -123,13 +144,6 @@ class OptimizationConfig(ConfigBaseModel):
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",
-    )
-
-    first_frame_conditioning_p: float = Field(
-        default=0.1,
-        description="Probability of conditioning on the first frame during training",
-        ge=0.0,
-        le=1.0,
     )
 
 
@@ -313,6 +327,7 @@ class LtxvTrainerConfig(ConfigBaseModel):
     # Sub-configurations
     model: ModelConfig = Field(default_factory=ModelConfig)
     lora: LoraConfig | None = Field(default=None)
+    conditioning: ConditioningConfig = Field(default_factory=ConditioningConfig)
     optimization: OptimizationConfig = Field(default_factory=OptimizationConfig)
     acceleration: AccelerationConfig = Field(default_factory=AccelerationConfig)
     data: DataConfig = Field(default_factory=DataConfig)
@@ -338,3 +353,23 @@ class LtxvTrainerConfig(ConfigBaseModel):
     def expand_output_path(cls, v: str) -> str:
         """Expand user home directory in output path."""
         return str(Path(v).expanduser().resolve())
+
+    @model_validator(mode="after")
+    def validate_conditioning_compatibility(self) -> "LtxvTrainerConfig":
+        """Validate that conditioning and validation configurations are compatible."""
+
+        # Check that reference videos are provided when using reference_video conditioning
+        if self.conditioning.mode == "reference_video" and self.validation.reference_videos is None:
+            raise ValueError(
+                "reference_videos must be provided in validation config when conditioning.mode is 'reference_video'"
+            )
+
+        # Check that LoRA config is provided when training mode is lora
+        if self.model.training_mode == "lora" and self.lora is None:
+            raise ValueError("LoRA configuration must be provided when training_mode is 'lora'")
+
+        # Check that LoRA config is provided when using reference_video conditioning with LoRA training mode
+        if self.conditioning.mode == "reference_video" and self.model.training_mode != "lora":
+            raise ValueError("Training mode must be 'lora' when using reference_video conditioning")
+
+        return self

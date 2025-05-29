@@ -6,6 +6,11 @@ model:
   training_mode: "full" # Options: "lora" or "full"
   load_checkpoint: null # Path to checkpoint file or directory to resume from. If directory, latest checkpoint will be used.
 
+# Conditioning configuration
+conditioning:
+  mode: "none" # Options: "none", "reference_video"
+  first_frame_conditioning_p: 0.1
+
 # Optimization configuration
 optimization:
   learning_rate: 1e-5 # Lower learning rate for full fine-tuning
@@ -17,7 +22,6 @@ optimization:
   scheduler_type: "linear" # Options: "constant", "linear", "cosine", "cosine_with_restarts", "polynomial"
   scheduler_params: {}
   enable_gradient_checkpointing: false # Enable to save memory
-  first_frame_conditioning_p: 0.1
 
 # Acceleration optimization
 acceleration:
