@@ -745,6 +745,7 @@ class BucketSampler(Sampler):
                 continue
             if self.shuffle:
                 random.shuffle(bucket)
-                yield bucket
-                del self.buckets[fhw]
-                self.buckets[fhw] = []
+
+            yield bucket
+            del self.buckets[fhw]
+            self.buckets[fhw] = []
