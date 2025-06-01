@@ -34,6 +34,36 @@ def encode_prompt(
     return _encode_prompt_t5(tokenizer, text_encoder, prompt, device, dtype, max_sequence_length)
 
 
+def pack_latents(
+    latents: Tensor,
+    spatial_patch_size: int = 1,
+    temporal_patch_size: int = 1,
+) -> Tensor:
+    """Reshapes latents [B,C,F,H,W] into patches and flattens to sequence form [B,L,D].
+
+    Args:
+        latents: Input latent tensor
+        spatial_patch_size: Size of spatial patches
+        temporal_patch_size: Size of temporal patches
+
+    Returns:
+        Flattened sequence of patches
+    """
+    b, c, f, h, w = latents.shape
+    latents = latents.reshape(
+        b,
+        -1,
+        f // temporal_patch_size,
+        temporal_patch_size,
+        h // spatial_patch_size,
+        spatial_patch_size,
+        w // spatial_patch_size,
+        spatial_patch_size,
+    )
+    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+    return latents
+
+
 def encode_video(
     vae: AutoencoderKLLTXVideo,
     image_or_video: Tensor,
@@ -77,86 +107,6 @@ def encode_video(
     # Patchify and pack latents to a sequence expected by the transformer.
     latents = pack_latents(latents, patch_size, patch_size_t)
     return {"latents": latents, "num_frames": num_frames, "height": height, "width": width}
-
-
-def pack_latents(latents: Tensor, spatial_patch_size: int = 1, temporal_patch_size: int = 1) -> Tensor:
-    """Reshapes latents [B,C,F,H,W] into patches and flattens to sequence form [B,L,D].
-
-    Args:
-        latents: Input latent tensor
-        spatial_patch_size: Size of spatial patches
-        temporal_patch_size: Size of temporal patches
-
-    Returns:
-        Flattened sequence of patches
-    """
-    b, c, f, h, w = latents.shape
-    latents = latents.reshape(
-        b,
-        -1,
-        f // temporal_patch_size,
-        temporal_patch_size,
-        h // spatial_patch_size,
-        spatial_patch_size,
-        w // spatial_patch_size,
-        spatial_patch_size,
-    )
-    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-    return latents
-
-
-def _normalize_latents(
-    latents: Tensor,
-    mean: Tensor,
-    std: Tensor,
-) -> Tensor:
-    """Normalizes latents using mean and standard deviation across the channel dimension."""
-    mean = mean.view(1, -1, 1, 1, 1).repeat(latents.shape[0], 1, 1, 1, 1).to(latents.device, latents.dtype)
-    std = std.view(1, -1, 1, 1, 1).repeat(latents.shape[0], 1, 1, 1, 1).to(latents.device, latents.dtype)
-    latents = (latents - mean) / std
-    return latents
-
-
-def _encode_prompt_t5(
-    tokenizer: T5Tokenizer,
-    text_encoder: T5EncoderModel,
-    prompt: list[str],
-    device: torch.device,
-    dtype: torch.dtype,
-    max_sequence_length: int,
-) -> dict[str, Tensor]:
-    """Encodes text prompts using T5 tokenizer and encoder.
-
-    Args:
-        tokenizer: T5 tokenizer
-        text_encoder: T5 encoder model
-        prompt: List of text prompts
-        device: Target device
-        dtype: Target dtype
-        max_sequence_length: Maximum sequence length
-
-    Returns:
-        Dict containing prompt embeddings and attention mask
-    """
-    batch_size = len(prompt)
-
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    prompt_attention_mask = text_inputs.attention_mask
-    prompt_attention_mask = prompt_attention_mask.bool().to(device)
-
-    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-    prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
-
-    return {"prompt_embeds": prompt_embeds, "prompt_attention_mask": prompt_attention_mask}
 
 
 def decode_video(  # noqa: PLR0913
@@ -238,3 +188,139 @@ def decode_video(  # noqa: PLR0913
     video = video.to(dtype=dtype) if dtype is not None else video
 
     return video
+
+
+def get_rope_scale_factors(fps: float) -> list[float]:
+    """Get ROPE interpolation scale factors for video transformers.
+
+    Args:
+        fps: Frames per second
+
+    Returns:
+        List of scale factors [temporal_scale, spatial_scale, spatial_scale]
+    """
+    if fps <= 0:
+        raise ValueError("FPS must be a positive number.")
+
+    latent_frame_rate = fps / 8.0  # Temporal compression ratio
+    spatial_compression_ratio = 32.0  # Spatial compression ratio
+
+    return [
+        1.0 / latent_frame_rate,
+        spatial_compression_ratio,
+        spatial_compression_ratio,
+    ]
+
+
+def prepare_video_coordinates(
+    num_frames: int,
+    height: int,
+    width: int,
+    batch_size: int,
+    sequence_multiplier: int = 1,
+    device: torch.device | None = None,
+) -> Tensor:
+    """Prepare video coordinates for positional embeddings.
+
+    Args:
+        num_frames: Number of frames
+        height: Height in latent space
+        width: Width in latent space
+        batch_size: Batch size
+        sequence_multiplier: Multiplier for sequence length (2 for IC-LoRA)
+        device: Target device for tensors
+
+    Returns:
+        Video coordinates tensor of shape [batch_size, 3, sequence_length * sequence_multiplier]
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # Create base coordinate tensors
+    raw_frame_indices = torch.arange(num_frames, device=device, dtype=torch.float32)
+    raw_height_indices = torch.arange(height, device=device, dtype=torch.float32)
+    raw_width_indices = torch.arange(width, device=device, dtype=torch.float32)
+
+    # Create meshgrid for one video part
+    grid_f, grid_h, grid_w = torch.meshgrid(
+        raw_frame_indices,
+        raw_height_indices,
+        raw_width_indices,
+        indexing="ij",
+    )
+
+    # Flatten to (F*H*W, 3) for one video part
+    raw_coords_single_video = torch.stack(
+        [
+            grid_f.flatten(),
+            grid_h.flatten(),
+            grid_w.flatten(),
+        ],
+        dim=-1,
+    )
+
+    # Repeat for sequence multiplier (e.g., for IC-LoRA with reference + target)
+    if sequence_multiplier > 1:
+        coords_list = [raw_coords_single_video for _ in range(sequence_multiplier)]
+        raw_coords_combined = torch.cat(coords_list, dim=0)
+    else:
+        raw_coords_combined = raw_coords_single_video
+
+    # Expand for batch: (B, sequence_length * multiplier, 3)
+    raw_video_coords_batched = raw_coords_combined.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return raw_video_coords_batched
+
+
+def _normalize_latents(
+    latents: Tensor,
+    mean: Tensor,
+    std: Tensor,
+) -> Tensor:
+    """Normalizes latents using mean and standard deviation across the channel dimension."""
+    mean = mean.view(1, -1, 1, 1, 1).repeat(latents.shape[0], 1, 1, 1, 1).to(latents.device, latents.dtype)
+    std = std.view(1, -1, 1, 1, 1).repeat(latents.shape[0], 1, 1, 1, 1).to(latents.device, latents.dtype)
+    latents = (latents - mean) / std
+    return latents
+
+
+def _encode_prompt_t5(
+    tokenizer: T5Tokenizer,
+    text_encoder: T5EncoderModel,
+    prompt: list[str],
+    device: torch.device,
+    dtype: torch.dtype,
+    max_sequence_length: int,
+) -> dict[str, Tensor]:
+    """Encodes text prompts using T5 tokenizer and encoder.
+
+    Args:
+        tokenizer: T5 tokenizer
+        text_encoder: T5 encoder model
+        prompt: List of text prompts
+        device: Target device
+        dtype: Target dtype
+        max_sequence_length: Maximum sequence length
+
+    Returns:
+        Dict containing prompt embeddings and attention mask
+    """
+    batch_size = len(prompt)
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    prompt_attention_mask = text_inputs.attention_mask
+    prompt_attention_mask = prompt_attention_mask.bool().to(device)
+
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
+
+    return {"prompt_embeds": prompt_embeds, "prompt_attention_mask": prompt_attention_mask}
