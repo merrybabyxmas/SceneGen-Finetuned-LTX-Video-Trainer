@@ -52,6 +52,7 @@ from ltxv_trainer.model_loader import load_ltxv_components
 from ltxv_trainer.pipeline_ltx import LTXPipeline
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
+from ltxv_trainer.training_strategies import get_training_strategy
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb
 
 import decord  # Note: Decord must be imported after torch
@@ -107,6 +108,7 @@ class LtxvTrainer:
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
+        self._training_strategy = get_training_strategy(self._config.conditioning)
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -339,128 +341,23 @@ class LtxvTrainer:
         return saved_path, stats
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
-        """Perform a single training step."""
+        """Perform a single training step using the configured strategy."""
+        # Use strategy to prepare the training batch
+        training_batch = self._training_strategy.prepare_batch(batch, self._timestep_sampler)
 
-        # Get pre-encoded latents
-        latent_conditions = batch["latent_conditions"]
-        latent_conditions["latents"].squeeze_(1)
-        packed_latents = latent_conditions["latents"]
-        packed_ref_latents = batch["ref_latents"]["latents"].squeeze_(1)
+        # Use strategy to prepare model inputs
+        model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
-        # TODO: support batch sizes > 1 (requires a PR for the diffusers LTXImageToVideoPipeline)
-        # Batch sizes > 1 are partially supported, assuming num_frames, height, width, fps
-        # are the same for all batch elements.
-        latent_frames = latent_conditions["num_frames"][0].item()
-        latent_height = latent_conditions["height"][0].item()
-        latent_width = latent_conditions["width"][0].item()
+        # Run transformer forward pass
+        model_pred = self._transformer(**model_inputs)[0]
 
-        # Handle FPS with backward compatibility for old preprocessed datasets
-        fps = latent_conditions.get("fps", None)
-        if fps is not None and not torch.all(fps == fps[0]):
-            logger.warning(
-                f"Different FPS values found in the batch. Found: {fps.tolist()}, using the first one: {fps[0].item()}"
-            )
+        # Use strategy to compute loss
+        loss = self._training_strategy.compute_loss(model_pred, training_batch)
 
-        fps = fps[0].item() if fps is not None else 24
-
-        # Get pre-encoded text conditions
-        text_conditions = batch["text_conditions"]
-        prompt_embeds = text_conditions["prompt_embeds"]
-        prompt_attention_mask = text_conditions["prompt_attention_mask"]
-
-        # Create reference and target sequences
-        reference_latents = packed_ref_latents.clone()  # This will be the clean reference
-        target_latents = packed_latents.clone()  # This will be noised
-
-        # Create noise only for the target part
-        sigmas = self._timestep_sampler.sample_for(target_latents)
-        timesteps = torch.round(sigmas * 1000.0).long()
-        noise = torch.randn_like(target_latents, device=self._accelerator.device)
-        sigmas = sigmas.view(-1, 1, 1)
-
-        # Apply noise only to target part
-        noisy_target = (1 - sigmas) * target_latents + sigmas * noise
-        targets = noise - target_latents
-
-        # Concatenate reference and noisy target
-        # Shape: [batch, sequence_length*2, channels]
-        combined_latents = torch.cat([reference_latents, noisy_target], dim=1)
-
-        # --- Prepare video_coords with correct scaling ---
-        batch_size = packed_latents.shape[0]
-        # sequence_length_original = packed_latents.shape[1] # This is F*H*W for one video
-
-        # Create base coordinate tensors (indices 0 to N-1)
-        raw_frame_indices = torch.arange(latent_frames, device=self._accelerator.device, dtype=torch.float32)
-        raw_height_indices = torch.arange(latent_height, device=self._accelerator.device, dtype=torch.float32)
-        raw_width_indices = torch.arange(latent_width, device=self._accelerator.device, dtype=torch.float32)
-
-        # Create meshgrid for one video part
-        grid_f, grid_h, grid_w = torch.meshgrid(raw_frame_indices, raw_height_indices, raw_width_indices, indexing="ij")
-
-        # Flatten to (F*H*W, 3) for one video part
-        raw_coords_single_video = torch.stack(
-            [
-                grid_f.flatten(),
-                grid_h.flatten(),
-                grid_w.flatten(),
-            ],
-            dim=-1,
-        )
-
-        # Duplicate for reference and target parts, making it (2*F*H*W, 3)
-        raw_coords_both_videos = torch.cat([raw_coords_single_video, raw_coords_single_video], dim=0)
-
-        # Expand for batch: (B, 2*F*H*W, 3)
-        raw_video_coords_batched = raw_coords_both_videos.unsqueeze(0).expand(batch_size, -1, -1)
-
-        # Get rope_interpolation_scale factors
-        latent_frame_rate = fps / 8.0  # Ensure float division
-        spatial_compression_ratio = 32.0  # Ensure float
-        # This is the list [scale_f, scale_h, scale_w]
-        # The LTXVideoRotaryPosEmbed uses these factors to scale the raw coordinates
-        # when video_coords is None. We need to replicate this scaling.
-        rope_interpolation_scale_factors = [
-            1.0 / latent_frame_rate if latent_frame_rate > 0 else 1.0,
-            spatial_compression_ratio,
-            spatial_compression_ratio,
-        ]
-
-        # Apply pre-scaling to raw coordinates.
-        # The LTXVideoRotaryPosEmbed expects video_coords to be (B, 3, SeqLen) if provided.
-        # It then divides video_coords[:, 0] by base_num_frames, etc.
-        # So, the video_coords we pass should be: raw_coord * rope_interpolation_factor
-        # (B, 2*F*H*W)
-        prescaled_f = raw_video_coords_batched[..., 0] * rope_interpolation_scale_factors[0]
-        prescaled_h = raw_video_coords_batched[..., 1] * rope_interpolation_scale_factors[1]
-        prescaled_w = raw_video_coords_batched[..., 2] * rope_interpolation_scale_factors[2]
-
-        # Stack to (B, 3, 2*F*H*W) for the transformer's video_coords argument
-        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)
-        # --- End of video_coords preparation ---
-
-        model_pred = self._transformer(
-            hidden_states=combined_latents,
-            encoder_hidden_states=prompt_embeds,
-            timestep=timesteps,
-            encoder_attention_mask=prompt_attention_mask,
-            num_frames=latent_frames,
-            height=latent_height,
-            width=latent_width,
-            rope_interpolation_scale=rope_interpolation_scale_factors,
-            video_coords=video_coords,
-            return_dict=False,
-        )[0]
-
-        # The model prediction will be for the full sequence
-        # We only want to compute loss on the target (second) part
-        model_pred = model_pred[:, packed_latents.shape[1] :]  # Take only the second half
-
-        # Compute loss only on the target part
-        loss = (model_pred - targets).pow(2).mean()
         return loss
 
-    def _print_config(self, config: BaseModel) -> None:
+    @staticmethod
+    def _print_config(config: BaseModel) -> None:
         """Print the configuration as a nicely formatted table."""
         if not IS_MAIN_PROCESS:
             return
@@ -644,17 +541,13 @@ class LtxvTrainer:
             raise ValueError(f"Invalid checkpoint path: {checkpoint_path}. Must be a file or directory.")
 
     def _init_dataloader(self) -> None:
-        """Initialize the training data loader."""
-
+        """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
-            # Determine data sources based on conditioning mode
-            data_sources = {"latents": "latent_conditions", "conditions": "text_conditions"}
-
-            if self._config.conditioning.mode == "reference_video":
-                data_sources[self._config.conditioning.reference_latents_dir] = "ref_latents"
+            # Get data sources from the training strategy
+            data_sources = self._training_strategy.get_data_sources()
 
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
-            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples")
+            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         dataloader = DataLoader(
             self._dataset,
