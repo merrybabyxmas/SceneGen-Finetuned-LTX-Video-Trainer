@@ -38,6 +38,8 @@ def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
     Opens an image file, applies rotation (if it's set in metadata) and converts it
     to the sRGB color space respecting the original image color space .
     """
+    exif_colorspace_srgb = 1
+
     with Image.open(image_path) as img_raw:
         img = ImageOps.exif_transpose(img_raw)
 
@@ -52,14 +54,9 @@ def open_image_as_srgb(image_path: str | Path | io.BytesIO) -> PilImage:
         # Try fall back to checking EXIF
         exif_data = img.getexif()
         if exif_data is not None:
+            # Assume sRGB if no ICC profile and EXIF has no ColorSpace tag
             color_space_value = exif_data.get(ExifTags.Base.ColorSpace.value)
-            EXIF_COLORSPACE_SRGB = 1  # noqa: N806
-            if color_space_value is None:
-                logger.debug(
-                    f"Opening image file '{image_path}' that has no ICC profile and EXIF has no"
-                    " ColorSpace tag, assuming sRGB",
-                )
-            elif color_space_value != EXIF_COLORSPACE_SRGB:
+            if color_space_value is not None and color_space_value != exif_colorspace_srgb:
                 raise ValueError(
                     "Image has colorspace tag in EXIF but it isn't set to sRGB,"
                     " conversion is not supported."
