@@ -12,7 +12,6 @@ import rich
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import LTXImageToVideoPipeline
 from diffusers.utils import export_to_video
 from peft import LoraConfig, get_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
@@ -42,23 +41,21 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
-import torchvision.transforms as T  # noqa: N812
+from torchvision.transforms import functional as F  # noqa: N812
+
 
 from ltxv_trainer import logger
 from ltxv_trainer.config import LtxvTrainerConfig
 from ltxv_trainer.datasets import PrecomputedDataset
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
-from ltxv_trainer.pipeline_ltx import LTXPipeline
+from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
+
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
 from ltxv_trainer.training_strategies import get_training_strategy
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb
-
-import decord  # Note: Decord must be imported after torch
-
-# Configure decord to use PyTorch tensors
-decord.bridge.set_bridge("torch")
+from ltxv_trainer.video_utils import read_video
 
 
 # Disable irrelevant warnings from transformers
@@ -266,7 +263,7 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Update progress
-                    if IS_MAIN_PROCESS:
+                    if IS_MAIN_PROCESS and is_optimization_step:
                         current_lr = self._optimizer.param_groups[0]["lr"]
                         elapsed = time.time() - train_start_time
                         progress_percentage = self._global_step / cfg.optimization.steps
@@ -377,10 +374,16 @@ class LtxvTrainer:
                     rows.extend(flatten_config(value, full_field))
                 elif isinstance(value, (list, tuple, set)):
                     # Format list/tuple/set values
-                    rows.append((full_field, ", ".join(str(item) for item in value)))
+                    value_str = ", ".join(str(item) for item in value)
+                    if len(value_str) > 70:
+                        value_str = value_str[:70] + "..."
+                    rows.append((full_field, value_str))
                 else:
                     # Add simple values
-                    rows.append((full_field, str(value)))
+                    value_str = str(value)
+                    if len(value_str) > 70:
+                        value_str = value_str[:70] + "..."
+                    rows.append((full_field, value_str))
             return rows
 
         for param, value in flatten_config(config):
@@ -655,74 +658,6 @@ class LtxvTrainer:
             logger.info(f"Global batch size: {self._config.optimization.batch_size * self._accelerator.num_processes}")
 
     @torch.no_grad()
-    def _preprocess_reference_video(self, video_path: str | Path) -> torch.Tensor:
-        """Load and preprocess a reference video according to validation config.
-
-        Args:
-            video_path: Path to the video file
-
-        Returns:
-            Preprocessed video tensor in range [-1, 1] with shape [1, C, F, H, W]
-        """
-        # Load video using decord
-        video_reader = decord.VideoReader(str(video_path))
-
-        # Get target dimensions
-        target_width, target_height, target_frames = self._config.validation.video_dims
-
-        # Sample frames uniformly to match target frame count
-        total_frames = len(video_reader)
-        if total_frames < target_frames:
-            raise ValueError(f"Video has {total_frames} frames, but {target_frames} frames are required")
-
-        # Calculate frame indices to sample
-        indices = torch.linspace(0, total_frames - 1, target_frames).long()
-        frames = video_reader.get_batch(indices.tolist()).float() / 255.0  # [F, H, W, C]
-        frames = frames.permute(0, 3, 1, 2)  # [F, H, W, C] -> [F, C, H, W]
-
-        # Resize maintaining aspect ratio
-        current_height, current_width = frames.shape[2:]
-        aspect_ratio = current_width / current_height
-        target_aspect_ratio = target_width / target_height
-
-        if aspect_ratio > target_aspect_ratio:
-            # Width is relatively larger, resize based on height
-            resize_height = target_height
-            resize_width = int(resize_height * aspect_ratio)
-        else:
-            # Height is relatively larger, resize based on width
-            resize_width = target_width
-            resize_height = int(resize_width / aspect_ratio)
-
-        frames = T.functional.resize(
-            frames,
-            size=[resize_height, resize_width],
-            interpolation=T.InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-
-        # Center crop to target dimensions
-        crop_top = (resize_height - target_height) // 2
-        crop_left = (resize_width - target_width) // 2
-
-        frames = T.functional.crop(
-            frames,
-            top=crop_top,
-            left=crop_left,
-            height=target_height,
-            width=target_width,
-        )
-
-        # Normalize to [-1, 1]
-        frames = frames * 2.0 - 1.0
-
-        # Add batch dimension
-        frames = frames.unsqueeze(0)  # [1, F, C, H, W]
-        frames = frames.permute(0, 2, 1, 3, 4)  # [1, F, C, H, W] -> [1, C, F, H, W]
-
-        return frames
-
-    @torch.no_grad()
     @torch.compiler.set_stance("force_eager")
     def _sample_videos(self, progress: Progress) -> list[Path] | None:
         """Run validation by generating images from validation prompts."""
@@ -734,8 +669,7 @@ class LtxvTrainer:
 
         use_images = self._config.validation.images is not None
 
-        pipeline_class = LTXImageToVideoPipeline if use_images else LTXPipeline
-        pipeline = pipeline_class(
+        pipeline = LTXConditionPipeline(
             scheduler=deepcopy(self._scheduler),
             vae=self._accelerator.unwrap_model(self._vae),
             text_encoder=self._accelerator.unwrap_model(self._text_encoder),
@@ -769,18 +703,24 @@ class LtxvTrainer:
                 "num_frames": frames,
                 "num_inference_steps": self._config.validation.inference_steps,
                 "generator": generator,
+                "output_reference_comparison": True,
             }
 
+            # Load and add first frame image, if provided
             if use_images:
                 image_path = self._config.validation.images[j]
-                pipeline_inputs["image"] = open_image_as_srgb(image_path)
-            # Load and preprocess reference video if provided
-            elif self._config.validation.reference_videos is not None:
+                image = open_image_as_srgb(image_path)
+                if image.size != (height, width):
+                    # Resize and center crop the image to match the validation video dimensions
+                    image = F.resize(image, size=min(width, height))
+                    image = F.center_crop(image, output_size=(width, height))
+                pipeline_inputs["image"] = image
+
+            # Load and add reference video, if provided
+            if self._config.validation.reference_videos is not None:
                 video_path = self._config.validation.reference_videos[j]
-                # Preprocess the reference video
-                reference_video = self._preprocess_reference_video(video_path)
-                reference_video = reference_video.to(device=self._accelerator.device)
-                pipeline_inputs["reference_video"] = reference_video
+                ref_video = read_video(video_path, target_frames=frames)
+                pipeline_inputs["reference_video"] = ref_video
 
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
                 result = pipeline(**pipeline_inputs)
@@ -846,7 +786,7 @@ class LtxvTrainer:
             state_dict = get_peft_model_state_dict(unwrapped_model)
             # Adjust layer names to standard formatting.
             state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-            LTXPipeline.save_lora_weights(
+            LTXConditionPipeline.save_lora_weights(
                 save_directory=save_dir,
                 transformer_lora_layers=state_dict,
                 weight_name=filename,

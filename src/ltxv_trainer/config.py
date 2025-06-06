@@ -267,13 +267,6 @@ class ValidationConfig(ConfigBaseModel):
             raise ValueError(f"Number of reference videos ({len(v)}) must match number of prompts ({num_prompts})")
         return v
 
-    @model_validator(mode="after")
-    def validate_conditioning_inputs(self) -> "ValidationConfig":
-        """Validate that only one type of conditioning input is provided."""
-        if self.images is not None and self.reference_videos is not None:
-            raise ValueError("Cannot provide both images and reference videos for validation")
-        return self
-
 
 class CheckpointsConfig(ConfigBaseModel):
     """Configuration for model checkpointing during training"""
