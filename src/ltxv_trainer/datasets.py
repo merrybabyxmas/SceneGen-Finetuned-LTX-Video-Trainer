@@ -61,8 +61,6 @@ COMMON_LLM_START_PHRASES: tuple[str, ...] = (
 )
 
 PRECOMPUTED_DIR_NAME = ".precomputed"
-PRECOMPUTED_CONDITIONS_DIR_NAME = "conditions"
-PRECOMPUTED_LATENTS_DIR_NAME = "latents"
 
 
 # Register HEIF/HEIC support
@@ -526,75 +524,160 @@ class ImageOrVideoDatasetWithResizeAndRectangleCrop(ImageOrVideoDataset):
 
 
 class PrecomputedDataset(Dataset):
-    def __init__(self, data_root: str) -> None:
+    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+        """
+        Generic dataset for loading precomputed data from multiple sources.
+
+        Args:
+            data_root: Root directory containing preprocessed data
+            data_sources: Either:
+                         - Dict mapping directory names to output keys
+                         - List of directory names (keys will equal values)
+                         - None (defaults to ["latents", "conditions"])
+
+        Example:
+            # Standard mode (list)
+            dataset = PrecomputedDataset("data/", ["latents", "conditions"])
+
+            # Standard mode (dict)
+            dataset = PrecomputedDataset("data/", {"latents": "latent_conditions", "conditions": "text_conditions"})
+
+            # IC-LoRA mode
+            dataset = PrecomputedDataset("data/", ["latents", "conditions", "ref_latents"])
+        """
         super().__init__()
 
-        self.data_root = Path(data_root)
+        self.data_root = self._setup_data_root(data_root)
+        self.data_sources = self._normalize_data_sources(data_sources)
+        self.source_paths = self._setup_source_paths()
+        self.sample_files = self._discover_samples()
+        self._validate_setup()
 
-        # If the given path is the dataset root, use the precomputed sub-directory.
-        if (self.data_root / PRECOMPUTED_DIR_NAME).exists():
-            self.data_root = self.data_root / PRECOMPUTED_DIR_NAME
+    @staticmethod
+    def _setup_data_root(data_root: str) -> Path:
+        """Setup and validate the data root directory."""
+        data_root = Path(data_root)
 
-        self.latents_path = self.data_root / PRECOMPUTED_LATENTS_DIR_NAME
-        self.conditions_path = self.data_root / PRECOMPUTED_CONDITIONS_DIR_NAME
+        if not data_root.exists():
+            raise FileNotFoundError(f"Data root directory does not exist: {data_root}")
 
-        # Verify that the required directories exist
-        if not self.data_root.exists():
-            raise FileNotFoundError(f"Data root directory does not exist: {self.data_root}")
+        # If the given path is the dataset root, use the precomputed sub-directory
+        if (data_root / PRECOMPUTED_DIR_NAME).exists():
+            data_root = data_root / PRECOMPUTED_DIR_NAME
 
-        if not self.latents_path.exists():
-            raise FileNotFoundError(
-                f"Precomputed latents directory does not exist: {self.latents_path}. "
-                f"Make sure you've run the preprocessing step.",
-            )
+        return data_root
 
-        if not self.conditions_path.exists():
-            raise FileNotFoundError(
-                f"Precomputed conditions directory does not exist: {self.conditions_path}. "
-                f"Make sure you've run the preprocessing step.",
-            )
+    @staticmethod
+    def _normalize_data_sources(data_sources: dict[str, str] | list[str] | None) -> dict[str, str]:
+        """Normalize data_sources input to a consistent dict format."""
+        if data_sources is None:
+            # Default sources
+            return {"latents": "latent_conditions", "conditions": "text_conditions"}
+        elif isinstance(data_sources, list):
+            # Convert list to dict where keys equal values
+            return {source: source for source in data_sources}
+        elif isinstance(data_sources, dict):
+            return data_sources.copy()
+        else:
+            raise TypeError(f"data_sources must be dict, list, or None, got {type(data_sources)}")
 
-        # Recursively search for latent and embedding files in nested folders
-        latent_files = list(self.latents_path.glob("**/*.pt"))
-        if not latent_files:
-            raise ValueError(f"No latent files found in {self.latents_path}")
+    def _setup_source_paths(self) -> dict[str, Path]:
+        """Map data source names to their actual directory paths."""
+        source_paths = {}
 
-        # For each latent file, find the corresponding text embedding file with the same relative path
-        self.latent_conditions = []
-        self.text_conditions = []
-        for latent_file in latent_files:
-            # Handle both old and new preprocessing script formats
-            rel_path = latent_file.relative_to(self.latents_path)
+        for dir_name in self.data_sources:
+            source_path = self.data_root / dir_name
+            source_paths[dir_name] = source_path
 
-            if latent_file.name.startswith("latent_"):
-                # Old format: latent_X.pt -> condition_X.pt
-                condition_file = self.conditions_path / f"condition_{latent_file.stem[7:]}.pt"
-            else:
-                # New format: same relative path in both directories
-                condition_file = self.conditions_path / rel_path
+            # Check that all sources exist.
+            if not source_path.exists():
+                raise FileNotFoundError(f"Required {dir_name} directory does not exist: {source_path}")
 
-            if condition_file.exists():
-                self.latent_conditions.append(rel_path)
-                self.text_conditions.append(condition_file.relative_to(self.conditions_path))
-            else:
-                logger.warning(f"No matching condition file found for latent file: {latent_file.name}")
+        return source_paths
 
-        if not self.latent_conditions:
-            raise ValueError("No matching latent and condition files found.")
+    def _discover_samples(self) -> dict[str, list[Path]]:
+        """Discover all valid sample files across all data sources."""
+        # Use first data source as the reference to discover samples
+        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
+        data_path = self.source_paths[data_key]
+        data_files = list(data_path.glob("**/*.pt"))
 
-        assert len(self.latent_conditions) == len(self.text_conditions), "Number of captions and videos do not match"
+        if not data_files:
+            raise ValueError(f"No data files found in {data_path}")
+
+        # Initialize sample files dict
+        sample_files = {output_key: [] for output_key in self.data_sources.values()}
+
+        # For each data file, find corresponding files in other sources
+        for data_file in data_files:
+            rel_path = data_file.relative_to(data_path)
+
+            # Check if corresponding files exist in ALL sources
+            if self._all_source_files_exist(data_file, rel_path):
+                self._fill_sample_data_files(data_file, rel_path, sample_files)
+
+        return sample_files
+
+    def _all_source_files_exist(self, data_file: Path, rel_path: Path) -> bool:
+        """Check if corresponding files exist in all data sources."""
+        for dir_name in self.data_sources:
+            expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
+            if not expected_path.exists():
+                logger.warning(
+                    f"No matching {dir_name} file found for: {data_file.name} (expected in: {expected_path})"
+                )
+                return False
+
+        return True
+
+    def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path) -> Path:
+        """Get the expected file path for a given data source."""
+        source_path = self.source_paths[dir_name]
+
+        # For conditions, handle legacy naming where latent_X.pt maps to condition_X.pt
+        if dir_name == "conditions" and data_file.name.startswith("latent_"):
+            return source_path / f"condition_{data_file.stem[7:]}.pt"
+
+        return source_path / rel_path
+
+    def _fill_sample_data_files(self, data_file: Path, rel_path: Path, sample_files: dict[str, list[Path]]) -> None:
+        """Add a valid sample to the sample_files tracking."""
+        for dir_name, output_key in self.data_sources.items():
+            expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
+            sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
+
+    def _validate_setup(self) -> None:
+        """Validate that the dataset setup is correct."""
+        if not self.sample_files:
+            raise ValueError("No valid samples found - all data sources must have matching files")
+
+        # Verify all output keys have the same number of samples
+        sample_counts = {key: len(files) for key, files in self.sample_files.items()}
+        if len(set(sample_counts.values())) > 1:
+            raise ValueError(f"Mismatched sample counts across sources: {sample_counts}")
 
     def __len__(self) -> int:
-        return len(self.latent_conditions)
+        # Use the first output key as reference count
+        first_key = next(iter(self.sample_files.keys()))
+        return len(self.sample_files[first_key])
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        conditions = {}
-        latent_path = self.latents_path / self.latent_conditions[index]
-        condition_path = self.conditions_path / self.text_conditions[index]
-        conditions["latent_conditions"] = torch.load(latent_path, map_location="cpu", weights_only=True)
-        conditions["text_conditions"] = torch.load(condition_path, map_location="cpu", weights_only=True)
-        conditions["idx"] = index
-        return conditions
+        result = {}
+
+        for dir_name, output_key in self.data_sources.items():
+            source_path = self.source_paths[dir_name]
+            file_rel_path = self.sample_files[output_key][index]
+            file_path = source_path / file_rel_path
+
+            try:
+                data = torch.load(file_path, map_location="cpu", weights_only=True)
+                result[output_key] = data
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {output_key} from {file_path}: {e}") from e
+
+        # Add index for debugging
+        result["idx"] = index
+        return result
 
 
 class BucketSampler(Sampler):

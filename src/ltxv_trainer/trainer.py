@@ -1,5 +1,4 @@
-import os
-import random
+import os  # noqa: I001
 import time
 import warnings
 from contextlib import nullcontext
@@ -13,7 +12,7 @@ import rich
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import LTXImageToVideoPipeline, LTXPipeline
+from diffusers import LTXImageToVideoPipeline
 from diffusers.utils import export_to_video
 from peft import LoraConfig, get_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
@@ -43,15 +42,23 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
+import torchvision.transforms as T  # noqa: N812
 
 from ltxv_trainer import logger
 from ltxv_trainer.config import LtxvTrainerConfig
 from ltxv_trainer.datasets import PrecomputedDataset
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
+from ltxv_trainer.pipeline_ltx import LTXPipeline
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb
+
+import decord  # Note: Decord must be imported after torch
+
+# Configure decord to use PyTorch tensors
+decord.bridge.set_bridge("torch")
+
 
 # Disable irrelevant warnings from transformers
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -338,6 +345,7 @@ class LtxvTrainer:
         latent_conditions = batch["latent_conditions"]
         latent_conditions["latents"].squeeze_(1)
         packed_latents = latent_conditions["latents"]
+        packed_ref_latents = batch["ref_latents"]["latents"].squeeze_(1)
 
         # TODO: support batch sizes > 1 (requires a PR for the diffusers LTXImageToVideoPipeline)
         # Batch sizes > 1 are partially supported, assuming num_frames, height, width, fps
@@ -360,51 +368,97 @@ class LtxvTrainer:
         prompt_embeds = text_conditions["prompt_embeds"]
         prompt_attention_mask = text_conditions["prompt_attention_mask"]
 
-        sigmas = self._timestep_sampler.sample_for(packed_latents)
-        timesteps = torch.round(sigmas * 1000.0).long()
+        # Create reference and target sequences
+        reference_latents = packed_ref_latents.clone()  # This will be the clean reference
+        target_latents = packed_latents.clone()  # This will be noised
 
-        noise = torch.randn_like(packed_latents, device=self._accelerator.device)
+        # Create noise only for the target part
+        sigmas = self._timestep_sampler.sample_for(target_latents)
+        timesteps = torch.round(sigmas * 1000.0).long()
+        noise = torch.randn_like(target_latents, device=self._accelerator.device)
         sigmas = sigmas.view(-1, 1, 1)
 
-        loss_mask = torch.ones_like(packed_latents)
-        # If first frame conditioning is enabled, the first latent (first video frame) is left (almost) unchanged.
-        if (
-            self._config.optimization.first_frame_conditioning_p
-            and random.random() < self._config.optimization.first_frame_conditioning_p
-        ):
-            sigmas = sigmas.repeat(1, packed_latents.shape[1], 1)
-            first_frame_end_idx = latent_height * latent_width
+        # Apply noise only to target part
+        noisy_target = (1 - sigmas) * target_latents + sigmas * noise
+        targets = noise - target_latents
 
-            # if we only have one frame (e.g. when training on still images),
-            # skip this step otherwise we have no target to train on.
-            if first_frame_end_idx < packed_latents.shape[1]:
-                sigmas[:, :first_frame_end_idx] = 1e-5  # Small sigma close to 0 for the first frame.
-                loss_mask[:, :first_frame_end_idx] = 0.0  # Mask out the loss for the first frame.
-                # TODO: the `timesteps` fed to the transformer should be
-                #  adjusted to reflect zero noise level for the first latent.
+        # Concatenate reference and noisy target
+        # Shape: [batch, sequence_length*2, channels]
+        combined_latents = torch.cat([reference_latents, noisy_target], dim=1)
 
-        noisy_latents = (1 - sigmas) * packed_latents + sigmas * noise
-        targets = noise - packed_latents
+        # --- Prepare video_coords with correct scaling ---
+        batch_size = packed_latents.shape[0]
+        # sequence_length_original = packed_latents.shape[1] # This is F*H*W for one video
 
-        latent_frame_rate = fps / 8
-        spatial_compression_ratio = 32
-        rope_interpolation_scale = [1 / latent_frame_rate, spatial_compression_ratio, spatial_compression_ratio]
+        # Create base coordinate tensors (indices 0 to N-1)
+        raw_frame_indices = torch.arange(latent_frames, device=self._accelerator.device, dtype=torch.float32)
+        raw_height_indices = torch.arange(latent_height, device=self._accelerator.device, dtype=torch.float32)
+        raw_width_indices = torch.arange(latent_width, device=self._accelerator.device, dtype=torch.float32)
+
+        # Create meshgrid for one video part
+        grid_f, grid_h, grid_w = torch.meshgrid(raw_frame_indices, raw_height_indices, raw_width_indices, indexing="ij")
+
+        # Flatten to (F*H*W, 3) for one video part
+        raw_coords_single_video = torch.stack(
+            [
+                grid_f.flatten(),
+                grid_h.flatten(),
+                grid_w.flatten(),
+            ],
+            dim=-1,
+        )
+
+        # Duplicate for reference and target parts, making it (2*F*H*W, 3)
+        raw_coords_both_videos = torch.cat([raw_coords_single_video, raw_coords_single_video], dim=0)
+
+        # Expand for batch: (B, 2*F*H*W, 3)
+        raw_video_coords_batched = raw_coords_both_videos.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Get rope_interpolation_scale factors
+        latent_frame_rate = fps / 8.0  # Ensure float division
+        spatial_compression_ratio = 32.0  # Ensure float
+        # This is the list [scale_f, scale_h, scale_w]
+        # The LTXVideoRotaryPosEmbed uses these factors to scale the raw coordinates
+        # when video_coords is None. We need to replicate this scaling.
+        rope_interpolation_scale_factors = [
+            1.0 / latent_frame_rate if latent_frame_rate > 0 else 1.0,
+            spatial_compression_ratio,
+            spatial_compression_ratio,
+        ]
+
+        # Apply pre-scaling to raw coordinates.
+        # The LTXVideoRotaryPosEmbed expects video_coords to be (B, 3, SeqLen) if provided.
+        # It then divides video_coords[:, 0] by base_num_frames, etc.
+        # So, the video_coords we pass should be: raw_coord * rope_interpolation_factor
+        # (B, 2*F*H*W)
+        prescaled_f = raw_video_coords_batched[..., 0] * rope_interpolation_scale_factors[0]
+        prescaled_h = raw_video_coords_batched[..., 1] * rope_interpolation_scale_factors[1]
+        prescaled_w = raw_video_coords_batched[..., 2] * rope_interpolation_scale_factors[2]
+
+        # Stack to (B, 3, 2*F*H*W) for the transformer's video_coords argument
+        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)
+        # --- End of video_coords preparation ---
 
         model_pred = self._transformer(
-            hidden_states=noisy_latents,
+            hidden_states=combined_latents,
             encoder_hidden_states=prompt_embeds,
             timestep=timesteps,
             encoder_attention_mask=prompt_attention_mask,
             num_frames=latent_frames,
             height=latent_height,
             width=latent_width,
-            rope_interpolation_scale=rope_interpolation_scale,
+            rope_interpolation_scale=rope_interpolation_scale_factors,
+            video_coords=video_coords,
             return_dict=False,
         )[0]
 
-        loss = (model_pred - targets).pow(2)
-        loss = loss.mul(loss_mask).div(loss_mask.mean())  # divide by mean to keep the loss scale unchanged.
-        return loss.mean()
+        # The model prediction will be for the full sequence
+        # We only want to compute loss on the target (second) part
+        model_pred = model_pred[:, packed_latents.shape[1] :]  # Take only the second half
+
+        # Compute loss only on the target part
+        loss = (model_pred - targets).pow(2).mean()
+        return loss
 
     def _print_config(self, config: BaseModel) -> None:
         """Print the configuration as a nicely formatted table."""
@@ -593,7 +647,13 @@ class LtxvTrainer:
         """Initialize the training data loader."""
 
         if self._dataset is None:
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root)
+            # Determine data sources based on conditioning mode
+            data_sources = {"latents": "latent_conditions", "conditions": "text_conditions"}
+
+            if self._config.conditioning.mode == "reference_video":
+                data_sources[self._config.conditioning.reference_latents_dir] = "ref_latents"
+
+            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples")
 
         dataloader = DataLoader(
@@ -702,6 +762,74 @@ class LtxvTrainer:
             logger.info(f"Global batch size: {self._config.optimization.batch_size * self._accelerator.num_processes}")
 
     @torch.no_grad()
+    def _preprocess_reference_video(self, video_path: str | Path) -> torch.Tensor:
+        """Load and preprocess a reference video according to validation config.
+
+        Args:
+            video_path: Path to the video file
+
+        Returns:
+            Preprocessed video tensor in range [-1, 1] with shape [1, C, F, H, W]
+        """
+        # Load video using decord
+        video_reader = decord.VideoReader(str(video_path))
+
+        # Get target dimensions
+        target_width, target_height, target_frames = self._config.validation.video_dims
+
+        # Sample frames uniformly to match target frame count
+        total_frames = len(video_reader)
+        if total_frames < target_frames:
+            raise ValueError(f"Video has {total_frames} frames, but {target_frames} frames are required")
+
+        # Calculate frame indices to sample
+        indices = torch.linspace(0, total_frames - 1, target_frames).long()
+        frames = video_reader.get_batch(indices.tolist()).float() / 255.0  # [F, H, W, C]
+        frames = frames.permute(0, 3, 1, 2)  # [F, H, W, C] -> [F, C, H, W]
+
+        # Resize maintaining aspect ratio
+        current_height, current_width = frames.shape[2:]
+        aspect_ratio = current_width / current_height
+        target_aspect_ratio = target_width / target_height
+
+        if aspect_ratio > target_aspect_ratio:
+            # Width is relatively larger, resize based on height
+            resize_height = target_height
+            resize_width = int(resize_height * aspect_ratio)
+        else:
+            # Height is relatively larger, resize based on width
+            resize_width = target_width
+            resize_height = int(resize_width / aspect_ratio)
+
+        frames = T.functional.resize(
+            frames,
+            size=[resize_height, resize_width],
+            interpolation=T.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+
+        # Center crop to target dimensions
+        crop_top = (resize_height - target_height) // 2
+        crop_left = (resize_width - target_width) // 2
+
+        frames = T.functional.crop(
+            frames,
+            top=crop_top,
+            left=crop_left,
+            height=target_height,
+            width=target_width,
+        )
+
+        # Normalize to [-1, 1]
+        frames = frames * 2.0 - 1.0
+
+        # Add batch dimension
+        frames = frames.unsqueeze(0)  # [1, F, C, H, W]
+        frames = frames.permute(0, 2, 1, 3, 4)  # [1, F, C, H, W] -> [1, C, F, H, W]
+
+        return frames
+
+    @torch.no_grad()
     @torch.compiler.set_stance("force_eager")
     def _sample_videos(self, progress: Progress) -> list[Path] | None:
         """Run validation by generating images from validation prompts."""
@@ -753,6 +881,13 @@ class LtxvTrainer:
             if use_images:
                 image_path = self._config.validation.images[j]
                 pipeline_inputs["image"] = open_image_as_srgb(image_path)
+            # Load and preprocess reference video if provided
+            elif self._config.validation.reference_videos is not None:
+                video_path = self._config.validation.reference_videos[j]
+                # Preprocess the reference video
+                reference_video = self._preprocess_reference_video(video_path)
+                reference_video = reference_video.to(device=self._accelerator.device)
+                pipeline_inputs["reference_video"] = reference_video
 
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
                 result = pipeline(**pipeline_inputs)

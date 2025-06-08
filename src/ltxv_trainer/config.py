@@ -195,6 +195,12 @@ class ValidationConfig(ConfigBaseModel):
         "One image path must be provided for each validation prompt",
     )
 
+    reference_videos: list[str] | None = Field(
+        default=None,
+        description="List of reference video paths to use for validation. "
+        "One video path must be provided for each validation prompt",
+    )
+
     video_dims: tuple[int, int, int] = Field(
         default=(704, 480, 161),
         description="Dimensions of validation videos (width, height, frames)",
@@ -237,6 +243,22 @@ class ValidationConfig(ConfigBaseModel):
         if v is not None and len(v) != num_prompts:
             raise ValueError(f"Number of images ({len(v)}) must match number of prompts ({num_prompts})")
         return v
+
+    @field_validator("reference_videos")
+    @classmethod
+    def validate_num_reference_videos(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
+        """Validate that number of reference videos (if provided) matches number of prompts."""
+        num_prompts = len(info.data.get("prompts", []))
+        if v is not None and len(v) != num_prompts:
+            raise ValueError(f"Number of reference videos ({len(v)}) must match number of prompts ({num_prompts})")
+        return v
+
+    @model_validator(mode="after")
+    def validate_conditioning_inputs(self) -> "ValidationConfig":
+        """Validate that only one type of conditioning input is provided."""
+        if self.images is not None and self.reference_videos is not None:
+            raise ValueError("Cannot provide both images and reference videos for validation")
+        return self
 
 
 class CheckpointsConfig(ConfigBaseModel):
