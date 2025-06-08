@@ -42,6 +42,9 @@ class TrainingBatch(BaseModel):
     timesteps: Tensor  # Timestep values for the transformer
     sigmas: Tensor  # Noise schedule values
 
+    # Conditioning information
+    conditioning_mask: Tensor  # Boolean mask: True = conditioning token, False = target token
+
     # Video metadata
     num_frames: int  # Number of frames in the video
     height: int  # Height of the video latents
@@ -102,30 +105,44 @@ class TrainingStrategy(ABC):
             Prepared training batch with all necessary data
         """
 
-    def _apply_first_frame_conditioning(self, batch: TrainingBatch) -> Tensor:
-        """Apply first frame conditioning by creating a loss mask.
+    def _create_timesteps_from_conditioning_mask(
+        self, conditioning_mask: Tensor, sampled_timestep_values: Tensor
+    ) -> Tensor:
+        """Create timesteps based on conditioning mask.
 
         Args:
-            batch: The training batch containing targets and metadata
+            conditioning_mask: Boolean mask of shape (batch_size, sequence_length),
+            where True = conditioning, False = target.
+            sampled_timestep_values: Sampled timestep values for target tokens of shape (batch_size,)
 
         Returns:
-            Loss mask tensor (1.0 = include in loss, 0.0 = exclude from loss)
+            Timesteps tensor with 0 for conditioning tokens, sampled values for target tokens
         """
-        loss_mask = torch.ones_like(batch.targets)
+        # Expand sampled values to match conditioning mask shape
+        expanded_timesteps = sampled_timestep_values.unsqueeze(1).expand_as(conditioning_mask)
 
-        # Check if first frame conditioning should be applied
+        # Use conditioning mask to select between 0 (conditioning) and sampled values (target)
+        return torch.where(conditioning_mask, 0, expanded_timesteps)
+
+    def _create_first_frame_conditioning_mask(
+        self, batch_size: int, sequence_length: int, height: int, width: int, device: torch.device
+    ) -> Tensor:
+        """Create conditioning mask for first frame conditioning.
+
+        Returns:
+            Boolean mask where True indicates first frame tokens (if conditioning is enabled)
+        """
+        conditioning_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool, device=device)
+
         if (
             self.conditioning_config.first_frame_conditioning_p > 0
             and random.random() < self.conditioning_config.first_frame_conditioning_p
         ):
-            first_frame_end_idx = batch.height * batch.width
+            first_frame_end_idx = height * width
+            if first_frame_end_idx < sequence_length:
+                conditioning_mask[:, :first_frame_end_idx] = True
 
-            # Skip if we only have one frame (e.g. training on still images)
-            if first_frame_end_idx < batch.targets.shape[1]:
-                # Mask out loss for first frame tokens
-                loss_mask[:, :first_frame_end_idx] = 0.0
-
-        return loss_mask
+        return conditioning_mask
 
     @staticmethod
     def prepare_model_inputs(batch: TrainingBatch) -> dict[str, Any]:
@@ -211,15 +228,32 @@ class StandardTrainingStrategy(TrainingStrategy):
         prompt_embeds = conditions["prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
 
+        # Create conditioning mask (only first frame conditioning for standard training)
+        conditioning_mask = self._create_first_frame_conditioning_mask(
+            batch_size=target_latents.shape[0],
+            sequence_length=target_latents.shape[1],
+            height=latent_height,
+            width=latent_width,
+            device=target_latents.device,
+        )
+
         # Create noise for the target latents
         sigmas = timestep_sampler.sample_for(target_latents)
-        timesteps = torch.round(sigmas * 1000.0).long()
         noise = torch.randn_like(target_latents, device=target_latents.device)
 
-        # Apply noise to target latents
+        # Apply noise only to non-conditioning tokens
         sigmas = sigmas.view(-1, 1, 1)
         noisy_latents = (1 - sigmas) * target_latents + sigmas * noise
+
+        # For conditioning tokens, use clean latents instead of noisy ones
+        conditioning_mask_expanded = conditioning_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        noisy_latents = torch.where(conditioning_mask_expanded, target_latents, noisy_latents)
+
         targets = noise - target_latents
+
+        # Create timesteps based on conditioning mask
+        sampled_timestep_values = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()
+        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_timestep_values)
 
         # Use existing utility function for ROPE scale factors
         rope_interpolation_scale_factors = get_rope_scale_factors(fps)
@@ -231,6 +265,7 @@ class StandardTrainingStrategy(TrainingStrategy):
             prompt_attention_mask=prompt_attention_mask,
             timesteps=timesteps,
             sigmas=sigmas,
+            conditioning_mask=conditioning_mask,
             num_frames=latent_frames,
             height=latent_height,
             width=latent_width,
@@ -240,15 +275,14 @@ class StandardTrainingStrategy(TrainingStrategy):
         )
 
     def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
-        """Compute masked MSE loss with first frame conditioning support."""
+        """Compute masked MSE loss using conditioning mask."""
         loss = (model_pred - batch.targets).pow(2)
 
-        # Apply first frame conditioning if enabled
-        loss_mask = self._apply_first_frame_conditioning(batch)
+        # Create loss mask: exclude conditioning tokens
+        loss_mask = (~batch.conditioning_mask.unsqueeze(-1)).float()
 
-        # Apply loss mask and normalize by the mean to maintain loss scale
+        # Apply original loss computation pattern
         loss = loss.mul(loss_mask).div(loss_mask.mean())
-
         return loss.mean()
 
 
@@ -306,12 +340,40 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
 
         # Create noise only for the target part
         sigmas = timestep_sampler.sample_for(target_latents)
-        timesteps = torch.round(sigmas * 1000.0).long()
         noise = torch.randn_like(target_latents, device=target_latents.device)
         sigmas = sigmas.view(-1, 1, 1)
 
+        # Create conditioning mask
+        batch_size = target_latents.shape[0]
+        ref_seq_len = ref_latents.shape[1]
+        target_seq_len = target_latents.shape[1]
+
+        # Reference tokens are always conditioning
+        ref_conditioning_mask = torch.ones(batch_size, ref_seq_len, dtype=torch.bool, device=target_latents.device)
+
+        # Target tokens: check for first frame conditioning
+        target_conditioning_mask = self._create_first_frame_conditioning_mask(
+            batch_size=batch_size,
+            sequence_length=target_seq_len,
+            height=latent_height,
+            width=latent_width,
+            device=target_latents.device,
+        )
+
+        # Combine reference and target conditioning masks
+        conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
+
+        # Create timesteps based on conditioning mask
+        sampled_timestep_values = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()
+        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_timestep_values)
+
         # Apply noise only to target part
         noisy_target = (1 - sigmas) * target_latents + sigmas * noise
+
+        # For first frame conditioning in target, use clean latents instead of noisy ones
+        target_conditioning_mask_expanded = target_conditioning_mask.unsqueeze(-1)  # (B, target_seq_len, 1)
+        noisy_target = torch.where(target_conditioning_mask_expanded, target_latents, noisy_target)
+
         targets = noise - target_latents
 
         # Concatenate reference and noisy target in the sequence dimension
@@ -351,6 +413,7 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             prompt_attention_mask=prompt_attention_mask,
             timesteps=timesteps,
             sigmas=sigmas,
+            conditioning_mask=conditioning_mask,
             num_frames=latent_frames,
             height=latent_height,
             width=latent_width,
@@ -360,18 +423,18 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         )
 
     def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
-        """Compute masked loss only on target portion with first frame conditioning support."""
-        # The model prediction will be for the full sequence (reference + target)
-        # We only want to compute loss on the target (second) part
-        model_pred = model_pred[:, batch.targets.shape[1] :]  # Take only the second half
+        """Compute masked loss only on target portion, excluding conditioning tokens."""
+        # Extract target portion from model prediction and conditioning mask
+        target_seq_len = batch.targets.shape[1]
+        target_pred = model_pred[:, -target_seq_len:]
+        target_conditioning_mask = batch.conditioning_mask[:, -target_seq_len:]
 
-        # Compute loss only on the target part
-        loss = (model_pred - batch.targets).pow(2)
+        loss = (target_pred - batch.targets).pow(2)
 
-        # Apply first frame conditioning if enabled
-        loss_mask = self._apply_first_frame_conditioning(batch)
+        # Create loss mask: exclude conditioning tokens
+        loss_mask = (~target_conditioning_mask.unsqueeze(-1)).float()
 
-        # Apply loss mask and normalize by the mean to maintain loss scale
+        # Apply original loss computation pattern
         loss = loss.mul(loss_mask).div(loss_mask.mean())
         return loss.mean()
 
