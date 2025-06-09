@@ -54,9 +54,9 @@ class LtxvModelVersion(str, Enum):
             case LtxvModelVersion.LTXV_2B_096_DISTILLED:
                 raise ValueError("LTXV_2B_096_DISTILLED does not have a HuggingFace repo")
             case LtxvModelVersion.LTXV_13B_097_DEV:
-                raise ValueError("LTXV_13B_097_DEV does not have a HuggingFace repo")
+                return "Lightricks/LTX-Video-0.9.7-dev"
             case LtxvModelVersion.LTXV_13B_097_DISTILLED:
-                raise ValueError("LTXV_13B_097_DISTILLED does not have a HuggingFace repo")
+                return "Lightricks/LTX-Video-0.9.7-distilled"
         raise ValueError(f"Unknown version: {self}")
 
     @property
@@ -107,7 +107,7 @@ def load_scheduler() -> FlowMatchEulerDiscreteScheduler:
         Loaded scheduler
     """
     return FlowMatchEulerDiscreteScheduler.from_pretrained(
-        HF_MAIN_REPO,
+        LtxvModelVersion.LTXV_13B_097_DEV.hf_repo,  # Use the latest scheduler config from LTXV_13B_097_DEV.
         subfolder="scheduler",
     )
 
