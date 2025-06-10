@@ -97,7 +97,7 @@ def push_to_hub(weights_path: Path, sampled_videos_paths: List[Path], config: Lt
             enable_progress_bars()
 
 
-def _convert_video_to_gif(video_path: Path, output_path: Path) -> None:
+def convert_video_to_gif(video_path: Path, output_path: Path) -> None:
     """Convert a video file to GIF format."""
     try:
         # Read the video file
@@ -173,7 +173,7 @@ def _create_model_card(
                 # Convert video to GIF
                 gif_path = samples_dir / f"sample_{i}.gif"
                 try:
-                    _convert_video_to_gif(video, gif_path)
+                    convert_video_to_gif(video, gif_path)
 
                     # Create grid cell with collapsible description
                     cell = (

@@ -39,6 +39,7 @@ The repository also includes auxiliary utilities for preprocessing datasets, cap
 - [Training Configuration](#-training-configuration)
   - [Example Configurations](#example-configurations)
 - [Running the Trainer](#-running-the-trainer)
+- [Quick Start with Gradio](#-quick-start-with-gradio)
 - [Using Trained LoRAs in ComfyUI](#-using-trained-loras-in-comfyui)
 - [Example LoRAs](#-example-loras)
 - [Contributing](#-contributing)
@@ -398,7 +399,7 @@ This script will:
 
 5. Convert LoRA to ComfyUI format:
    - Automatically converts the trained LoRA weights to ComfyUI format
-   - Saves the converted weights with "\_comfy" suffix
+   - Saves the converted weights with "_comfy" suffix
 
 Required arguments:
 
@@ -419,6 +420,30 @@ The script will create the following directory structure:
 outputs/                # Training outputs and checkpoints
     └── lora_weights_comfy.safetensors  # ComfyUI-compatible LoRA weights
 ```
+
+## 🎨 Quick Start with Gradio
+
+If you prefer a graphical interface, you can also use our Gradio web UI:
+
+```bash
+# Install dependencies if you haven't already
+uv sync
+source .venv/bin/activate
+
+# Launch the Gradio interface
+python app_gradio.py
+```
+
+This will open a web interface at `http://localhost:7860` that provides all training functionality in a user-friendly way.
+
+- Upload training videos
+- Generate or edit captions
+- Configure training parameters
+- Monitor training progress
+- View validation samples in real-time
+- Download trained models
+
+The interface provides the same functionality as the command-line tools but in a more intuitive way.
 
 ---
 
