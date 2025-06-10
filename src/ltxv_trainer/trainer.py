@@ -199,7 +199,7 @@ class LtxvTrainer:
                 sampled_videos_paths = self._sample_videos(sample_progress)
             self._accelerator.wait_for_everyone()
 
-            for step in range(cfg.optimization.steps):
+            for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -263,7 +263,7 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Update progress
-                    if IS_MAIN_PROCESS and is_optimization_step:
+                    if IS_MAIN_PROCESS:
                         current_lr = self._optimizer.param_groups[0]["lr"]
                         elapsed = time.time() - train_start_time
                         progress_percentage = self._global_step / cfg.optimization.steps
@@ -273,10 +273,10 @@ class LtxvTrainer:
                         else:
                             total_time = "calculating..."
 
-                        step_time = time.time() - step_start_time
+                        step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                         train_progress.update(
                             task,
-                            advance=1,
+                            advance=1 if is_optimization_step else 0,
                             loss=loss.item(),
                             lr=current_lr,
                             step_time=step_time,
