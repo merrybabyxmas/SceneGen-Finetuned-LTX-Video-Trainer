@@ -493,6 +493,8 @@ class ImageOrVideoDatasetWithResizeAndRectangleCrop(ImageOrVideoDataset):
 
         frame_indices = list(range(video_num_frames))
         frames = video_reader.get_batch(frame_indices)
+        if not isinstance(frames, torch.Tensor):
+            frames = torch.from_numpy(frames.asnumpy())
         frames = frames[:nearest_frame_bucket].float() / 255.0
         frames = frames.permute(0, 3, 1, 2).contiguous()
 

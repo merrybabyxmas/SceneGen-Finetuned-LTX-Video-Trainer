@@ -110,6 +110,7 @@ def process_video(videos: list, caption_text: str) -> tuple[list, str]:
     Returns:
         Dataset content as list of dicts
     """
+
     if not videos:
         return []
 
@@ -139,9 +140,11 @@ def process_video(videos: list, caption_text: str) -> tuple[list, str]:
 
     # Save both captions and dataset files
     data_dir = TRAINING_DATA_DIR
-    data_dir.mkdir(exist_ok=True)
+    shutil.rmtree(data_dir, missing_ok=True)
 
-    captions_file = data_dir / "captions.json"
+    data_dir.mkdir()
+
+    captions_file = data_dir / "dataset.json"
 
     with open(captions_file, "w") as f:
         json.dump(captions_data, f, indent=2)
@@ -486,7 +489,7 @@ class GradioUI:
         current_resolution = f"{width}x{height}x{num_frames}"
 
         # If no previous resolution or dataset, preprocessing is needed
-        if not resolution_file.exists() or not (TRAINING_DATA_DIR / "dataset.json").exists():
+        if not resolution_file.exists() or not (TRAINING_DATA_DIR / "captions.json").exists():
             return True
 
         # Check if resolution has changed
@@ -552,12 +555,12 @@ class GradioUI:
             data_dir.mkdir(exist_ok=True)
 
             # Check if we need to copy and process data (first training session)
-            dataset_file = data_dir / "dataset.json"
+            training_captions_file = data_dir / "captions.json"
             needs_preprocessing = self._should_preprocess_data(width, height, num_frames)
 
-            if not dataset_file.exists():
+            if not training_captions_file.exists():
                 # Load captions
-                captions_file = data_dir / "captions.json"
+                captions_file = data_dir / "dataset.json"
                 if not captions_file.exists():
                     return "No captions.json found. Please process videos first.", gr.update(interactive=True)
 
@@ -588,7 +591,7 @@ class GradioUI:
                     )
 
                 # Save dataset.json with updated paths
-                with open(dataset_file, "w") as f:
+                with open(training_captions_file, "w") as f:
                     json.dump(dataset, f, indent=2)
 
             # Preprocess if needed (first time or resolution changed)
@@ -599,7 +602,7 @@ class GradioUI:
                     shutil.rmtree(precomputed_dir)
 
                 success, error_msg = self._preprocess_dataset(
-                    dataset_file=dataset_file,
+                    dataset_file=training_captions_file,
                     model_source=model_source,
                     width=width,
                     height=height,
