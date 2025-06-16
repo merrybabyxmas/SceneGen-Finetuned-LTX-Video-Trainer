@@ -46,6 +46,7 @@ def preprocess_dataset(  # noqa: PLR0913
     device: str,
     load_text_encoder_in_8bit: bool,
     remove_llm_prefixes: bool = False,
+    reference_column: str | None = None,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments"""
     # Validate dataset file
@@ -84,6 +85,22 @@ def preprocess_dataset(  # noqa: PLR0913
         vae_tiling=vae_tiling,
     )
 
+    # Process reference videos if reference_column is provided
+    if reference_column:
+        logger.info("Processing reference videos for IC-LoRA training...")
+        reference_latents_dir = output_base / "reference_latents"
+
+        compute_video_latents(
+            dataset_file=dataset_file,
+            video_column=reference_column,
+            resolution_buckets=resolution_buckets,
+            output_dir=str(reference_latents_dir),
+            model_source=model_source,
+            batch_size=batch_size,
+            device=device,
+            vae_tiling=vae_tiling,
+        )
+
     # Handle video decoding if requested
     if decode_videos:
         logger.info("Decoding videos for verification...")
@@ -95,8 +112,17 @@ def preprocess_dataset(  # noqa: PLR0913
         )
         decoder.decode(latents_dir, output_base / "decoded_videos")
 
+        # Also decode reference videos if they exist
+        if reference_column:
+            reference_latents_dir = output_base / "reference_latents"
+            if reference_latents_dir.exists():
+                logger.info("Decoding reference videos for verification...")
+                decoder.decode(reference_latents_dir, output_base / "decoded_reference_videos")
+
     # Print summary
     logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
+    if reference_column:
+        logger.info("Reference videos processed and saved to reference_latents/ directory for IC-LoRA training")
 
 
 def _validate_dataset_file(dataset_path: str) -> None:
@@ -167,6 +193,10 @@ def main(  # noqa: PLR0913
         default=False,
         help="Remove LLM prefixes from captions",
     ),
+    reference_column: str | None = typer.Option(
+        default=None,
+        help="Column name containing reference video paths in the dataset JSON/JSONL/CSV file",
+    ),
 ) -> None:
     """Preprocess a video dataset by computing and saving latents and text embeddings.
 
@@ -179,6 +209,11 @@ def main(  # noqa: PLR0913
         # Process a JSON dataset with custom column names
         python preprocess_dataset.py dataset.json
             --resolution-buckets 768x768x25 --caption-column "text" --video-column "video_path"
+
+        # Process dataset with reference videos for IC-LoRA training
+        python preprocess_dataset.py dataset.json
+            --resolution-buckets 768x768x25 --caption-column "caption"
+            --video-column "media_path" --reference-column "reference_path"
     """
     parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
 
@@ -202,6 +237,7 @@ def main(  # noqa: PLR0913
         device=device,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
         remove_llm_prefixes=remove_llm_prefixes,
+        reference_column=reference_column,
     )
 
 
