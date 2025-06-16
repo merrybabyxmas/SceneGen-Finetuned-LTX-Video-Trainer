@@ -10,6 +10,7 @@ Basic usage:
     decode_latents.py /path/to/latents/dir --output-dir /path/to/output
 """
 
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -27,6 +28,7 @@ from rich.progress import (
 )
 from transformers.utils.logging import disable_progress_bar
 
+from ltxv_trainer import logger
 from ltxv_trainer.ltxv_utils import decode_video
 from ltxv_trainer.model_loader import LtxvModelVersion, load_vae
 
@@ -39,62 +41,70 @@ app = typer.Typer(
 
 
 class LatentsDecoder:
-    def __init__(self, model_source: str, device: str = "cuda"):
+    def __init__(self, model_source: str, device: str = "cuda", vae_tiling: bool = False):
         """Initialize the decoder with model configuration.
 
         Args:
             model_source: Model source - can be a version string, HF repo, or local path
             device: Device to use for computation
+            vae_tiling: Whether to enable VAE tiling for larger video resolutions
         """
         self.device = torch.device(device)
-        self._load_model(model_source)
+        self._load_model(model_source, vae_tiling)
 
-    def _load_model(self, model_source: str) -> None:
+    def _load_model(self, model_source: str, vae_tiling: bool) -> None:
         """Initialize and load the VAE model"""
-        with console.status("[bold]Loading VAE model...", spinner="dots"):
-            console.print(f"Loading VAE from [cyan]{model_source}[/]")
+        with console.status(f"[bold]Loading VAE model from {model_source}...", spinner="dots"):
             self.vae = load_vae(model_source, dtype=torch.bfloat16).to(self.device)
 
-        console.print("[bold green]✓[/] VAE model loaded successfully")
+            if vae_tiling:
+                self.vae.enable_tiling()
 
     @torch.inference_mode()
     def decode(self, latents_dir: Path, output_dir: Path, seed: int | None = None) -> None:
-        """Decode all latent files in the given directory"""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        latent_files = sorted(latents_dir.glob("*.pt"))
+        """Decode all latent files in the directory recursively.
+
+        Args:
+            latents_dir: Directory containing latent files (.pt)
+            output_dir: Directory to save decoded videos
+            seed: Optional random seed for noise generation
+        """
+        # Find all .pt files recursively
+        latent_files = list(latents_dir.rglob("*.pt"))
 
         if not latent_files:
-            console.print(f"[bold red]No latent files found in {latents_dir}[/]")
+            logger.warning(f"No .pt files found in {latents_dir}")
             return
 
-        console.print(f"Found [bold]{len(latent_files)}[/] latent files to decode")
+        logger.info(f"Found {len(latent_files):,} latent files to decode")
 
-        # Process files one by one
-        progress = Progress(
+        # Process files with progress bar
+        with Progress(
             SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=40),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
-            TextColumn("•"),
             TimeRemainingColumn(),
             console=console,
-        )
-
-        with progress:
-            task = progress.add_task(
-                "Decoding latents",
-                total=len(latent_files),
-            )
+        ) as progress:
+            task = progress.add_task("Decoding latents", total=len(latent_files))
 
             for latent_file in latent_files:
-                self._process_file(latent_file, output_dir, seed)
+                # Calculate relative path to maintain directory structure
+                rel_path = latent_file.relative_to(latents_dir)
+                output_subdir = output_dir / rel_path.parent
+                output_subdir.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    self._process_file(latent_file, output_subdir, seed)
+                except Exception as e:
+                    logger.error(f"Error processing {latent_file}: {e}")
+                    continue
+
                 progress.advance(task)
 
-        console.print(
-            f"[bold green]✓[/] Decoded [bold]{len(latent_files)}[/] latent files. "
-            f"Results saved to [cyan]{output_dir}[/]",
-        )
+        logger.info(f"Decoding complete! Videos saved to {output_dir}")
 
     def _process_file(self, latent_file: Path, output_dir: Path, seed: int | None) -> None:
         """Process a single latent file"""
@@ -126,27 +136,37 @@ class LatentsDecoder:
         video = (video * 255).round().clamp(0, 255).to(torch.uint8)
         video = video.permute(1, 2, 3, 0)  # [C,F,H,W] -> [F,H,W,C]
 
-        # Save as video file
-        output_path = output_dir / f"{latent_file.stem}.mp4"
-        torchvision.io.write_video(
-            str(output_path),
-            video.cpu(),
-            # TODO: take the fps from a stored value in the latent file
-            fps=30,
-            video_codec="h264",
-            options={"crf": "18"},
-        )
+        # Determine output format and save
+        is_image = video.shape[0] == 1
+        if is_image:
+            # Save as PNG for single frame
+            output_path = output_dir / f"{latent_file.stem}.png"
+            torchvision.utils.save_image(
+                video[0].permute(2, 0, 1) / 255.0,  # [H,W,C] -> [C,H,W] and normalize
+                str(output_path),
+            )
+        else:
+            # Save as MP4 for video
+            output_path = output_dir / f"{latent_file.stem}.mp4"
+            fps = data.get("fps", 24)  # Use stored FPS or default to 24
+            torchvision.io.write_video(
+                str(output_path),
+                video.cpu(),
+                fps=Fraction(fps).limit_denominator(1000),
+                video_codec="h264",
+                options={"crf": "18"},
+            )
 
 
 @app.command()
 def main(
     latents_dir: str = typer.Argument(
         ...,
-        help="Directory containing the precomputed latent files",
+        help="Directory containing the precomputed latent files (searched recursively)",
     ),
-    output_dir: str = typer.Option(
+    output_dir: str = typer.Argument(
         ...,
-        help="Directory to save the decoded videos",
+        help="Directory to save the decoded videos (maintains same folder hierarchy as input)",
     ),
     device: str = typer.Option(
         default="cuda",
@@ -156,19 +176,37 @@ def main(
         default=str(LtxvModelVersion.latest()),
         help="Model source - can be a version string (e.g. 'LTXV_2B_0.9.5'), HF repo, or local path",
     ),
+    vae_tiling: bool = typer.Option(
+        default=False,
+        help="Enable VAE tiling for larger video resolutions",
+    ),
     seed: int = typer.Option(
         default=None,
-        help="Random seed for noise generation",
+        help="Random seed for noise generation during decoding",
     ),
 ) -> None:
-    """Decode precomputed video latents back into videos using the VAE."""
+    """Decode precomputed video latents back into videos using the VAE.
+
+    This script recursively searches for .pt latent files in the input directory
+    and decodes them to videos, maintaining the same folder hierarchy in the output.
+
+    Examples:
+        # Basic usage
+        python decode_latents.py /path/to/latents --output-dir /path/to/videos
+
+        # With VAE tiling for large videos
+        python decode_latents.py /path/to/latents --output-dir /path/to/videos --vae-tiling
+
+        # With specific model and seed
+        python decode_latents.py /path/to/latents --output-dir /path/to/videos --model-source LTXV_2B_0.9.5 --seed 42
+    """
     latents_path = Path(latents_dir)
     output_path = Path(output_dir)
 
     if not latents_path.exists() or not latents_path.is_dir():
         raise typer.BadParameter(f"Latents directory does not exist: {latents_path}")
 
-    decoder = LatentsDecoder(model_source=model_source, device=device)
+    decoder = LatentsDecoder(model_source=model_source, device=device, vae_tiling=vae_tiling)
     decoder.decode(latents_path, output_path, seed=seed)
 
 
