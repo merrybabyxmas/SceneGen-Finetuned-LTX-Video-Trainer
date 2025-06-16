@@ -38,6 +38,10 @@ The repository also includes auxiliary utilities for preprocessing datasets, cap
   - [Preprocess Dataset](#3-dataset-preprocessing-preprocess_datasetpy)
 - [Training Configuration](#-training-configuration)
   - [Example Configurations](#example-configurations)
+- [Training Modes](#-training-modes)
+  - [Standard LoRA Training](#standard-lora-training)
+  - [Full Model Fine-tuning](#full-model-fine-tuning)
+  - [In-Context LoRA (IC-LoRA) Training](#in-context-lora-ic-lora-training)
 - [Running the Trainer](#-running-the-trainer)
 - [Quick Start with Gradio](#-quick-start-with-gradio)
 - [Using Trained LoRAs in ComfyUI](#-using-trained-loras-in-comfyui)
@@ -204,33 +208,19 @@ Videos are processed as follows:
 
 ##### Dataset Format
 
-The trainer supports on either videos or single images.
+The trainer supports either videos or single images.
 Note that your dataset must be homogeneous - either all videos or all images, mixing is not supported.
 When using images, follow the same preprocessing steps and format requirements as with videos,
 simply provide image files instead of video files.
 
-1. Directory with text files:
-
-```
-dataset/
-├── captions.txt      # One caption per line
-└── video_paths.txt   # One video path per line
-```
+The dataset must be a CSV, JSON, or JSONL metadata file with columns for captions and video paths:
 
 ```bash
-python scripts/preprocess_dataset.py dataset/ \
-    --caption-column captions \
-    --video-column video_paths
-```
-
-2. Single metadata file:
-
-```bash
-# Using CSV/JSON/JSONL, e.g.
+# Using CSV/JSON/JSONL metadata file
 python scripts/preprocess_dataset.py dataset.json \
     --caption-column "caption" \
     --video-column "video_path" \
-    --model-source "LTXV_2B_0.9.5"  # Optional: specify a specific version, defaults to latest
+    --model-source "LTXV_13B_097_DEV"  # Optional: specify a specific version, defaults to latest
 ```
 
 ##### Output Structure
@@ -240,9 +230,53 @@ The preprocessed data is saved in a `.precomputed` directory:
 ```
 dataset/
 └── .precomputed/
-    ├── latents/     # Cached video latents
-    └── conditions/  # Cached text embeddings
+    ├── latents/           # Cached video latents
+    ├── conditions/        # Cached text embeddings
+    └── reference_latents/ # Cached reference video latents (for IC-LoRA training)
 ```
+
+##### IC-LoRA Reference Video Preprocessing
+
+For IC-LoRA training, you can preprocess datasets that include reference videos. Reference videos provide clean conditioning input while target videos represent the desired transformed output.
+
+**Dataset Format with Reference Videos:**
+
+JSON/JSONL format:
+```json
+[
+  {
+    "caption": "A video of a cake being decorated with CAKEIFY effect",
+    "media_path": "videos/target_001.mp4",
+    "reference_path": "videos/reference_001.mp4"
+  }
+]
+```
+
+CSV format:
+```csv
+caption,media_path,reference_path
+"A video of a cake being decorated with CAKEIFY effect","videos/target_001.mp4","videos/reference_001.mp4"
+```
+
+**Preprocessing with Reference Videos:**
+
+```bash
+# Using JSON/JSONL dataset
+python scripts/preprocess_dataset.py dataset.json \
+    --resolution-buckets "768x768x25" \
+    --caption-column "caption" \
+    --video-column "media_path" \
+    --reference-column "reference_path"
+
+# Using CSV dataset
+python scripts/preprocess_dataset.py dataset.json \
+    --resolution-buckets "768x768x25" \
+    --caption-column "caption" \
+    --video-column "media_path" \
+    --reference-column "reference_path"
+```
+
+This will create an additional `reference_latents/` directory containing the preprocessed reference video latents.
 
 ##### LoRA Trigger Words
 
@@ -265,6 +299,12 @@ By providing the `--decode-videos` flag, the script will also VAE-decode the pre
 python scripts/preprocess_dataset.py /path/to/dataset \
     --resolution-buckets "768x768x25" \
     --decode-videos
+
+# For IC-LoRA datasets, this will also decode reference videos
+python scripts/preprocess_dataset.py dataset.json \
+    --resolution-buckets "768x768x25" \
+    --reference-column "reference_path" \
+    --decode-videos
 ```
 
 For single-frame images, they are saved as PNG files instead of MP4.
@@ -282,6 +322,7 @@ The main configuration class is [`LtxvTrainerConfig`](src/ltxv_trainer/config.py
 - **ValidationConfig**: Validation and inference settings
 - **CheckpointsConfig**: Checkpoint saving frequency and retention settings
 - **FlowMatchingConfig**: Timestep sampling parameters
+- **ConditioningConfig**: Video conditioning settings (reference videos, first frame conditioning)
 
 ### Example Configurations
 
@@ -291,6 +332,88 @@ for your training runs:
 - 📄 [Full Model Fine-tuning Example](configs/ltxv_2b_full.yaml)
 - 📄 [LoRA Fine-tuning Example](configs/ltxv_2b_lora.yaml)
 - 📄 [LoRA Fine-tuning Example (Low VRAM)](configs/ltxv_2b_lora_low_vram.yaml) - Optimized for GPUs with 24GB VRAM.
+- 📄 [IC-LoRA Training Examples](configs/) - Video-to-video transformation training
+
+---
+
+## 🎯 Training Modes
+
+The trainer supports three main training modes, each suited for different use cases:
+
+### Standard LoRA Training
+
+Standard LoRA (Low-Rank Adaptation) training fine-tunes the model by adding small, trainable adapter layers while keeping the base model frozen. This approach:
+
+- Requires significantly less memory and compute than full fine-tuning
+- Produces small, portable weight files
+- Is ideal for learning specific styles, effects, or concepts
+- Can be easily combined with other LoRAs during inference
+
+Configure standard LoRA training with:
+```yaml
+model:
+  training_mode: "lora"
+conditioning:
+  mode: "none"
+```
+
+### Full Model Fine-tuning
+
+Full model fine-tuning updates all parameters of the base model, providing maximum flexibility but requiring substantial computational resources:
+
+- Offers the highest potential quality and capability improvements
+- Requires significant GPU memory (typically 40GB+ for larger models)
+- Produces large checkpoint files (several GB)
+- Best for major model adaptations or when LoRA limitations are reached
+
+Configure full fine-tuning with:
+```yaml
+model:
+  training_mode: "full"
+conditioning:
+  mode: "none"
+```
+
+### In-Context LoRA (IC-LoRA) Training
+
+IC-LoRA is a specialized training mode for video-to-video transformations. Unlike standard training modes that learn from individual videos, IC-LoRA learns transformations by comparing pairs of videos:
+
+- **Reference videos** provide clean, unnoised conditioning input showing the "before" state
+- **Target videos** are noised during training and represent the desired "after" state
+- The model learns transformations from reference videos to target videos
+- Loss is applied only to the target portion, not the reference
+- Enables learning complex video-to-video effects like style transfers, control adapters, etc.
+
+To enable IC-LoRA training, configure your YAML file with:
+
+```yaml
+model:
+  training_mode: "lora"
+conditioning:
+  mode: "reference_video"
+  reference_latents_dir: "reference_latents"  # Directory name for reference video latents
+```
+
+**Dataset Requirements for IC-LoRA:**
+- Your dataset must contain paired videos where each target video has a corresponding reference video
+- Reference and target videos must have *identical* resolution and length
+- Both reference and target videos should be preprocessed together using the same resolution buckets
+
+**Configuration Requirements for IC-LoRA:**
+- You must provide `reference_videos` in your validation configuration when using IC-LoRA training
+- The number of reference videos must match the number of validation prompts
+
+Example validation configuration for IC-LoRA:
+```yaml
+validation:
+  prompts:
+    - "First prompt"
+    - "Second prompt"
+  reference_videos:
+    - "path/to/reference1.mp4"
+    - "path/to/reference2.mp4"
+```
+
 
 ---
 
@@ -488,7 +611,7 @@ Feel free to use these datasets as references for preparing your own training da
 
 ## ️🔧 Utility Scripts
 
-### LoRA Format Convertor
+### LoRA Format Converter
 
 Using `scripts/convert_checkpoint.py` you can convert your LoRA saved file from `diffusers` library format to `ComfyUI` format.
 
