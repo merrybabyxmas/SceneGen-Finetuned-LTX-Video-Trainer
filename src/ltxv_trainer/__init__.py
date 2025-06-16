@@ -1,6 +1,8 @@
 import logging
 import os
+import sys
 from logging import getLogger
+from pathlib import Path
 
 from rich.logging import RichHandler
 
@@ -36,3 +38,7 @@ info = logger.info
 warning = logger.warning
 error = logger.error
 critical = logger.critical
+
+
+# Add the root directory to the Python path so we can import from scripts.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))

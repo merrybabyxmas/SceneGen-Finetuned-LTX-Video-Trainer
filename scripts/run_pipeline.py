@@ -14,18 +14,15 @@ Usage:
 """
 
 import inspect
-
-# Add the parent directory to the Python path so we can import from scripts
-import sys
+import json
 from pathlib import Path
 from typing import Callable
 
 import typer
+import yaml
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from typer.models import OptionInfo
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.caption_videos import VIDEO_EXTENSIONS
 from scripts.caption_videos import main as caption_videos
@@ -133,13 +130,27 @@ def process_scenes(scenes_dir: Path) -> None:
     )
 
 
-def preprocess_data(scenes_dir: Path, resolution_buckets: str, id_token: str | None = None) -> None:
+def preprocess_data(
+    scenes_dir: Path,
+    resolution_buckets: str,
+    id_token: str | None = None,
+    batch_size: int = 1,
+    device: str = "cuda",
+    load_text_encoder_in_8bit: bool = False,
+    vae_tiling: bool = False,
+    remove_llm_prefixes: bool = False,
+) -> None:
     """Preprocess the dataset using the provided resolution buckets.
 
     Args:
         scenes_dir: Directory containing split scenes and captions
         resolution_buckets: Resolution buckets string (e.g. "768x768x49")
         id_token: Optional token to prepend to each caption (acts as a trigger word when training a LoRA)
+        batch_size: Batch size for preprocessing
+        device: Device to use for computation
+        load_text_encoder_in_8bit: Load the T5 text encoder in 8-bit precision to save memory
+        vae_tiling: Enable VAE tiling for larger video resolutions
+        remove_llm_prefixes: Remove LLM prefixes from captions
     """
     if not scenes_dir.exists():
         console.print("[bold yellow]Scenes directory not found.[/]")
@@ -164,9 +175,14 @@ def preprocess_data(scenes_dir: Path, resolution_buckets: str, id_token: str | N
         resolution_buckets=resolution_buckets,
         caption_column="caption",
         video_column="media_path",
+        batch_size=batch_size,
+        device=device,
+        load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        vae_tiling=vae_tiling,
         output_dir=str(preprocessed_dir),
         id_token=id_token,
         decode_videos=True,  # Enable video decoding for verification
+        remove_llm_prefixes=remove_llm_prefixes,
     )
 
 
@@ -175,6 +191,7 @@ def prepare_and_run_training(
     config_template: Path,
     scenes_dir: Path,
     rank: int,
+    id_token: str | None = None,
 ) -> None:
     """Prepare training configuration and run training.
 
@@ -183,6 +200,7 @@ def prepare_and_run_training(
         config_template: Path to the configuration template file
         scenes_dir: Directory containing preprocessed data
         rank: LoRA rank to use for training
+        id_token: Optional token used during preprocessing (for prompts)
     """
     if not config_template.exists():
         console.print(f"[bold red]Configuration template not found: {config_template}[/]")
@@ -194,10 +212,6 @@ def prepare_and_run_training(
     config_content = config_content.replace("[RANK]", str(rank))
 
     # Parse the config content to get the output directory
-    import json
-
-    import yaml
-
     config_data = yaml.safe_load(config_content)
     output_dir = Path(config_data.get("output_dir", "outputs"))
 
@@ -211,6 +225,11 @@ def prepare_and_run_training(
             captions_data = json.load(f)
             # Get up to 3 prompts from the captions
             prompts = [item["caption"] for item in captions_data[:3]]
+
+            # Add id_token to prompts if specified
+            if id_token and prompts:
+                prompts = [f"{id_token.strip()} {prompt}" for prompt in prompts]
+
             if prompts:
                 # Replace validation.prompts in the config
                 config_data["validation"]["prompts"] = prompts
@@ -276,6 +295,26 @@ def main(
         min=1,
         max=128,
     ),
+    batch_size: int = typer.Option(
+        default=1,
+        help="Batch size for preprocessing",
+    ),
+    device: str = typer.Option(
+        default="cuda",
+        help="Device to use for computation",
+    ),
+    load_text_encoder_in_8bit: bool = typer.Option(
+        default=False,
+        help="Load the T5 text encoder in 8-bit precision to save memory",
+    ),
+    vae_tiling: bool = typer.Option(
+        default=False,
+        help="Enable VAE tiling for larger video resolutions",
+    ),
+    remove_llm_prefixes: bool = typer.Option(
+        default=False,
+        help="Remove LLM prefixes from captions",
+    ),
 ) -> None:
     """Run the complete LTXV training pipeline."""
     # Define directories
@@ -298,11 +337,20 @@ def main(
 
     # Step 3: Preprocess dataset
     console.print("[bold blue]Step 3: Preprocessing dataset...[/]")
-    preprocess_data(scenes_dir, resolution_buckets, id_token)
+    preprocess_data(
+        scenes_dir,
+        resolution_buckets,
+        id_token,
+        batch_size=batch_size,
+        device=device,
+        load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        vae_tiling=vae_tiling,
+        remove_llm_prefixes=remove_llm_prefixes,
+    )
 
     # Step 4: Run training
     console.print("[bold blue]Step 4: Running training...[/]")
-    prepare_and_run_training(basename, config_template, scenes_dir, rank)
+    prepare_and_run_training(basename, config_template, scenes_dir, rank, id_token)
 
     console.print("[bold green]Pipeline completed successfully![/]")
 
