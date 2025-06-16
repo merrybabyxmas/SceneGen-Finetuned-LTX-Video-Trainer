@@ -100,7 +100,27 @@ class TrainingState:
                 setattr(self, key, value)
 
 
-def process_video(videos: list, caption_text: str) -> tuple[list, str]:
+@dataclass
+class TrainingParams:
+    videos: list[str]
+    validation_prompt: str
+    learning_rate: float
+    steps: int
+    lora_rank: int
+    batch_size: int
+    model_source: str
+    width: int
+    height: int
+    num_frames: int
+    push_to_hub: bool
+    hf_model_id: str
+    hf_token: str | None = None
+    id_token: str | None = None
+    validation_interval: int = 100
+    captions_json: str | None = None
+
+
+def process_video(videos: list, caption_text: str) -> str:
     """Process uploaded videos and generate/edit captions.
 
     Args:
@@ -108,11 +128,11 @@ def process_video(videos: list, caption_text: str) -> tuple[list, str]:
         caption_text: Existing caption text (if any)
 
     Returns:
-        Dataset content as list of dicts
+        Dataset content as JSON string
     """
 
     if not videos:
-        return []
+        return ""
 
     # Create captions dictionary and dataset entries
     captions_data = {}
@@ -140,7 +160,9 @@ def process_video(videos: list, caption_text: str) -> tuple[list, str]:
 
     # Save both captions and dataset files
     data_dir = TRAINING_DATA_DIR
-    shutil.rmtree(data_dir, missing_ok=True)
+    # Remove the directory if it exists (compatibility with Python <3.12)
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
 
     data_dir.mkdir()
 
@@ -149,10 +171,10 @@ def process_video(videos: list, caption_text: str) -> tuple[list, str]:
     with open(captions_file, "w") as f:
         json.dump(captions_data, f, indent=2)
 
-    # Convert the dictionary to a list of objects for Gradio JSON display
+    # Convert the dictionary to a list of objects for Gradio JSON/code display
     dataset_display = [{"media_path": k, "caption": v} for k, v in captions_data.items()]
 
-    return dataset_display
+    return json.dumps(dataset_display, indent=2)
 
 
 def _handle_validation_sample(step: int, video_path: Path) -> str | None:
@@ -273,9 +295,10 @@ class GradioUI:
         return {
             self.video_upload: gr.update(value=None),
             self.caption_output: gr.update(value=""),
-            self.dataset_display: gr.update(value=None),
+            self.dataset_display: gr.update(value=""),
             self.validation_prompt: gr.update(
-                value="a professional portrait video of a person with blurry bokeh background"
+                value="a professional portrait video of a person with blurry bokeh background",
+                info="Include the LoRA ID token (e.g., &lt;lora&gt;) in this prompt if desired.",
             ),
             self.status_output: gr.update(value=""),
             self.progress_output: gr.update(value=""),
@@ -519,27 +542,31 @@ class GradioUI:
         with open(resolution_file, "w") as f:
             f.write(current_resolution)
 
-    def start_training(  # noqa: PLR0913, PLR0912
+    def _sync_captions_from_ui(
+        self, params: TrainingParams, training_captions_file: Path
+    ) -> tuple[dict[str, str] | None, str | None]:
+        """Sync captions from the UI to captions.json. Returns (captions_data, error_message)."""
+        if params.captions_json:
+            try:
+                dataset = json.loads(params.captions_json)
+                # Convert list of dicts to captions_data dict
+                captions_data = {item["media_path"]: item["caption"] for item in dataset}
+                # Save to captions.json (overwrite every time)
+                with open(training_captions_file, "w") as f:
+                    json.dump(captions_data, f, indent=2)
+                return captions_data, None
+            except Exception as e:
+                return None, f"Invalid captions JSON: {e!s}"
+        else:
+            return None, "No captions found in the UI. Please process videos first."
+
+    def start_training(
         self,
-        videos: list[str],
-        validation_prompt: str,
-        learning_rate: float,
-        steps: int,
-        lora_rank: int,
-        batch_size: int,
-        model_source: str,
-        width: int,
-        height: int,
-        num_frames: int,
-        push_to_hub: bool,
-        hf_model_id: str,
-        hf_token: str | None = None,
-        id_token: str | None = None,
-        validation_interval: int = 100,
+        params: TrainingParams,
     ) -> tuple[str, gr.update]:
         """Start the training process."""
-        if hf_token:
-            login(token=hf_token)
+        if params.hf_token:
+            login(token=params.hf_token)
 
         try:
             # Clear any existing CUDA cache
@@ -556,43 +583,36 @@ class GradioUI:
 
             # Check if we need to copy and process data (first training session)
             training_captions_file = data_dir / "captions.json"
-            needs_preprocessing = self._should_preprocess_data(width, height, num_frames)
+            needs_preprocessing = self._should_preprocess_data(params.width, params.height, params.num_frames)
 
-            if not training_captions_file.exists():
-                # Load captions
-                captions_file = data_dir / "dataset.json"
-                if not captions_file.exists():
-                    return "No captions.json found. Please process videos first.", gr.update(interactive=True)
+            # Sync captions from UI
+            captions_data, error_message = self._sync_captions_from_ui(params, training_captions_file)
+            if error_message:
+                return error_message, gr.update(interactive=True)
 
-                with open(captions_file) as f:
-                    captions_data = json.load(f)
-
-                # Copy videos and create dataset entries
-                dataset = []
-                for video in videos:
-                    video_path = Path(video)
-                    video_name = video_path.name
-                    if video_name not in captions_data:
-                        return f"No caption found for video {video_name}. Please process videos first.", gr.update(
-                            interactive=True
-                        )
-
-                    # Copy video to training directory
-                    target_path = data_dir / video_name
-                    try:
-                        shutil.copy2(video, target_path)  # Copy with metadata
-                        video_path.unlink()  # Remove original after successful copy
-                    except Exception as e:
-                        return f"Error copying video {video_path.name}: {e!s}", gr.update(interactive=True)
-
-                    # Add dataset entry with relative path
-                    dataset.append(
-                        {"caption": captions_data[video_name], "media_path": str(target_path.relative_to(data_dir))}
+            # Copy videos and create dataset entries
+            dataset = []
+            for video in params.videos:
+                video_path = Path(video)
+                video_name = video_path.name
+                if video_name not in captions_data:
+                    return f"No caption found for video {video_name}. Please process videos first.", gr.update(
+                        interactive=True
                     )
-
-                # Save dataset.json with updated paths
-                with open(training_captions_file, "w") as f:
-                    json.dump(dataset, f, indent=2)
+                # Copy video to training directory
+                target_path = data_dir / video_name
+                try:
+                    shutil.copy2(video, target_path)  # Copy with metadata
+                    video_path.unlink()  # Remove original after successful copy
+                except Exception as e:
+                    return f"Error copying video {video_path.name}: {e!s}", gr.update(interactive=True)
+                # Add dataset entry with relative path
+                dataset.append(
+                    {"caption": captions_data[video_name], "media_path": str(target_path.relative_to(data_dir))}
+                )
+            # Save dataset.json with updated paths
+            with open(training_captions_file, "w") as f:
+                json.dump(dataset, f, indent=2)
 
             # Preprocess if needed (first time or resolution changed)
             if needs_preprocessing:
@@ -603,30 +623,30 @@ class GradioUI:
 
                 success, error_msg = self._preprocess_dataset(
                     dataset_file=training_captions_file,
-                    model_source=model_source,
-                    width=width,
-                    height=height,
-                    num_frames=num_frames,
-                    id_token=id_token,
+                    model_source=params.model_source,
+                    width=params.width,
+                    height=params.height,
+                    num_frames=params.num_frames,
+                    id_token=params.id_token,
                 )
                 if not success:
                     return error_msg, gr.update(interactive=True)
 
                 # Save current resolution config after successful preprocessing
-                self._save_resolution_config(width, height, num_frames)
+                self._save_resolution_config(params.width, params.height, params.num_frames)
 
             # Generate training config
             config_params = TrainingConfigParams(
-                model_source=model_source,
-                learning_rate=learning_rate,
-                steps=steps,
-                lora_rank=lora_rank,
-                batch_size=batch_size,
-                validation_prompt=validation_prompt,
-                video_dims=(width, height, num_frames),
-                validation_interval=validation_interval,
-                push_to_hub=push_to_hub,
-                hub_model_id=hf_model_id if push_to_hub else None,
+                model_source=params.model_source,
+                learning_rate=params.learning_rate,
+                steps=params.steps,
+                lora_rank=params.lora_rank,
+                batch_size=params.batch_size,
+                validation_prompt=params.validation_prompt,
+                video_dims=(params.width, params.height, params.num_frames),
+                validation_interval=params.validation_interval,
+                push_to_hub=params.push_to_hub,
+                hub_model_id=params.hf_model_id if params.push_to_hub else None,
             )
 
             config = generate_training_config(config_params, str(data_dir))
@@ -713,9 +733,10 @@ class GradioUI:
                         # Video upload and caption section
                         self.video_upload = gr.File(label="Upload Videos", file_count="multiple", file_types=["video"])
                         self.caption_output = gr.Textbox(label="Generated/Edited Caption", interactive=True)
-                        self.dataset_display = gr.JSON(
-                            label="Dataset JSON",
-                            show_label=True,
+                        self.dataset_display = gr.Code(
+                            label="Captions JSON",
+                            language="json",
+                            interactive=True,
                         )
 
                         generate_btn = gr.Button("Generate Caption")
@@ -727,6 +748,7 @@ class GradioUI:
                             placeholder="Enter the prompt to use for validation samples",
                             value="a professional portrait video of a person with blurry bokeh background",
                             interactive=True,
+                            info="Include the LoRA ID token (e.g., &lt;lora&gt;) in this prompt if desired.",
                         )
 
                     with gr.Column():
@@ -761,7 +783,7 @@ class GradioUI:
                             label="LoRA ID Token",
                             placeholder="Optional: Enter token to prepend to captions (e.g., <lora>)",
                             value="",
-                            info="This token will be prepended to all captions during training",
+                            info="This token will be prepended to all training captions during training",
                         )
 
                         # Resolution inputs
@@ -854,7 +876,41 @@ class GradioUI:
             )
 
             train_btn.click(
-                self.start_training,
+                lambda videos,
+                validation_prompt,
+                lr,
+                steps,
+                lora_rank,
+                batch_size,
+                model_source,
+                width,
+                height,
+                num_frames,
+                push_to_hub,
+                hf_model_id,
+                hf_token,
+                id_token,
+                validation_interval,
+                captions_json: self.start_training(
+                    TrainingParams(
+                        videos=videos,
+                        validation_prompt=validation_prompt,
+                        learning_rate=lr,
+                        steps=steps,
+                        lora_rank=lora_rank,
+                        batch_size=batch_size,
+                        model_source=model_source,
+                        width=width,
+                        height=height,
+                        num_frames=num_frames,
+                        push_to_hub=push_to_hub,
+                        hf_model_id=hf_model_id,
+                        hf_token=hf_token,
+                        id_token=id_token,
+                        validation_interval=validation_interval,
+                        captions_json=captions_json,
+                    )
+                ),
                 inputs=[
                     self.video_upload,
                     self.validation_prompt,
@@ -871,6 +927,7 @@ class GradioUI:
                     hf_token,
                     id_token,
                     validation_interval,
+                    self.dataset_display,
                 ],
                 outputs=[self.status_output, train_btn],
             )
