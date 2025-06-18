@@ -5,7 +5,7 @@ from pathlib import Path  # noqa: I001
 import torch
 from torch import Tensor
 import torchvision.transforms as T  # noqa: N812
-
+import torchvision.io
 import decord  # Note: Decord must be imported after torch
 
 # Configure decord to use PyTorch tensors
@@ -115,3 +115,28 @@ def crop_video(video: Tensor, target_width: int, target_height: int) -> Tensor:
     )
 
     return video
+
+
+def save_video(video_tensor: torch.Tensor, output_path: Path, fps: float = 24.0) -> None:
+    """Save a video tensor to a file.
+
+    Args:
+        video_tensor: Video tensor of shape [F, C, H, W] in range [0, 255]
+        output_path: Path to save the video
+        fps: Frames per second for the output video
+    """
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Convert to uint8 and correct format for torchvision.io.write_video
+    video_tensor = video_tensor.clamp(0, 255).to(torch.uint8)
+    video_tensor = video_tensor.permute(0, 2, 3, 1)  # [F, C, H, W] -> [F, H, W, C]
+
+    # Save video
+    torchvision.io.write_video(
+        str(output_path),
+        video_tensor.cpu(),
+        fps=fps,
+        video_codec="h264",
+        options={"crf": "18"},
+    )

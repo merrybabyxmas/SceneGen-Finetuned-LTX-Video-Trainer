@@ -399,6 +399,14 @@ conditioning:
 - Reference and target videos must have *identical* resolution and length
 - Both reference and target videos should be preprocessed together using the same resolution buckets
 
+We provide an example script to generate Canny reference videos for a given dataset. Note that it takes as an input a json file as the dataset configuration (eg. output of `caption_videos.py`), and edits the json to include the names of generated reference videos.
+```bash
+python scripts/compute_condition.py scenes_output_dir/ \
+    --output scenes_output_dir/captions.json
+```
+
+to compute a different condition, simply implement the function `compute_condition()` inside this script.
+
 **Configuration Requirements for IC-LoRA:**
 - You must provide `reference_videos` in your validation configuration when using IC-LoRA training
 - The number of reference videos must match the number of validation prompts
@@ -460,7 +468,6 @@ CUDA_VISIBLE_DEVICES=0,1 python scripts/train_distributed.py configs/ltxv_2b_lor
 - `--num_processes`: Number of GPUs/processes to use (overrides auto-detection).
 - `--disable_progress_bars`: Disables rich progress bars (recommended for multi-GPU runs).
 
-The script will automatically detect the number of available GPUs using `nvidia-smi` if `--num_processes` is not specified.
 
 ### 🤗 Pushing Models to Hugging Face Hub
 
