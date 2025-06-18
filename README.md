@@ -332,7 +332,7 @@ for your training runs:
 - 📄 [Full Model Fine-tuning Example](configs/ltxv_2b_full.yaml)
 - 📄 [LoRA Fine-tuning Example](configs/ltxv_2b_lora.yaml)
 - 📄 [LoRA Fine-tuning Example (Low VRAM)](configs/ltxv_2b_lora_low_vram.yaml) - Optimized for GPUs with 24GB VRAM.
-- 📄 [IC-LoRA Training Examples](configs/) - Video-to-video transformation training
+- 📄 [IC-LoRA Training Examples](configs/ltxv_13b_ic_lora.yaml) - Video-to-video transformation training
 
 ---
 
