@@ -264,6 +264,8 @@ class MediaDataset(Dataset):
 
         frame_indices = list(range(video_num_frames))
         frames = video_reader.get_batch(frame_indices)
+        if isinstance(frames, np.ndarray):
+            frames = torch.from_numpy(frames)
         frames = frames[:nearest_frame_bucket].float() / 255.0
         frames = frames.permute(0, 3, 1, 2).contiguous()
 
