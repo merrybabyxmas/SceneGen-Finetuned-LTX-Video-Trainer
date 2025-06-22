@@ -11,10 +11,11 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from ltxv_trainer import logger
 from ltxv_trainer.config import LtxvTrainerConfig
 from ltxv_trainer.model_loader import try_parse_version
-from ltxv_trainer.utils import convert_checkpoint
 
 
-def push_to_hub(weights_path: Path, sampled_videos_paths: List[Path], config: LtxvTrainerConfig) -> None:
+def push_to_hub(
+    weights_path: Path, comfy_model_path: Path, sampled_videos_paths: List[Path], config: LtxvTrainerConfig
+) -> None:
     """Push the trained LoRA weights to HuggingFace Hub."""
     if not config.hub.hub_model_id:
         logger.warning("⚠️ HuggingFace hub_model_id not specified, skipping push to hub")
@@ -53,20 +54,10 @@ def push_to_hub(weights_path: Path, sampled_videos_paths: List[Path], config: Lt
                     # Copy original weights
                     task_copy = progress.add_task("Copying original weights...", total=None)
                     weights_dest = temp_path / weights_path.name
+                    comfy_weights_dest = temp_path / comfy_model_path.name
                     shutil.copy2(weights_path, weights_dest)
+                    shutil.copy2(comfy_model_path, comfy_weights_dest)
                     progress.update(task_copy, description="✓ Original weights copied")
-
-                    # Convert and save ComfyUI version
-                    task_convert = progress.add_task("Converting to ComfyUI format...", total=None)
-                    comfy_filename = f"comfyui_{weights_path.name}"
-                    comfy_path = temp_path / comfy_filename
-
-                    convert_checkpoint(
-                        input_path=str(weights_path),
-                        to_comfy=True,
-                        output_path=str(comfy_path),
-                    )
-                    progress.update(task_convert, description="✓ ComfyUI conversion complete")
 
                     # Create model card and save samples
                     task_card = progress.add_task("Creating model card and samples...", total=None)

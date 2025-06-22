@@ -54,7 +54,7 @@ from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
 from ltxv_trainer.training_strategies import get_training_strategy
-from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb
+from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb, convert_checkpoint
 from ltxv_trainer.video_utils import read_video
 
 
@@ -325,17 +325,22 @@ class LtxvTrainer:
 
         if IS_MAIN_PROCESS:
             saved_path = self._save_checkpoint()
-
+            comfy_path = saved_path.parent / f"comfy_{saved_path.name}"
+            convert_checkpoint(
+                input_path=str(saved_path),
+                to_comfy=True,
+                output_path=str(comfy_path),
+            )
             # Upload artifacts to hub if enabled
             if cfg.hub.push_to_hub:
-                push_to_hub(saved_path, sampled_videos_paths, self._config)
+                push_to_hub(saved_path, comfy_path, sampled_videos_paths, self._config)
 
             # Log the training statistics
             self._log_training_stats(stats)
 
         self._accelerator.end_training()
 
-        return saved_path, stats
+        return comfy_path, stats
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
         """Perform a single training step using the configured strategy."""
