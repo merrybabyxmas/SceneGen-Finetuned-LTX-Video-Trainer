@@ -272,7 +272,7 @@ def main(
 
     Examples:
         # Process all videos in a directory
-        compute_condition.py videos_dir/ -o videos_dir/captions.json -r
+        compute_condition.py videos_dir/ -o videos_dir/captions.json
     """
 
     # Ensure output path is absolute
