@@ -62,7 +62,7 @@ python scripts/preprocess_dataset.py dataset.json \
 
 # Fewer frames
 python scripts/preprocess_dataset.py dataset.json \
-    --resolution-buckets "768x768x25"  # 17 frames instead of 49
+    --resolution-buckets "768x768x25"  # 25 frames instead of 49
 ```
 
 #### 4. Memory-Optimized Configuration
