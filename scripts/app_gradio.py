@@ -24,11 +24,8 @@ from ltxv_trainer.model_loader import (
     LtxvModelVersion,
 )
 from ltxv_trainer.trainer import LtxvTrainer, LtxvTrainerConfig
-from scripts.preprocess_dataset import (
-    DatasetPreprocessor,
-    PreprocessingArgs,
-    _parse_resolution_buckets,
-)
+from scripts.preprocess_dataset import preprocess_dataset
+from scripts.process_videos import parse_resolution_buckets
 
 # Setup logging
 logging.basicConfig(
@@ -208,7 +205,7 @@ def generate_training_config(params: TrainingConfigParams, training_data_dir: st
         Dictionary containing the complete training configuration
     """
     # Load the template config
-    template_path = Path(__file__).parent / "configs" / "ltxv_13b_lora_template.yaml"
+    template_path = Path(__file__).parent.parent / "configs" / "ltxv_13b_lora_template.yaml"
     with open(template_path) as f:
         config = yaml.safe_load(f)
 
@@ -406,7 +403,7 @@ class GradioUI:
 
         # Generate a unique filename for the checkpoint using UTC timezone
         timestamp = datetime.datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        checkpoint_filename = f"ltxv_lora_checkpoint_{timestamp}.safetensors"
+        checkpoint_filename = f"comfy_lora_checkpoint_{timestamp}.safetensors"
         permanent_checkpoint_path = permanent_checkpoint_dir / checkpoint_filename
 
         try:
@@ -455,33 +452,25 @@ class GradioUI:
                 shutil.rmtree(precomputed_dir)
 
             resolution_buckets = f"{width}x{height}x{num_frames}"
-            parsed_buckets = _parse_resolution_buckets(resolution_buckets)
+            parsed_buckets = parse_resolution_buckets(resolution_buckets)
 
-            # Initialize preprocessor with correct settings
-            preprocessor = DatasetPreprocessor(
-                model_source=model_source,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                load_text_encoder_in_8bit=False,  # Changed from True to False to avoid the .to() error
-            )
-
-            args = PreprocessingArgs(
-                dataset_path=str(dataset_file),
+            # Run preprocessing using the function directly
+            preprocess_dataset(
+                dataset_file=str(dataset_file),
                 caption_column="caption",
                 video_column="media_path",
                 resolution_buckets=parsed_buckets,
                 batch_size=1,
-                num_workers=0,  # Set to 0 to avoid multiprocessing issues
                 output_dir=None,
                 id_token=id_token,
-                vae_tiling=False,  # Keep this False during preprocessing
-                decode_videos=True,  # Keep video decoding enabled for verification
+                vae_tiling=False,
+                decode_videos=True,
+                model_source=model_source,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                load_text_encoder_in_8bit=False,
             )
 
-            # Run preprocessing
-            preprocessor.preprocess(args)
-
             # Clean up preprocessor
-            del preprocessor
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -497,6 +486,7 @@ class GradioUI:
         width: int,
         height: int,
         num_frames: int,
+        videos: list[str],
     ) -> bool:
         """Check if data needs to be preprocessed based on resolution changes.
 
@@ -504,24 +494,32 @@ class GradioUI:
             width: Video width
             height: Video height
             num_frames: Number of frames
+            videos: List of video file paths
 
         Returns:
             True if preprocessing is needed, False otherwise
         """
         resolution_file = TRAINING_DATA_DIR / ".resolution_config"
         current_resolution = f"{width}x{height}x{num_frames}"
+        needs_to_copy = False
+        for video in videos:
+            if Path(video).exists():
+                needs_to_copy = True
+        if needs_to_copy:
+            logger.info("Videos provided, will copy them to training directory.")
+            return True, needs_to_copy
 
         # If no previous resolution or dataset, preprocessing is needed
         if not resolution_file.exists() or not (TRAINING_DATA_DIR / "captions.json").exists():
-            return True
+            return True, needs_to_copy
 
         # Check if resolution has changed
         try:
             with open(resolution_file) as f:
                 previous_resolution = f.read().strip()
-            return previous_resolution != current_resolution
+            return previous_resolution != current_resolution, needs_to_copy
         except Exception:
-            return True
+            return True, needs_to_copy
 
     def _save_resolution_config(
         self,
@@ -560,6 +558,7 @@ class GradioUI:
         else:
             return None, "No captions found in the UI. Please process videos first."
 
+    # ruff: noqa: PLR0912
     def start_training(
         self,
         params: TrainingParams,
@@ -583,7 +582,9 @@ class GradioUI:
 
             # Check if we need to copy and process data (first training session)
             training_captions_file = data_dir / "captions.json"
-            needs_preprocessing = self._should_preprocess_data(params.width, params.height, params.num_frames)
+            needs_preprocessing, needs_to_copy = self._should_preprocess_data(
+                params.width, params.height, params.num_frames, params.videos
+            )
 
             # Sync captions from UI
             captions_data, error_message = self._sync_captions_from_ui(params, training_captions_file)
@@ -591,28 +592,29 @@ class GradioUI:
                 return error_message, gr.update(interactive=True)
 
             # Copy videos and create dataset entries
-            dataset = []
-            for video in params.videos:
-                video_path = Path(video)
-                video_name = video_path.name
-                if video_name not in captions_data:
-                    return f"No caption found for video {video_name}. Please process videos first.", gr.update(
-                        interactive=True
+            if needs_to_copy:
+                dataset = []
+                for video in params.videos:
+                    video_path = Path(video)
+                    video_name = video_path.name
+                    if video_name not in captions_data:
+                        return f"No caption found for video {video_name}. Please process videos first.", gr.update(
+                            interactive=True
+                        )
+                    # Copy video to training directory
+                    target_path = data_dir / video_name
+                    try:
+                        shutil.copy2(video, target_path)  # Copy with metadata
+                        video_path.unlink()  # Remove original after successful copy
+                    except Exception as e:
+                        return f"Error copying video {video_path.name}: {e!s}", gr.update(interactive=True)
+                    # Add dataset entry with relative path
+                    dataset.append(
+                        {"caption": captions_data[video_name], "media_path": str(target_path.relative_to(data_dir))}
                     )
-                # Copy video to training directory
-                target_path = data_dir / video_name
-                try:
-                    shutil.copy2(video, target_path)  # Copy with metadata
-                    video_path.unlink()  # Remove original after successful copy
-                except Exception as e:
-                    return f"Error copying video {video_path.name}: {e!s}", gr.update(interactive=True)
-                # Add dataset entry with relative path
-                dataset.append(
-                    {"caption": captions_data[video_name], "media_path": str(target_path.relative_to(data_dir))}
-                )
-            # Save dataset.json with updated paths
-            with open(training_captions_file, "w") as f:
-                json.dump(dataset, f, indent=2)
+                # Save dataset.json with updated paths
+                with open(training_captions_file, "w") as f:
+                    json.dump(dataset, f, indent=2)
 
             # Preprocess if needed (first time or resolution changed)
             if needs_preprocessing:

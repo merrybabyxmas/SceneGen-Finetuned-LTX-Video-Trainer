@@ -32,6 +32,7 @@ Note that while more user-friendly, it's less flexible configuration-wise than t
 uv sync
 source .venv/bin/activate
 
+cd scripts
 # Launch the Gradio interface
 python app_gradio.py
 ```
