@@ -266,7 +266,7 @@ def compute_captions_embeddings(
         text_encoder = load_text_encoder(load_in_8bit=load_text_encoder_in_8bit).to(device)
 
     # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # Process batches
     total_batches = len(dataloader)

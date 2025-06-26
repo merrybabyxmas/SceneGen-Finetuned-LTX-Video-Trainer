@@ -373,7 +373,7 @@ def compute_video_latents(
         vae.enable_tiling()
 
     # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Process batches
     with Progress(
