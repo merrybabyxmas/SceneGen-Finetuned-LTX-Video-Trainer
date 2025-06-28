@@ -73,10 +73,12 @@ def compute_condition(
         )
 
         # Convert back to tensor
-        edge_mask = torch.from_numpy(edges).float() / 255.0
+        edge_mask = torch.from_numpy(edges).float()
         edge_masks.append(edge_mask)
 
-    return torch.stack(edge_masks)
+    edges = torch.stack(edge_masks)
+    edges = torch.stack([edges] * 3, dim=1)  # Convert to 3-channel
+    return edges
 
 
 def _get_meta_data(
@@ -202,19 +204,18 @@ def process_media(
                     video = read_video(media_file)
 
                     # Process frames in batches
-                    edge_frames = []
+                    condition_frames = []
 
                     for i in range(0, len(video), batch_size):
                         batch = video[i : i + batch_size]
-                        edges = compute_condition(batch)
-                        edges = torch.stack([edges] * 3, dim=1) * 255  # Convert to 3-channel
-                        edge_frames.append(edges)
+                        condition_batch = compute_condition(batch)
+                        condition_frames.append(condition_batch)
 
                     # Concatenate all edge frames
-                    all_edges = torch.cat(edge_frames, dim=0)
+                    all_condition = torch.cat(condition_frames, dim=0)
 
                     # Save the edge video
-                    save_video(all_edges, reference_path.resolve())
+                    save_video(all_condition, reference_path.resolve())
 
                 except Exception as e:
                     console.print(f"[bold red]Error processing [bold blue]{media_file}[/]: {e}[/]")

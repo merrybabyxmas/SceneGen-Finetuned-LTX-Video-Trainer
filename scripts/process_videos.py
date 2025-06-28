@@ -67,6 +67,7 @@ class MediaDataset(Dataset):
     def __init__(
         self,
         dataset_file: str | Path,
+        main_media_column: str,
         video_column: str,
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
@@ -83,12 +84,15 @@ class MediaDataset(Dataset):
         super().__init__()
 
         self.dataset_file = Path(dataset_file)
-        self.video_column = video_column
+        self.main_media_column = main_media_column
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
 
-        # Load video paths
-        self.video_paths = self._load_video_paths()
+        # First load main media paths
+        self.main_media_paths = self._load_video_paths(main_media_column)
+
+        # Then load reference video paths
+        self.video_paths = self._load_video_paths(video_column)
 
         # Filter out videos with insufficient frames
         self._filter_valid_videos()
@@ -117,6 +121,7 @@ class MediaDataset(Dataset):
         # Compute relative path of the video
         data_root = self.dataset_file.parent
         relative_path = str(video_path.relative_to(data_root))
+        media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             video = self._preprocess_image(video_path)
@@ -127,6 +132,7 @@ class MediaDataset(Dataset):
         return {
             "video": video,
             "relative_path": relative_path,
+            "main_media_relative_path": media_relative_path,
             "video_metadata": {
                 "num_frames": video.shape[0],
                 "height": video.shape[2],
@@ -135,25 +141,25 @@ class MediaDataset(Dataset):
             },
         }
 
-    def _load_video_paths(self) -> list[Path]:
+    def _load_video_paths(self, column: str) -> list[Path]:
         """Load video paths from the specified data source."""
         if self.dataset_file.suffix == ".csv":
-            return self._load_video_paths_from_csv()
+            return self._load_video_paths_from_csv(column)
         elif self.dataset_file.suffix == ".json":
-            return self._load_video_paths_from_json()
+            return self._load_video_paths_from_json(column)
         elif self.dataset_file.suffix == ".jsonl":
-            return self._load_video_paths_from_jsonl()
+            return self._load_video_paths_from_jsonl(column)
         else:
             raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
 
-    def _load_video_paths_from_csv(self) -> list[Path]:
+    def _load_video_paths_from_csv(self, column: str) -> list[Path]:
         """Load video paths from a CSV file."""
         df = pd.read_csv(self.dataset_file)
-        if self.video_column not in df.columns:
-            raise ValueError(f"Column '{self.video_column}' not found in CSV file")
+        if column not in df.columns:
+            raise ValueError(f"Column '{column}' not found in CSV file")
 
         data_root = self.dataset_file.parent
-        video_paths = [data_root / Path(line.strip()) for line in df[self.video_column].tolist()]
+        video_paths = [data_root / Path(line.strip()) for line in df[column].tolist()]
 
         # Validate that all paths exist
         invalid_paths = [path for path in video_paths if not path.is_file()]
@@ -162,7 +168,7 @@ class MediaDataset(Dataset):
 
         return video_paths
 
-    def _load_video_paths_from_json(self) -> list[Path]:
+    def _load_video_paths_from_json(self, column: str) -> list[Path]:
         """Load video paths from a JSON file."""
         with open(self.dataset_file, "r", encoding="utf-8") as file:
             data = json.load(file)
@@ -173,9 +179,9 @@ class MediaDataset(Dataset):
         data_root = self.dataset_file.parent
         video_paths = []
         for entry in data:
-            if self.video_column not in entry:
-                raise ValueError(f"Key '{self.video_column}' not found in JSON entry")
-            video_paths.append(data_root / Path(entry[self.video_column].strip()))
+            if column not in entry:
+                raise ValueError(f"Key '{column}' not found in JSON entry")
+            video_paths.append(data_root / Path(entry[column].strip()))
 
         # Validate that all paths exist
         invalid_paths = [path for path in video_paths if not path.is_file()]
@@ -184,16 +190,16 @@ class MediaDataset(Dataset):
 
         return video_paths
 
-    def _load_video_paths_from_jsonl(self) -> list[Path]:
+    def _load_video_paths_from_jsonl(self, column: str) -> list[Path]:
         """Load video paths from a JSONL file."""
         data_root = self.dataset_file.parent
         video_paths = []
         with open(self.dataset_file, "r", encoding="utf-8") as file:
             for line in file:
                 entry = json.loads(line)
-                if self.video_column not in entry:
-                    raise ValueError(f"Key '{self.video_column}' not found in JSONL entry")
-                video_paths.append(data_root / Path(entry[self.video_column].strip()))
+                if column not in entry:
+                    raise ValueError(f"Key '{column}' not found in JSONL entry")
+                video_paths.append(data_root / Path(entry[column].strip()))
 
         # Validate that all paths exist
         invalid_paths = [path for path in video_paths if not path.is_file()]
@@ -319,6 +325,7 @@ def compute_video_latents(
     resolution_buckets: list[tuple[int, int, int]],
     output_dir: str,
     model_source: str,
+    main_media_column: str | None = None,
     reshape_mode: str = "center",
     batch_size: int = 1,
     device: str = "cuda",
@@ -334,6 +341,7 @@ def compute_video_latents(
         output_dir: Directory to save latents
         model_source: Model source for VAE
         reshape_mode: How to crop videos ("center", "random")
+        main_media_column: Column name for main media paths (if different from video_column)
         batch_size: Batch size for processing
         device: Device to use for computation
         vae_tiling: Whether to enable VAE tiling
@@ -356,6 +364,7 @@ def compute_video_latents(
     # Create dataset
     dataset = MediaDataset(
         dataset_file=dataset_file,
+        main_media_column=main_media_column or video_column,
         video_column=video_column,
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
@@ -399,7 +408,7 @@ def compute_video_latents(
 
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):
-                output_rel_path = Path(batch["relative_path"][i]).with_suffix(".pt")
+                output_rel_path = Path(batch["main_media_relative_path"][i]).with_suffix(".pt")
                 output_file = output_path / output_rel_path
 
                 # Create output directory maintaining structure

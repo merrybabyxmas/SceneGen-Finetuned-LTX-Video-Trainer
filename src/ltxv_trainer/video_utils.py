@@ -129,7 +129,9 @@ def save_video(video_tensor: torch.Tensor, output_path: Path, fps: float = 24.0)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Convert to uint8 and correct format for torchvision.io.write_video
-    video_tensor = video_tensor.clamp(0, 255).to(torch.uint8)
+    if video_tensor.max() <= 1:
+        video_tensor = video_tensor * 255
+    video_tensor = video_tensor.to(torch.uint8)
     video_tensor = video_tensor.permute(0, 2, 3, 1)  # [F, C, H, W] -> [F, H, W, C]
 
     # Save video

@@ -92,6 +92,7 @@ def preprocess_dataset(  # noqa: PLR0913
 
         compute_video_latents(
             dataset_file=dataset_file,
+            main_media_column=video_column,
             video_column=reference_column,
             resolution_buckets=resolution_buckets,
             output_dir=str(reference_latents_dir),
