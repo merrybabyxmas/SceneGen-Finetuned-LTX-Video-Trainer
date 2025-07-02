@@ -724,7 +724,7 @@ class LtxvTrainer:
             # Load and add reference video, if provided
             if self._config.validation.reference_videos is not None:
                 video_path = self._config.validation.reference_videos[j]
-                ref_video = read_video(video_path, target_frames=frames)
+                ref_video, _ = read_video(video_path, target_frames=frames)
                 pipeline_inputs["reference_video"] = ref_video
 
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
@@ -733,7 +733,7 @@ class LtxvTrainer:
 
             for video in videos:
                 video_path = output_dir / f"step_{self._global_step:06d}_{i}.mp4"
-                export_to_video(video, str(video_path), fps=25)
+                export_to_video(video, str(video_path), fps=24)
                 video_paths.append(video_path)
                 i += 1
             progress.update(task, advance=1)

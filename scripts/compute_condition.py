@@ -201,7 +201,7 @@ def process_media(
 
             if not reference_path.resolve().exists() or override:
                 try:
-                    video = read_video(media_file)
+                    video, fps = read_video(media_file)
 
                     # Process frames in batches
                     condition_frames = []
@@ -215,7 +215,7 @@ def process_media(
                     all_condition = torch.cat(condition_frames, dim=0)
 
                     # Save the edge video
-                    save_video(all_condition, reference_path.resolve())
+                    save_video(all_condition, reference_path.resolve(), fps=fps)
 
                 except Exception as e:
                     console.print(f"[bold red]Error processing [bold blue]{media_file}[/]: {e}[/]")

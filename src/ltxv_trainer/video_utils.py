@@ -2,6 +2,7 @@
 
 from pathlib import Path  # noqa: I001
 
+from fractions import Fraction
 import torch
 from torch import Tensor
 import torchvision.transforms as T  # noqa: N812
@@ -12,7 +13,7 @@ import decord  # Note: Decord must be imported after torch
 decord.bridge.set_bridge("torch")
 
 
-def read_video(video_path: str | Path, target_frames: int | None = None) -> Tensor:
+def read_video(video_path: str | Path, target_frames: int | None = None) -> tuple[Tensor, float]:
     """Load and sample frames from a video file.
 
     Args:
@@ -20,13 +21,14 @@ def read_video(video_path: str | Path, target_frames: int | None = None) -> Tens
         target_frames: Target number of frames to sample. If None, loads all frames.
 
     Returns:
-        Video tensor with shape [F, C, H, W] in range [0, 1]
+        Video tensor with shape [F, C, H, W] in range [0, 1] and frames per second (fps).
 
     Raises:
         ValueError: If video has fewer frames than target_frames
     """
     # Load video using decord
     video_reader = decord.VideoReader(str(video_path))
+    fps = video_reader.get_avg_fps()
 
     total_frames = len(video_reader)
 
@@ -45,7 +47,7 @@ def read_video(video_path: str | Path, target_frames: int | None = None) -> Tens
 
     frames = frames.permute(0, 3, 1, 2)  # [F, H, W, C] -> [F, C, H, W]
 
-    return frames
+    return frames, fps
 
 
 def resize_video(frames: Tensor, target_width: int, target_height: int) -> Tensor:
@@ -138,7 +140,7 @@ def save_video(video_tensor: torch.Tensor, output_path: Path, fps: float = 24.0)
     torchvision.io.write_video(
         str(output_path),
         video_tensor.cpu(),
-        fps=fps,
+        fps=Fraction(fps).limit_denominator(1000),
         video_codec="h264",
         options={"crf": "18"},
     )
