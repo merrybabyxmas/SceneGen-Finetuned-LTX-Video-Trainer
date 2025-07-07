@@ -707,6 +707,7 @@ class LtxvTrainer:
                 "height": height,
                 "num_frames": frames,
                 "num_inference_steps": self._config.validation.inference_steps,
+                "guidance_scale": self._config.validation.guidance_scale,
                 "generator": generator,
                 "output_reference_comparison": True,
             }
@@ -724,7 +725,7 @@ class LtxvTrainer:
             # Load and add reference video, if provided
             if self._config.validation.reference_videos is not None:
                 video_path = self._config.validation.reference_videos[j]
-                ref_video, _ = read_video(video_path, target_frames=frames)
+                ref_video, _ = read_video(video_path)[:frames]
                 pipeline_inputs["reference_video"] = ref_video
 
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
