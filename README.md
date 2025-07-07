@@ -2,12 +2,13 @@
 
 <img src="assets/banner.webp" alt="LTX-Video Community Trainer Banner" width="75%">
 
-[Official GitHub Repo](https://github.com/Lightricks/LTX-Video) |
-[Website](https://www.lightricks.com/ltxv) |
-[Model](https://huggingface.co/Lightricks/LTX-Video) |
-[Demo](https://app.ltx.studio/ltx-video) |
-[Paper](https://arxiv.org/abs/2501.00103) |
-[Discord](https://discord.gg/Mn8BRgUKKy)
+[![GitHub](https://img.shields.io/badge/LTXV-Repo-blue?logo=github)](https://github.com/Lightricks/LTX-Video)
+[![Website](https://img.shields.io/badge/Website-LTXV-181717?logo=google-chrome)](https://www.lightricks.com/ltxv)
+[![Model](https://img.shields.io/badge/HuggingFace-Model-orange?logo=huggingface)](https://huggingface.co/Lightricks/LTX-Video)
+[![ComfyUI Nodes](https://img.shields.io/badge/ComfyUI-Nodes-purple)](https://github.com/Lightricks/ComfyUI-LTXVideo)
+[![Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?logo=vercel)](https://app.ltx.studio/ltx-video)
+[![Paper](https://img.shields.io/badge/Paper-arXiv-B31B1B?logo=arxiv)](https://arxiv.org/abs/2501.00103)
+[![Discord](https://img.shields.io/badge/Join-Discord-5865F2?logo=discord)](https://discord.gg/Mn8BRgUKKy)
 
 </div>
 
