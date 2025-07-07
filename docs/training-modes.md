@@ -77,6 +77,7 @@ IC-LoRA training fundamentally differs from standard LoRA and full fine-tuning:
 - **Target videos** are noised during training and represent the desired "after" state
 - **The model learns transformations** from reference videos to target videos
 - **Loss is applied only to the target portion**, not the reference
+- **Training and inference time increase significantly** due to the doubled sequence length from concatenating reference and target video tokens
 
 To enable IC-LoRA training, configure your YAML file with:
 
@@ -130,6 +131,18 @@ validation:
 - Creating control adapters (e.g., Canny edge → video)
 - Implementing style transfer effects
 - Building conditional generation models
+
+### Pretrained IC-LoRA Models
+
+To help you get started with IC-LoRA training and understand the capabilities, we provide several pretrained control models:
+
+**🎨 LTXV Control Adapters:**
+- **[Depth Map Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-depth-13b-0.9.7)** - Generate videos from depth maps
+- **[Human Pose Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-pose-13b-0.9.7)** - Generate videos from pose skeletons
+- **[Canny Edge Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-canny-13b-0.9.7)** - Generate videos from Canny edge maps
+
+These models demonstrate the power of IC-LoRA for creating precise control over video generation.
+You can use them directly for inference or as inspiration for training your own control adapters.
 
 ## 🚀 Next Steps
 

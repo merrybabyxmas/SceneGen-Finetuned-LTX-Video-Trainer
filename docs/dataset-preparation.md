@@ -241,6 +241,10 @@ python scripts/preprocess_dataset.py dataset.json \
 
 This will create an additional `reference_latents/` directory containing the preprocessed reference video latents.
 
+### Example Dataset
+
+For reference, see our **[🎯 Canny Control Dataset](https://huggingface.co/datasets/Lightricks/Canny-Control-Dataset)** which demonstrates proper IC-LoRA dataset structure with paired videos and Canny edge maps.
+
 ### Generating Reference Videos
 
 **Dataset Requirements for IC-LoRA:**
@@ -248,7 +252,7 @@ This will create an additional `reference_latents/` directory containing the pre
 - Reference and target videos must have *identical* resolution and length
 - Both reference and target videos should be preprocessed together using the same resolution buckets
 
-We provide an example script, [`scripts/compute_condition.py`](../scripts/compute_condition.py), to generate Canny reference videos for a given dataset.
+We provide an example script, [`scripts/compute_condition.py`](../scripts/compute_condition.py), to generate Canny reference videos for a given dataset, similar to the approach used in our example dataset.
 This script accepts a JSON file as the dataset configuration (such as the output from `caption_videos.py`) and updates it in-place by adding the filenames of the generated reference videos.
 
 ```bash

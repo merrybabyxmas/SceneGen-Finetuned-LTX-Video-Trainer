@@ -44,17 +44,25 @@ All detailed guides and technical documentation have been moved to the `docs/` d
 
 ## 🔥 Changelog
 
-- **23.06.2025:** Added support for training IC-LoRAs (In-Context LoRAs) for advanced video-to-video transformations.
-- **06.05.2025:** Added support for LTXV 13B. Example training configs can be found in [configs/ltxv_13b_lora_cakeify.yaml](configs/ltxv_13b_lora_cakeify.yaml) and [configs/ltxv_13b_lora_squish.yaml](configs/ltxv_13b_lora_squish.yaml).
+- **08.07.2025:** Added support for training IC-LoRAs (In-Context LoRAs) for advanced video-to-video transformations. See the [training modes](https://github.com/LightricksResearch/LTX-Video-Trainer-Internal/blob/main/docs/training-modes.md#-in-context-lora-ic-lora-training) doc for more details.
+Pretrained control models: [Depth](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-depth-13b-0.9.7), [Pose](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-pose-13b-0.9.7), [Canny](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-canny-13b-0.9.7).
+- **06.05.2025:** Added support for LTXV 13B.
+  An example training configuration can be found [here](configs/ltxv_13b_lora_cakeify.yaml).
 
 ---
 
-## 🍰 Example LoRAs
+## 🍰 Example Models
 
-- [Cakeify LoRA](https://huggingface.co/Lightricks/LTX-Video-Cakeify-LoRA): Transforms videos to make objects appear as if they're made of cake. ([Cakeify Dataset](https://huggingface.co/datasets/Lightricks/Cakeify-Dataset))
-- [Squish LoRA](https://huggingface.co/Lightricks/LTX-Video-Squish-LoRA): Creates a playful squishing effect. ([Squish Dataset](https://huggingface.co/datasets/Lightricks/Squish-Dataset))
+### Standard LoRAs
+- [Cakeify LoRA](https://huggingface.co/Lightricks/LTX-Video-Cakeify-LoRA): Transforms videos to make objects appear as if they're made of cake. ([Dataset](https://huggingface.co/datasets/Lightricks/Cakeify-Dataset))
+- [Squish LoRA](https://huggingface.co/Lightricks/LTX-Video-Squish-LoRA): Creates a playful squishing effect. ([Dataset](https://huggingface.co/datasets/Lightricks/Squish-Dataset))
 
-These examples demonstrate how you can train specialized video effects using this trainer. Use these datasets as references for preparing your own training data.
+### IC-LoRA Control Adapters
+- [Depth Map Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-depth-13b-0.9.7): Generate videos from depth maps.
+- [Human Pose Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-pose-13b-0.9.7): Generate videos from pose skeletons.
+- [Canny Edge Control](https://huggingface.co/Lightricks/LTX-Video-ICLoRA-canny-13b-0.9.7): Generate videos from Canny edge maps. ([Canny Control Dataset](https://huggingface.co/datasets/Lightricks/Canny-Control-Dataset))
+
+These examples demonstrate how you can train specialized video effects and control adapters using this trainer. Use these datasets as references for preparing your own training data.
 
 ---
 
