@@ -19,11 +19,33 @@ This repository provides tools and scripts for training and fine-tuning Lightric
 
 <div align="center">
 
-| <img src="assets/cakeify.gif" width="256px">  | <img src="assets/squish.gif" width="256px"> |
-| --------------------------------------------- | ------------------------------------------- |
-| <img src="assets/dissolve.gif" width="256px"> | <img src="assets/slime.gif" width="256px">  |
+<table style="border: none; border-collapse: collapse;">
+  <tr style="border: none;">
+    <td style="border: none; padding: 0; vertical-align: top;">
+      <img src="assets/depth_control.gif" height="327px">
+    </td>
+    <td style="border: none; padding: 0; vertical-align: top;">
+      <img src="assets/cakeify.gif" height="160px"><br>
+      <img src="assets/squish.gif" height="160px">
+    </td>
+    <td style="border: none; padding: 0; vertical-align: top;">
+      <img src="assets/dissolve.gif" height="160px"><br>
+      <img src="assets/slime.gif" height="160px">
+    </td>
+    <td style="border: none; padding: 0; vertical-align: top;">
+      <img src="assets/canny_control.gif" height="327px">
+    </td>
+  </tr>
+  <tr style="border: none;">
+    <td colspan="4" style="border: none; padding: 0;">
+      <div align="center">
+        <img src="assets/pose_control.gif" width="500px">
+      </div>
+    </td>
+  </tr>
+</table>
 
-<small>Examples of effects trained as LoRAs on top of LTX-Video 13B</small>
+<small>Examples of LoRA effects and IC-LoRA control models</small>
 
 </div>
 
