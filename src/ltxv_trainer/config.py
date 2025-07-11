@@ -249,6 +249,11 @@ class ValidationConfig(ConfigBaseModel):
         ge=1.0,
     )
 
+    skip_initial_validation: bool = Field(
+        default=False,
+        description="Skip validation video sampling at step 0 (beginning of training)",
+    )
+
     @field_validator("images")
     @classmethod
     def validate_num_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:

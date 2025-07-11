@@ -237,7 +237,7 @@ class LtxvTrainer:
                 step_time=0.0,
             )
 
-            if cfg.validation.interval and IS_MAIN_PROCESS:
+            if cfg.validation.interval and IS_MAIN_PROCESS and not cfg.validation.skip_initial_validation:
                 sampled_videos_paths = self._sample_videos(sample_progress)
             self._accelerator.wait_for_everyone()
 
