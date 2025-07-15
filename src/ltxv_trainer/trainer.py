@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import rich
 import torch
 import wandb
+import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers.utils import export_to_video
@@ -109,50 +110,10 @@ class LtxvTrainer:
         self._init_wandb()
         self._training_strategy = get_training_strategy(self._config.conditioning)
 
-    def _init_wandb(self) -> None:
-        """Initialize Weights & Biases run."""
-        if not self._config.wandb.enabled or not IS_MAIN_PROCESS:
-            self._wandb_run = None
-            return
-
-        wandb_config = self._config.wandb
-        run = wandb.init(
-            project=wandb_config.project,
-            entity=wandb_config.entity,
-            name=Path(self._config.output_dir).name,
-            tags=wandb_config.tags,
-            config=self._config.model_dump(),
-        )
-        self._wandb_run = run
-
-    def _log_metrics(self, metrics: dict[str, float]) -> None:
-        """Log metrics to Weights & Biases."""
-        if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
-
-    def _log_validation_videos(self, video_paths: list[Path], prompts: list[str]) -> None:
-        """Log validation videos to Weights & Biases."""
-        if not self._config.wandb.log_validation_videos or self._wandb_run is None:
-            return
-
-        # Create lists of videos with their captions
-        validation_videos = [
-            wandb.Video(str(video_path), caption=prompt)
-            for video_path, prompt in zip(video_paths, prompts, strict=False)
-        ]
-
-        # Log all videos at once
-        self._wandb_run.log(
-            {
-                "validation_videos": validation_videos,
-            },
-            step=self._global_step,
-        )
-
     def train(  # noqa: PLR0912, PLR0915
         self,
         disable_progress_bars: bool = False,
-        step_callback: StepCallback = None,
+        step_callback: StepCallback | None = None,
     ) -> tuple[Path, TrainingStats]:
         """
         Start the training process.
@@ -181,6 +142,9 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
 
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+
+        # Save the training configuration as YAML
+        self._save_config()
 
         logger.info("🚀 Starting training...")
 
@@ -890,3 +854,54 @@ class LtxvTrainer:
                     logger.debug(f"Removed old checkpoints: {old_checkpoint}")
             # Update the list to only contain kept checkpoints
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+
+    def _save_config(self) -> None:
+        """Save the training configuration as a YAML file in the output directory."""
+        if not IS_MAIN_PROCESS:
+            return
+
+        config_path = Path(self._config.output_dir) / "training_config.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump(self._config.model_dump(), f, default_flow_style=False, indent=2)
+
+        logger.info(f"💾 Training configuration saved to: {config_path.relative_to(self._config.output_dir)}")
+
+    def _init_wandb(self) -> None:
+        """Initialize Weights & Biases run."""
+        if not self._config.wandb.enabled or not IS_MAIN_PROCESS:
+            self._wandb_run = None
+            return
+
+        wandb_config = self._config.wandb
+        run = wandb.init(
+            project=wandb_config.project,
+            entity=wandb_config.entity,
+            name=Path(self._config.output_dir).name,
+            tags=wandb_config.tags,
+            config=self._config.model_dump(),
+        )
+        self._wandb_run = run
+
+    def _log_metrics(self, metrics: dict[str, float]) -> None:
+        """Log metrics to Weights & Biases."""
+        if self._wandb_run is not None:
+            self._wandb_run.log(metrics)
+
+    def _log_validation_videos(self, video_paths: list[Path], prompts: list[str]) -> None:
+        """Log validation videos to Weights & Biases."""
+        if not self._config.wandb.log_validation_videos or self._wandb_run is None:
+            return
+
+        # Create lists of videos with their captions
+        validation_videos = [
+            wandb.Video(str(video_path), caption=prompt, format="mp4")
+            for video_path, prompt in zip(video_paths, prompts, strict=False)
+        ]
+
+        # Log all videos at once
+        self._wandb_run.log(
+            {
+                "validation_videos": validation_videos,
+            },
+            step=self._global_step,
+        )
