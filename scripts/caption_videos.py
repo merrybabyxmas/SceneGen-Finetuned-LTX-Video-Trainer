@@ -62,6 +62,7 @@ MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + IMAGE_EXTENSIONS
 console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Auto-caption videos using vision-language models.",
 )
 

@@ -23,6 +23,7 @@ from ltxv_trainer.trainer import LtxvTrainer
 console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Train LTXV models using configuration from YAML files.",
 )
 

@@ -27,6 +27,7 @@ from scripts.process_videos import compute_video_latents, parse_resolution_bucke
 console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Preprocess a video dataset by computing video clips latents and text captions embeddings. "
     "The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.",
 )

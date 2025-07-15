@@ -44,7 +44,7 @@ from scenedetect.scene_manager import save_images as save_scene_images
 from scenedetect.stats_manager import StatsManager
 from scenedetect.video_splitter import split_video_ffmpeg
 
-app = typer.Typer(help="Split video into scenes using PySceneDetect.")
+app = typer.Typer(no_args_is_help=True, help="Split video into scenes using PySceneDetect.")
 
 
 class DetectorType(str, Enum):

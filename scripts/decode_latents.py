@@ -36,6 +36,7 @@ disable_progress_bar()
 console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Decode precomputed video latents back into videos using the VAE.",
 )
 

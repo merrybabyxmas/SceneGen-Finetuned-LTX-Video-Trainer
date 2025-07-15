@@ -60,6 +60,7 @@ def typer_unpacker(f: Callable) -> Callable:
 
 console = Console()
 app = typer.Typer(
+    no_args_is_help=True,
     pretty_exceptions_enable=False,
     help="Run the complete LTXV training pipeline.",
 )

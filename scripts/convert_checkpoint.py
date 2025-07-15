@@ -9,7 +9,7 @@ from ltxv_trainer.utils import convert_checkpoint
 
 console = Console()
 
-app = typer.Typer(help="Convert checkpoint format between Diffusers and ComfyUI formats")
+app = typer.Typer(no_args_is_help=True, help="Convert checkpoint format between Diffusers and ComfyUI formats")
 
 
 @app.command()

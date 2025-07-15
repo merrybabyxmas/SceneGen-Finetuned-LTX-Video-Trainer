@@ -49,6 +49,7 @@ VAE_TEMPORAL_FACTOR = 8
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Process videos/images and save latent representations for video generation training.",
 )
 

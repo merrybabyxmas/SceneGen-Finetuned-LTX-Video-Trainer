@@ -66,6 +66,7 @@ COMMON_LLM_START_PHRASES: tuple[str, ...] = (
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Process text captions and save embeddings for video generation training.",
 )
 

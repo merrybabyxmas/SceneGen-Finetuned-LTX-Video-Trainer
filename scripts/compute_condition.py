@@ -237,6 +237,7 @@ def process_media(
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
+    no_args_is_help=True,
     help="Compute condition on videos.",
 )
 
