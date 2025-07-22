@@ -202,11 +202,11 @@ def get_rope_scale_factors(fps: float) -> list[float]:
     if fps <= 0:
         raise ValueError("FPS must be a positive number.")
 
-    latent_frame_rate = fps / 8.0  # Temporal compression ratio
-    spatial_compression_ratio = 32.0  # Spatial compression ratio
+    temporal_compression_ratio = 8.0
+    spatial_compression_ratio = 32.0
 
     return [
-        1.0 / latent_frame_rate,
+        temporal_compression_ratio / fps,
         spatial_compression_ratio,
         spatial_compression_ratio,
     ]
