@@ -29,3 +29,7 @@ data/videos/.precomputed/
 *.mkv
 *.webm
 *.avi
+
+# allow mp4s under data/videos only
+!data/videos/*.mp4
+!data/videos/**/*.mp4
