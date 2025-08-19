@@ -1,0 +1,55 @@
+model:
+  model_source: "LTXV_2B_0.9.5"   # 13B로 학습하려면 "LTXV_13B_097_DEV"
+  training_mode: "lora"
+  # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # 여기부터 학습 재개
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["to_q","to_k","to_v","to_out.0"]
+
+optimization:
+  learning_rate: 1e-4
+  steps: 3000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: false   # 13B면 true 권장
+
+acceleration:
+  mixed_precision_mode: "bf16" 
+  load_text_encoder_in_8bit: true
+  compile_with_inductor: false
+  compilation_mode: "reduce-overhead"
+
+data:
+  preprocessed_data_root: "./data/videos/.precomputed"
+  num_dataloader_workers: 4
+
+validation:
+  prompts: ["a serene waterfall cascading down into a tranquil pool surrounded by lush greenery and trees, creating a peaceful natural setting."]
+  negative_prompt: "jitter, artifacts, wobble"
+  images: null
+  reference_videos: null
+  video_dims: [768, 448, 49]
+  seed: 42
+  inference_steps: 50
+  interval: 200
+  videos_per_prompt: 1
+  guidance_scale: 3.0
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: 3
+
+hub:
+  push_to_hub: false
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
