@@ -34,7 +34,6 @@ def _sinusoidal_pos_emb(n_positions: int, dim: int) -> torch.Tensor:
 
 class SOSToken(nn.Module):
     """
-    Expert-style SOS:
       - learnable base frame [C,H,W] (trunc_normal init)
       - sinusoidal temporal PE -> project to channels and add with scale alpha
       - outputs [F,C,H,W]
