@@ -1,2 +1,4 @@
 *.webp filter=lfs diff=lfs merge=lfs -text
 *.gif filter=lfs diff=lfs merge=lfs -text
+data/videos/*.mp4 filter=lfs diff=lfs merge=lfs -text
+data/videos/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
