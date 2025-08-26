@@ -27,7 +27,7 @@ acceleration:
   compilation_mode: "reduce-overhead"
 
 data:
-  preprocessed_data_root: "./data/videos/.precomputed"
+  preprocessed_data_root: "/home/jeongseon38/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 4
 
 validation:
@@ -48,7 +48,8 @@ checkpoints:
   keep_last_n: 3
 
 hub:
-  push_to_hub: false
+  push_to_hub: True
+  hub_model_id: "merrybabyxmas/scenegen_FT"
 
 flow_matching:
   timestep_sampling_mode: "shifted_logit_normal"

@@ -48,14 +48,18 @@ from torchvision.transforms import functional as F  # noqa: N812
 
 from ltxv_trainer import logger
 from ltxv_trainer.config import LtxvTrainerConfig
-from ltxv_trainer.datasets import PrecomputedDataset
+# from ltxv_trainer.datasets import PrecomputedDataset
+from ltxv_trainer.SG_datasets import PrecomputedDataset
+
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
 from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
 
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
-from ltxv_trainer.training_strategies import get_training_strategy
+# from ltxv_trainer.training_strategies import get_training_strategy
+from ltxv_trainer.SG_training_strategy import get_training_strategy
+
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb, convert_checkpoint
 from ltxv_trainer.video_utils import read_video
 

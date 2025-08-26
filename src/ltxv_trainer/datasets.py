@@ -223,6 +223,7 @@ class PrecomputedDataset(Dataset):
 
             try:
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
+                print(f"data:{data}")
                 result[output_key] = data
             except Exception as e:
                 raise RuntimeError(f"Failed to load {output_key} from {file_path}: {e}") from e

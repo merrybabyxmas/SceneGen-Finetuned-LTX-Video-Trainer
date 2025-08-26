@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import re
 
 # ---------- SOS token utilities ----------
 def _trunc_normal_(tensor: torch.Tensor, std: float = 0.02):
@@ -34,44 +34,39 @@ def _sinusoidal_pos_emb(n_positions: int, dim: int) -> torch.Tensor:
     return pe
 
 
-class SOSToken(nn.Module):
+
+class SOSTokenLatents(nn.Module):
     """
-      - learnable base frame [C,H,W] (trunc_normal init)
-      - sinusoidal temporal PE -> project to channels and add with scale alpha
-      - outputs [F,C,H,W]
+    SOS token generator for latent sequence [Seq, D].
+    - learnable base token [1, D] (trunc_normal init)
+    - sinusoidal positional embedding -> project to D and add
+    - outputs [Seq, D]
     """
-    def __init__(self, channels: int = 3, height: int = 256, width: int = 256, pe_dim: Optional[int] = None):
+    def __init__(self, d_model: int = 128, pe_dim: Optional[int] = None):
         super().__init__()
-        self.C, self.H, self.W = channels, height, width
-        self.base = nn.Parameter(torch.empty(channels, height, width))
+        self.d_model = d_model
+        self.base = nn.Parameter(torch.empty(1, d_model))
         _trunc_normal_(self.base, std=0.02)
         self.alpha = nn.Parameter(torch.tensor(0.1))
 
-        pe_dim = pe_dim or min(64, channels)
-        self.pe_proj = nn.Linear(pe_dim, channels, bias=False)
+        pe_dim = pe_dim or min(64, d_model)
+        self.pe_proj = nn.Linear(pe_dim, d_model, bias=False)
         nn.init.xavier_uniform_(self.pe_proj.weight)
 
-    @torch.no_grad()
-    def _resize_if_needed(self, H: int, W: int):
-        if H != self.H or W != self.W:
-            x = self.base.data.unsqueeze(0)
-            x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False).squeeze(0)
-            self.base.data = x
-            self.H, self.W = H, W
-
-    def forward(self, F_len: int, C: int, H: int, W: int, device=None) -> torch.Tensor:
+    def forward(self, seq_len: int, device=None) -> torch.Tensor:
         if device is None:
             device = self.base.device
-        self._resize_if_needed(H, W)
 
-        base = self.base.to(device).unsqueeze(0).expand(F_len, -1, -1, -1)
+        # base: [1, D] -> expand to [Seq, D]
+        base = self.base.to(device).expand(seq_len, -1)  # (Seq, D)
 
+        # sinusoidal pos emb [Seq, pe_dim] -> project -> [Seq, D]
         pe_dim = self.pe_proj.in_features
-        pe = _sinusoidal_pos_emb(F_len, pe_dim).to(device)
-        pe_c = self.pe_proj(pe).unsqueeze(-1).unsqueeze(-1)
+        pe = _sinusoidal_pos_emb(seq_len, pe_dim).to(device)  # (Seq, pe_dim)
+        pe_c = self.pe_proj(pe)  # (Seq, D)
 
         sos = base + self.alpha * pe_c
-        return sos.clamp(0.0, 1.0)
+        return sos.clamp(0.0, 1.0)  # (Seq, D)
 
 
 PRECOMPUTED_DIR_NAME = ".precomputed"
@@ -252,51 +247,45 @@ class PrecomputedDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
+        import pprint
         entry = self.entries[index]
         video_id = entry["video_id"]
         shot_idx = entry["shot_idx"]
         prev_shot_idx = entry["prev_shot_idx"]
+        
+        # print(f"curr shot idx : {shot_idx} "
+        #       f"prev shot idx : {prev_shot_idx}")
 
-        result: Dict[str, Any] = {"idx": index, "meta": {"video_id": video_id, "shot_index": shot_idx}}
-
+        result = {}
         for dir_name, output_key in self.data_sources.items():
             source_root = self.source_paths[dir_name]
-
-            # 현재 샷 로드
-            rel_curr = entry["per_source_rel"][output_key]
-            curr_path = source_root / rel_curr
-            curr_data = torch.load(curr_path, map_location="cpu")
-
-            # 이전 샷 로드 (같은 video_id 내부)
-            if prev_shot_idx is None:
-                # 첫 샷: sos_sources에 포함된 소스만 SOS 생성, 아니면 None
-                if dir_name in self.sos_sources:
-                    prev_data = self._make_sos_like(curr_data)
-                else:
-                    prev_data = None
-            else:
-                rel_prev = self._key_to_rel.get((video_id, prev_shot_idx, output_key))
-                if rel_prev is None:
-                    # 혹시 빠졌다면 SOS/None 처리
-                    logging.warning(f"[WARN] missing prev shot for {video_id} shot{prev_shot_idx} ({output_key})")
-                    prev_data = self._make_sos_like(curr_data) if dir_name in self.sos_sources else None
-                else:
+            try:
+                rel_data = entry["per_source_rel"][output_key]
+                data_path = source_root / rel_data
+                data = torch.load(data_path, map_location="cpu",weights_only=True)
+                result[output_key] = data
+                
+                
+                if dir_name == "latents" and prev_shot_idx is not None:
+                    key = (video_id, prev_shot_idx, output_key)
+                    rel_prev = self._key_to_rel[key]
                     prev_path = source_root / rel_prev
-                    prev_data = torch.load(prev_path, map_location="cpu")
-
-            result[output_key] = {
-                "current_shot": curr_data,
-                "prev_shot": prev_data,
-                "meta": {"video_id": video_id, "shot_index": shot_idx, "prev_shot_index": prev_shot_idx},
-            }
-
+                    data = torch.load(prev_path, map_location="cpu",weights_only=True)
+                    result["prev_conditions"] = data
+                elif dir_name == "latents" and prev_shot_idx is None:
+                    data = self._make_sos_like(data)                    
+                    result["prev_conditions"] = data
+                    continue
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {output_key} from {data_path}: {e}") from e
+        result["idx"] = index
         return result
-
     # ---------- helpers ----------
     def _make_sos_like(self, ref: torch.Tensor) -> torch.Tensor:
         """
         ref가 dict인 경우 등 다양한 포맷을 고려한다면 여기서 분기 처리.
-        일단 ref가 Tensor 또는 dict{"latents": Tensor, ...}일 수 있다고 가정.
+        - dict{"latents": Tensor, ...} → latents만 SOS로 교체
+        - Tensor → SOS tensor 생성
         """
         if isinstance(ref, dict) and "latents" in ref:
             tensor = ref["latents"]
@@ -312,16 +301,35 @@ class PrecomputedDataset(Dataset):
             return torch.zeros(1)
 
     def _make_sos_tensor_like(self, ref: torch.Tensor) -> torch.Tensor:
+        """
+        Latent 형식 [Seq, D] 에 맞춰 SOS token 생성
+        """
         device = ref.device if ref.is_cuda else "cpu"
-        if ref.dim() == 4:
-            F_len, C, H, W = ref.shape
-        elif ref.dim() == 3:
-            C, H, W = ref.shape
-            F_len = 1
-        else:
-            C, H, W = ref.shape[-3:]
-            F_len = max(1, int(ref.numel() // (C * H * W)))
-        sos = SOSToken(channels=C, height=H, width=W).to(device)
+        print(f"ref shape : {ref.shape}")
+
+        if ref.dim() != 2:
+            raise ValueError(f"[SOS] Unexpected latent shape {ref.shape}, expected [Seq, D]")
+
+        seq_len, d_model = ref.shape
+
+        sos_gen = SOSTokenLatents(d_model=d_model).to(device)
         with torch.no_grad():
-            out = sos(F_len=F_len, C=C, H=H, W=W, device=device)
+            out = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
+
         return out
+
+
+
+if __name__ == "__main__":
+    from torch.utils.data import DataLoader
+    ds = PrecomputedDataset("/home/jeongseon38/datasets/videos/splits/.precomputed")
+    # loader = DataLoader(ds, batch_size=4, shuffle=True)
+    # for batch in loader:
+    #     print(batch)
+    it = iter(ds)
+    print(next(it))
+    print(next(it))
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+    for batch in loader:
+        print(batch)
+    
