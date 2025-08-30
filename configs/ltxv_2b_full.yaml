@@ -49,6 +49,7 @@ validation:
   interval: 200 # Set to null to disable validation
   videos_per_prompt: 1
   guidance_scale: 3.5
+  enable_multi_shot : True
 
 # Checkpoint configuration
 checkpoints:

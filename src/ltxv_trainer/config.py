@@ -253,6 +253,24 @@ class ValidationConfig(ConfigBaseModel):
         default=False,
         description="Skip validation video sampling at step 0 (beginning of training)",
     )
+    
+    # Multi-shot validation settings
+    enable_multi_shot: bool = Field(
+        default=False,
+        description="Enable multi-shot validation pipeline for sequential video generation",
+    )
+    
+    num_shots: int = Field(
+        default=3,
+        description="Number of shots to generate in multi-shot validation",
+        gt=0,
+    )
+    
+    sos_latent_dim: int = Field(
+        default=128, 
+        description="Dimension of SOS token latents for multi-shot generation",
+        gt=0,
+    )
 
     @field_validator("images")
     @classmethod

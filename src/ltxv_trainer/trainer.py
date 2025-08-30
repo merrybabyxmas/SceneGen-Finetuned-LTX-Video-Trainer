@@ -54,6 +54,7 @@ from ltxv_trainer.SG_datasets import PrecomputedDataset
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
 from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
+from ltxv_trainer.SG_validation_pipeline import create_multi_shot_validation_pipeline
 
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.timestep_samplers import SAMPLERS
@@ -713,6 +714,10 @@ class LtxvTrainer:
         if not self._config.acceleration.load_text_encoder_in_8bit:
             self._text_encoder.to(self._accelerator.device)
 
+        # Check if multi-shot validation is enabled
+        if self._config.validation.enable_multi_shot:
+            return self._sample_multi_shot_videos(progress)
+
         use_images = self._config.validation.images is not None
 
         pipeline = LTXConditionPipeline(
@@ -790,6 +795,65 @@ class LtxvTrainer:
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
         return video_paths
+
+    @torch.no_grad()
+    @torch.compiler.set_stance("force_eager")
+    def _sample_multi_shot_videos(self, progress: Progress) -> list[Path] | None:
+        """Run multi-shot validation by generating sequential video shots from a single prompt."""
+        
+        # Create multi-shot validation pipeline
+        multi_shot_pipeline = create_multi_shot_validation_pipeline(
+            scheduler=self._scheduler,
+            vae=self._vae,
+            text_encoder=self._text_encoder,
+            tokenizer=self._tokenizer,
+            transformer=self._transformer,
+            device=self._accelerator.device,
+            accelerator=self._accelerator,
+            d_model=self._config.validation.sos_latent_dim
+        )
+        
+        # Create output directory for multi-shot samples
+        output_dir = Path(self._config.output_dir) / "samples"
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        all_video_paths = []
+        
+        # Generate multi-shot sequence for each validation prompt
+        for i, prompt in enumerate(self._config.validation.prompts):
+            logger.info(f"Generating multi-shot sequence {i+1}/{len(self._config.validation.prompts)}")
+            
+            try:
+                video_paths = multi_shot_pipeline.generate_multi_shot_sequence(
+                    prompt=prompt,  # Single prompt for all shots
+                    output_dir=output_dir,
+                    global_step=self._global_step,
+                    video_dims=self._config.validation.video_dims,
+                    num_shots=self._config.validation.num_shots,
+                    inference_steps=self._config.validation.inference_steps,
+                    guidance_scale=self._config.validation.guidance_scale,
+                    negative_prompt=self._config.validation.negative_prompt,
+                    seed=self._config.validation.seed + i  # Different seed for each sequence
+                )
+                
+                all_video_paths.extend(video_paths)
+                
+            except Exception as e:
+                logger.error(f"Failed to generate multi-shot sequence for prompt {i+1}: {e}")
+                continue
+        
+        # Move unused components back to CPU
+        self._vae.to("cpu")
+        if not self._config.acceleration.load_text_encoder_in_8bit:
+            self._text_encoder.to("cpu")
+        
+        if all_video_paths:
+            rel_outputs_path = output_dir.relative_to(self._config.output_dir)
+            logger.info(f"🎬 Multi-shot validation samples for step {self._global_step} saved in {rel_outputs_path}")
+            return all_video_paths
+        else:
+            logger.warning("No multi-shot videos were generated successfully")
+            return None
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:

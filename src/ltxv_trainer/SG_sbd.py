@@ -123,7 +123,6 @@ class SceneBoundaryDetector:
             writer = cv2.VideoWriter(str(shot_path), fourcc, fps, (W, H))
             for f in range(shot_frames_resized.shape[0]):
                 frame = (shot_frames_resized[f].permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)
-                # print(f"frame :{shot_frames_resized[f].shape}")
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 writer.write(frame_bgr)
             writer.release()

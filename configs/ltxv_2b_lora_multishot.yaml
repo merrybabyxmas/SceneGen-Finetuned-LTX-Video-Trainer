@@ -1,0 +1,83 @@
+# LTXV Multi-Shot LoRA Training Configuration
+
+# Model configuration
+model:
+  model_source: "LTXV_2B_0.9.6_DEV" # Options: "LTXV_13B_097_DEV", "LTXV_2B_0.9.6_DEV", "LTXV_2B_0.9.5", "LTXV_2B_0.9.1", "LTXV_2B_0.9.0", or a HF repo/local path
+  training_mode: "lora" # Options: "lora" or "full"
+  load_checkpoint: null # Path to checkpoint file or directory to resume from. If directory, latest checkpoint will be used.
+
+# LoRA configuration
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Conditioning configuration
+conditioning:
+  mode: "none" # Options: "none", "reference_video"
+  first_frame_conditioning_p: 0.1
+
+# Optimization configuration
+optimization:
+  learning_rate: 2e-4
+  steps: 1500
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  optimizer: "adamw"
+  lr_scheduler: "constant"
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1e-8
+
+# Data configuration
+data:
+  data_root: "datasets/videos/splits"
+  data_sources:
+    latents: "latent_conditions"
+    conditions: "text_conditions"
+
+# Validation configuration with multi-shot support
+validation:
+  prompts:
+    - "A cinematic shot of a person walking through a busy city street"
+    - "The camera follows as they enter a modern coffee shop"
+    - "Close-up shot of hands preparing a perfect cup of coffee"
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  video_dims: [704, 480, 161]
+  seed: 42
+  inference_steps: 50
+  interval: 500
+  videos_per_prompt: 1
+  guidance_scale: 3.5
+  skip_initial_validation: false
+  
+  # Multi-shot validation settings
+  enable_multi_shot: true  # Enable sequential multi-shot generation
+  num_shots: 3            # Generate 3 sequential shots
+  sos_latent_dim: 128     # Dimension for SOS token latents
+
+# Output configuration
+output_dir: "outputs/multishot_training"
+save_steps: 500
+push_to_hub: false
+
+# Acceleration settings
+acceleration:
+  mixed_precision: "bf16"
+  gradient_checkpointing: false
+  compile_model: false
+  compile_mode: "default"
+  load_text_encoder_in_8bit: false
+
+# Logging configuration
+wandb:
+  enabled: false
+  project_name: "ltxv-multishot-lora"
+  run_name: null
+  log_validation_videos: true

@@ -327,9 +327,11 @@ if __name__ == "__main__":
     # for batch in loader:
     #     print(batch)
     it = iter(ds)
-    print(next(it))
-    print(next(it))
+
     loader = DataLoader(ds, batch_size=4, shuffle=True)
     for batch in loader:
-        print(batch)
-    
+        # print(batch)
+        print(batch["latent_conditions"]["latents"].shape)
+        print(batch["prev_conditions"]["latents"].shape)
+        
+        

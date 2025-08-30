@@ -10,7 +10,7 @@ lora:
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
 optimization:
-  learning_rate: 1e-4
+  learning_rate: 1e-5
   steps: 3000
   batch_size: 1
   gradient_accumulation_steps: 1
@@ -31,17 +31,19 @@ data:
   num_dataloader_workers: 4
 
 validation:
-  prompts: ["a serene waterfall cascading down into a tranquil pool surrounded by lush greenery and trees, creating a peaceful natural setting."]
+  prompts: ["a bunch of people are standing in line and holding cans of the soft drink coke"]
   negative_prompt: "jitter, artifacts, wobble"
   images: null
   reference_videos: null
-  video_dims: [768, 448, 49]
+  video_dims: [256, 256, 49]
   seed: 42
   inference_steps: 50
   interval: 200
   videos_per_prompt: 1
   guidance_scale: 3.0
   skip_initial_validation: true
+  enable_multi_shot : True
+
 
 checkpoints:
   interval: 500
@@ -49,7 +51,7 @@ checkpoints:
 
 hub:
   push_to_hub: True
-  hub_model_id: "merrybabyxmas/scenegen_FT"
+  hub_model_id: "merrybabyxmas/SceneGen-Finetuned"
 
 flow_matching:
   timestep_sampling_mode: "shifted_logit_normal"

@@ -22,7 +22,7 @@ from torch import Tensor
 from ltxv_trainer import logger
 from ltxv_trainer.config import ConditioningConfig
 from ltxv_trainer.ltxv_utils import get_rope_scale_factors, prepare_video_coordinates
-from ltxv_trainer.timestep_samplers import TimestepSampler
+from ltxv_trainer.timestep_samplers import TimestepSampler, UniformTimestepSampler
 
 DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 
@@ -174,11 +174,8 @@ def _unpack_condition_entry(conds: Any) -> tuple[Tensor, Tensor]:
             "prev_shot":    {"prompt_embeds":..., "prompt_attention_mask":...} (옵션)
        }
     """
-    if "current_shot" in conds:
-        c = conds["current_shot"]
-        return c["prompt_embeds"], c["prompt_attention_mask"]
-    else:
-        return conds["prompt_embeds"], conds["prompt_attention_mask"]
+
+    return conds["prompt_embeds"], conds["prompt_attention_mask"]
 
 
 def _concat_prev_curr(prev_lat: Tensor | None, curr_lat: Tensor) -> tuple[Tensor, int, int]:
@@ -207,22 +204,24 @@ class StandardTrainingStrategy(TrainingStrategy):
         - "latents": {"current_shot": {...}, "prev_shot": {... or SOS}}  # ← Dataset이 보장
         - "conditions": scene/text 조건 (prev 구분이 있더라도 curr만 쓰면 충분)
         """
-        return ["latents", "conditions"]
-
+        return {"latents": "latent_conditions", "conditions": "text_conditions"}
     def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
         # 1) Latents 언팩
-        lat_node = batch["latents"]  # ex) {"current_shot": <dict>, "prev_shot": <dict or Tensor or None>, ...}
-        curr_lat, F, H, W, fps = _unpack_latent_entry(lat_node["current_shot"])
-        # ex) curr_lat: (B, Cseq, D)
+        curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
 
         prev_lat = None
-        if lat_node.get("prev_shot", None) is not None:
-            # prev_shot이 SOS 텐서/실샷 모두 가능 (Dataset이 생성)
-            prev_lat, _, _, _, _ = _unpack_latent_entry(lat_node["prev_shot"])
-            # ex) prev_lat: (B, Pseq, D)
+        if batch.get("prev_conditions", None) is not None:
+            prev_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
 
         # 2) Conditions 언팩 (scene-level이면 curr와 동일)
-        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["conditions"])
+        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
+        
+        
+        # print(f"-------------batch config-------------"
+        #       f"curr_lat : {curr_lat.shape}"
+        #       f"prev_lat : {prev_lat.shape}"
+        #       f"prompt_embeds : {prompt_embeds.shape}"
+        #       )
 
         # 3) 노이즈 샘플 & 시그마 (curr에만 적용)
         sigmas = timestep_sampler.sample_for(curr_lat)         # (B, Cseq, 1) 또는 전략 구현에 따라
@@ -270,7 +269,38 @@ class StandardTrainingStrategy(TrainingStrategy):
         # 9) ROPE scale & video coords (prev+curr 길이에 맞추어 준비)
         rope_scale = get_rope_scale_factors(fps)
         # seq_mult = 2 if Pseq > 0 else 1  # prev를 붙이면 2배
+        
+        
+        if Pseq > 0:
+            raw_coords = prepare_video_coordinates(
+                num_frames=F, height=H, width=W,
+                batch_size=concat_lat.shape[0],
+                sequence_multiplier=2,              # ★ 핵심: prev + curr
+                device=concat_lat.device,
+            )
+            prescaled_f = raw_coords[..., 0] * rope_scale[0]
+            prescaled_h = raw_coords[..., 1] * rope_scale[1]
+            prescaled_w = raw_coords[..., 2] * rope_scale[2]
+            video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)  # (B, 3, P+C)
+        else:
+            video_coords = None
 
+        # return TrainingBatch(
+        #     latents=concat_lat,
+        #     targets=targets,
+        #     prompt_embeds=prompt_embeds,
+        #     prompt_attention_mask=prompt_attention_mask,
+        #     timesteps=timesteps,
+        #     sigmas=sigmas,
+        #     conditioning_mask=conditioning_mask,
+        #     num_frames=F,
+        #     height=H,
+        #     width=W,
+        #     fps=fps,
+        #     rope_interpolation_scale=rope_scale,
+        #     video_coords=video_coords,
+        # )
+        
         return TrainingBatch(
             latents=concat_lat,
             targets=targets,
@@ -284,8 +314,11 @@ class StandardTrainingStrategy(TrainingStrategy):
             width=W,
             fps=fps,
             rope_interpolation_scale=rope_scale,
-            video_coords=None,
+            video_coords=video_coords,
         )
+        
+        
+        
 
     def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
         """
@@ -301,123 +334,6 @@ class StandardTrainingStrategy(TrainingStrategy):
 
 # ------------------------------------------------------
 # ReferenceVideo (IC-LoRA): prev-shot 자동 폴백 지원
-# ------------------------------------------------------
-class ReferenceVideoTrainingStrategy(TrainingStrategy):
-    def __init__(self, conditioning_config: ConditioningConfig):
-        super().__init__(conditioning_config)
-
-    def get_data_sources(self) -> dict[str, str]:
-        """
-        기존: 별도 ref_latents_dir 필요.
-        보강: ref_latents_dir가 없거나 batch에 없으면 dataset의 prev_shot을 레퍼런스로 사용(폴백)
-        """
-        mapping = {"latents": "latents", "conditions": "conditions"}
-        if getattr(self.conditioning_config, "reference_latents_dir", None):
-            mapping[self.conditioning_config.reference_latents_dir] = "ref_latents"
-        return mapping
-
-    def prepare_batch(self, batch: dict[str, dict[str, Tensor]], timestep_sampler: TimestepSampler) -> TrainingBatch:
-        lat_node = batch["latents"]
-
-        # 1) 타깃(latents) 언팩 (curr)
-        curr_lat, F, H, W, fps = _unpack_latent_entry(lat_node["current_shot"])  # (B, Cseq, D)
-
-        # 2) 레퍼런스 확보
-        ref_lat = None
-        # (a) 설정된 별도 디렉토리에서 제공되면 사용
-        if "ref_latents" in batch:
-            ref_lat, _, _, _, _ = _unpack_latent_entry(batch["ref_latents"])     # (B, Rseq, D)
-        # (b) 없으면 prev_shot을 레퍼런스로 폴백
-        elif lat_node.get("prev_shot", None) is not None:
-            ref_lat, _, _, _, _ = _unpack_latent_entry(lat_node["prev_shot"])    # (B, Pseq, D)
-
-        # 3) 텍스트 조건
-        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["conditions"])
-
-        # 4) curr에만 노이즈
-        sigmas = timestep_sampler.sample_for(curr_lat)  # 기대 모양 브로드캐스트
-        sigmas = sigmas.view(curr_lat.shape[0], 1, 1)
-        noise = torch.randn_like(curr_lat, device=curr_lat.device)
-        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise
-
-        # 5) curr 첫 프레임 conditioning
-        first_mask_curr = self._create_first_frame_conditioning_mask(
-            batch_size=curr_lat.shape[0],
-            sequence_length=curr_lat.shape[1],
-            height=H,
-            width=W,
-            device=curr_lat.device,
-        )
-        noisy_curr = torch.where(first_mask_curr.unsqueeze(-1), curr_lat, noisy_curr)
-
-        # 6) ref(항상 conditioning) + noisy_curr concat
-        if ref_lat is None:
-            # 레퍼런스가 전혀 없다면 표준전략과 동일 동작 (경고)
-            logger.warning("No explicit ref_latents nor prev_shot; falling back to Standard-like behavior.")
-            ref_mask = None
-            combined, Rseq, Cseq = _concat_prev_curr(None, noisy_curr)
-        else:
-            combined, Rseq, Cseq = _concat_prev_curr(ref_lat, noisy_curr)
-            ref_mask = torch.ones(curr_lat.shape[0], Rseq, dtype=torch.bool, device=curr_lat.device)
-
-        # 7) conditioning mask
-        if Rseq > 0:
-            conditioning_mask = torch.cat([ref_mask, first_mask_curr], dim=1)  # (B, R+C)
-        else:
-            conditioning_mask = first_mask_curr  # (B, C)
-
-        # 8) targets (ref 구간 0, curr 구간 noise - clean)
-        targets_curr = noise - curr_lat
-        if Rseq > 0:
-            zeros_ref = torch.zeros(curr_lat.shape[0], Rseq, curr_lat.shape[2], device=curr_lat.device, dtype=targets_curr.dtype)
-            targets = torch.cat([zeros_ref, targets_curr], dim=1)
-        else:
-            targets = targets_curr
-
-        # 9) timesteps
-        sampled_t = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()  # (B,)
-        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_t)  # (B, R+C)
-
-        # 10) ROPE & coords (ref+curr 2배)
-        rope_scale = get_rope_scale_factors(fps)
-        seq_mult = 2 if Rseq > 0 else 1
-        raw_coords = prepare_video_coordinates(
-            num_frames=F, height=H, width=W,
-            batch_size=combined.shape[0],
-            sequence_multiplier=seq_mult,
-            device=combined.device,
-        )
-        prescaled_f = raw_coords[..., 0] * rope_scale[0]
-        prescaled_h = raw_coords[..., 1] * rope_scale[1]
-        prescaled_w = raw_coords[..., 2] * rope_scale[2]
-        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)  # (B, 3, R+C)
-
-        return TrainingBatch(
-            latents=combined,
-            targets=targets,
-            prompt_embeds=prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            timesteps=timesteps,
-            sigmas=sigmas,
-            conditioning_mask=conditioning_mask,
-            num_frames=F,
-            height=H,
-            width=W,
-            fps=fps,
-            rope_interpolation_scale=rope_scale,
-            video_coords=video_coords,
-        )
-
-    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
-        """
-        마스킹 MSE (ref + curr)
-        - ref 구간: conditioning → 로스 제외
-        - curr 첫 프레임: conditioning → 로스 제외
-        """
-        loss = (model_pred - batch.targets).pow(2)
-        loss_mask = (~batch.conditioning_mask.unsqueeze(-1)).float()
-        loss = loss.mul(loss_mask).div(loss_mask.mean())
-        return loss.mean()
 
 
 # --------------- Factory ---------------
@@ -432,3 +348,110 @@ def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingSt
 
     logger.debug(f"🎯 Using {strategy.__class__.__name__}")
     return strategy
+
+
+
+if __name__ == "__main__":
+    import os
+    import time
+    import torch
+    from torch.utils.data import DataLoader
+
+    # --------------------------
+    # 0) 재현/디바이스 설정
+    # --------------------------
+    torch.manual_seed(42)
+    torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --------------------------
+    # 1) 데이터셋 로드
+    # --------------------------
+    from ltxv_trainer.SG_datasets import PrecomputedDataset
+
+
+    data_root = "/home/jeongseon38/datasets/videos/splits/.precomputed"
+    
+    print("loading data!")
+    # DataLoader는 여기선 1개만 뽑아보는 스모크 테스트 용도로 사용
+    ds = PrecomputedDataset(data_root)
+    dl = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
+    print("data successfully loaded!")
+
+    # --------------------------
+    # 2) 설정(전략/샘플러)
+    # --------------------------
+
+
+    # 모드 선택: "none" → Standard, "reference_video" → IC-LoRA 스타일
+    cfg = ConditioningConfig(
+        mode="none",                      # "none" | "reference_video"
+        first_frame_conditioning_p=0.5,   # 첫 프레임을 conditioning으로 사용할 확률
+        # reference_latents_dir="ref_latents",  # 필요 시 활성화
+    )
+    sampler = UniformTimestepSampler(min_value=0.0, max_value=1.0)
+
+
+    # 전략 생성
+    strategy = get_training_strategy(cfg)
+    print(f"[INFO] Using strategy: {strategy.__class__.__name__}")
+
+    # --------------------------
+    # 3) 배치 → TrainingBatch
+    # --------------------------
+    t0 = time.time()
+    raw_batch = next(iter(dl))  # Dataset이 dict를 반환한다고 가정
+    t1 = time.time()
+
+    # 주의: Dataset에서 뽑힌 텐서들이 CPU일 수 있으므로, 여기선
+    # prepare_batch 내부에서의 디바이스 가정에 맞춰 그대로 전달.
+    # (전략 내부 연산은 입력 텐서의 device를 사용)
+
+    training_batch = strategy.prepare_batch(raw_batch, sampler)
+    t2 = time.time()
+
+    print("------------- Prepared TrainingBatch -------------")
+    print(f"latents              : {tuple(training_batch.latents.shape)}  (B, Seq, D)")
+    print(f"targets              : {tuple(training_batch.targets.shape)}")
+    print(f"prompt_embeds        : {tuple(training_batch.prompt_embeds.shape)}")
+    print(f"prompt_attention_mask: {tuple(training_batch.prompt_attention_mask.shape)}")
+    print(f"timesteps            : {tuple(training_batch.timesteps.shape)}")
+    print(f"sigmas               : {tuple(training_batch.sigmas.shape)}")
+    print(f"conditioning_mask    : {tuple(training_batch.conditioning_mask.shape)}  (True=conditioning)")
+    print(f"num_frames / HxW / fps: {training_batch.num_frames} / {training_batch.height}x{training_batch.width} / {training_batch.fps}")
+    if training_batch.video_coords is not None:
+        print(f"video_coords         : {tuple(training_batch.video_coords.shape)}  (B, 3, Seq)")
+    print(f"rope_scale           : {training_batch.rope_interpolation_scale}")
+    print("--------------------------------------------------")
+    print(f"[Timing] dataloader: {(t1 - t0):.3f}s, prepare_batch: {(t2 - t1):.3f}s")
+
+    # --------------------------
+    # 4) 더미 모델로 forward & loss
+    # --------------------------
+    # 실제 모델 입력 규격에 맞춰 dict를 구성
+    model_inputs = strategy.prepare_model_inputs(training_batch)
+    # 실제 모델이 없다면, 동일 shape의 더미 예측을 생성(평균 0, 분산 동일)
+    # 여기서는 간단히 targets에 노이즈를 더한 값을 예측으로 사용
+    with torch.no_grad():
+        model_pred = training_batch.targets + 0.05 * torch.randn_like(training_batch.targets)
+
+    loss = strategy.compute_loss(model_pred, training_batch)
+    print(f"[Loss] masked MSE: {loss.item():.6f}")
+
+    # --------------------------
+    # 5) (선택) GPU 이동 테스트
+    # --------------------------
+    # 실제 학습 코드에선 모델/배치 텐서를 accelerator.device로 맞춰야 합니다.
+    # 여기선 스모크 테스트 차원에서 latents만 잠깐 옮겨보기:
+    try:
+        if torch.cuda.is_available():
+            _ = training_batch.latents.to(device)
+            print(f"[Device] Latents moved to {device} OK.")
+    except Exception as e:
+        print(f"[WARN] Device move test failed: {e}")
+
+    print("[DONE] Strategy smoke test finished.")
+
+
+
+    
