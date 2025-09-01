@@ -12,8 +12,7 @@ The pipeline follows the same logic as SG_training_strategy.py for consistency.
 
 from typing import Any, Callable, Dict, List, Optional, Union
 import torch
-from torch import Tensor
-from copy import deepcopy
+from diffusers.video_processor import VideoProcessor
 
 from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline, LTXVideoCondition
 from ltxv_trainer.SG_datasets import SOSTokenLatents
@@ -35,7 +34,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         tokenizer,
         transformer,
         sos_token_generator: Optional[SOSTokenLatents] = None,
-        **kwargs
     ):
         super().__init__(
             scheduler=scheduler,
@@ -43,10 +41,20 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             transformer=transformer,
-            **kwargs
         )
         # SOS token generator for first shot
         self.sos_token_generator = sos_token_generator or SOSTokenLatents(d_model=128)
+        
+        # Initialize video processor if not already done by parent
+        if not hasattr(self, 'video_processor') or self.video_processor is None:
+            vae_scale_factor = getattr(self.vae, 'spatial_compression_ratio', 32)
+            self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
+        
+    @property 
+    def device(self):
+        """Get the device of the pipeline."""
+        # Simple fallback to cuda:0 to avoid infinite logging
+        return torch.device('cuda:0')
         
     @torch.no_grad()
     def __call__(
@@ -197,29 +205,53 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         num_frames = generation_kwargs.get('num_frames', 161)
         
         logger.info(f"Multi-shot validation generation: {height}x{width}x{num_frames}")
-        device = self.device
+        logger.info("Getting pipeline device...")
+        
+        # Use a more direct approach to get device
+        try:
+            if hasattr(self.transformer, 'parameters'):
+                device = next(iter(self.transformer.parameters())).device
+                logger.info(f"Got device from transformer: {device}")
+            else:
+                device = torch.device('cuda:0')
+                logger.info(f"Using default device: {device}")
+        except Exception as e:
+            logger.info(f"Device detection failed, using cuda:0: {e}")
+            device = torch.device('cuda:0')
         
         # Calculate expected latent dimensions
-        latent_frames = num_frames // 4  # VAE temporal downsampling
-        latent_height = height // 8      # VAE spatial downsampling  
-        latent_width = width // 8
+        latent_frames = num_frames // 7  # VAE temporal downsampling
+        latent_height = height // 32      # VAE spatial downsampling  
+        latent_width = width // 32
         curr_seq_len = latent_frames * latent_height * latent_width
+        
+        logger.info(f"Calculated latent dimensions: frames={latent_frames}, h={latent_height}, w={latent_width}, seq_len={curr_seq_len}")
         
         # 1. Prepare prev_latent
         if use_sos_conditioning or prev_latent is None:
             # Generate SOS token conditioning
             logger.info("Generating SOS token conditioning for multi-shot")
+            logger.info(f"SOS generator device: {getattr(self.sos_token_generator, 'device', 'unknown')}")
+            # Ensure SOS token generator is on correct device
+            if hasattr(self.sos_token_generator, 'to'):
+                self.sos_token_generator = self.sos_token_generator.to(device)
+                logger.info(f"Moved SOS generator to {device}")
             prev_latent = self.sos_token_generator(curr_seq_len, device=device)
+            logger.info(f"Generated SOS prev_latent shape: {prev_latent.shape}")
             
         # Ensure prev_latent is on correct device and has batch dimension
+        logger.info(f"prev_latent initial shape: {prev_latent.shape}, dim: {prev_latent.dim()}")
         if prev_latent.dim() == 2:  # [seq_len, channels]
             prev_latent = prev_latent.unsqueeze(0)  # [1, seq_len, channels]
+            logger.info(f"Added batch dimension to prev_latent: {prev_latent.shape}")
         prev_latent = prev_latent.to(device)
+        logger.info(f"prev_latent after device move: {prev_latent.shape}, device: {prev_latent.device}")
         
         prev_seq_len = prev_latent.shape[1]
         total_seq_len = prev_seq_len + curr_seq_len
         
         logger.info(f"Multi-shot conditioning: prev_seq={prev_seq_len}, curr_seq={curr_seq_len}, total={total_seq_len}")
+        logger.info(f"prev_latent final shape: {prev_latent.shape}, device: {prev_latent.device}")
         
         # 2. Create conditioning mask
         # prev part: all True (fully conditioned)
@@ -231,10 +263,12 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         conditioning_mask[:, :prev_seq_len] = True
         
         # Mark first frame of curr part as conditioned (optional)
-        first_frame_tokens = latent_height * latent_width
-        curr_start = prev_seq_len
-        curr_first_frame_end = min(curr_start + first_frame_tokens, total_seq_len)
+        # first_frame_tokens = latent_height * latent_width
+        # curr_start = prev_seq_len
+        # curr_first_frame_end = min(curr_start + first_frame_tokens, total_seq_len)
         # conditioning_mask[:, curr_start:curr_first_frame_end] = True  # Optional first frame conditioning
+        
+        logger.info(f"Created conditioning mask shape: {conditioning_mask.shape}, prev_conditioned: {conditioning_mask[:, :prev_seq_len].sum().item()}")
         
         # 3. Prepare latents for generation
         # We'll modify the standard generation to use our custom conditioning
@@ -287,8 +321,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         negative_prompt = kwargs.get('negative_prompt', "")
         device = self.device
         
+        logger.info("Starting prompt encoding...")
         # Prepare prompt embeddings
-        prompt_embeds, negative_prompt_embeds, prompt_attention_mask, negative_prompt_attention_mask = (
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = (
             self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -298,36 +333,53 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 max_sequence_length=kwargs.get('max_sequence_length', 256)
             )
         )
+        logger.info(f"Prompt encoding completed. prompt_embeds shape: {prompt_embeds.shape}, device: {prompt_embeds.device}")
+        logger.info(f"Using CFG: {guidance_scale > 1.0}, guidance_scale: {guidance_scale}")
         
         # Calculate latent dimensions (use standard LTX-Video scaling factors)
-        vae_scale_factor_temporal = getattr(self.vae, 'temporal_scale_factor', 8)
-        vae_scale_factor_spatial = getattr(self.vae, 'spatial_scale_factor', 8)
+        vae_scale_factor_temporal = getattr(self.vae, 'temporal_scale_factor', 32)
+        vae_scale_factor_spatial = getattr(self.vae, 'spatial_scale_factor', 32)
         
-        latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
+        
+        latent_frames = num_frames // 7
         latent_height = height // vae_scale_factor_spatial
         latent_width = width // vae_scale_factor_spatial
         latent_shape = (1, latent_frames * latent_height * latent_width, self.transformer.config.in_channels)
-        
+        logger.info(f"  F : {num_frames}, H : {height}, W : {width}")
+        logger.info(f"  Initializing latents with shape : {latent_frames}x{latent_height}x{latent_width}")        
+        logger.info(f"  Initializing latents with shape: {latent_shape}")
         # Initialize current latents with noise
         curr_latents = randn_tensor(latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
+        logger.info(f"  Created curr_latents shape: {curr_latents.shape}, device: {curr_latents.device}")
         
         # Combine prev + current latents
-        combined_latents, prev_seq_len, _ = self._concat_prev_curr(prev_latent, curr_latents)
+        logger.info(f"  Before concat - prev_latent shape: {prev_latent.shape}, curr_latents shape: {curr_latents.shape}")
+        try:
+            combined_latents, prev_seq_len, _ = self._concat_prev_curr(prev_latent, curr_latents)
+            logger.info(f"Combined latents shape: {combined_latents.shape}, prev_seq_len: {prev_seq_len}")
+        except Exception as e:
+            logger.error(f"Failed to concat prev and curr latents: {e}")
+            logger.error(f"prev_latent shape: {prev_latent.shape}, curr_latents shape: {curr_latents.shape}")
+            raise
         
         # Set up scheduler
+        logger.info(f"Setting up scheduler for {num_inference_steps} steps")
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        logger.info(f"Timesteps prepared: {len(timesteps)} steps, first: {timesteps[0]}, last: {timesteps[-1]}")
         
         # Denoising loop
-        for i, t in enumerate(timesteps):
+        logger.info("Starting denoising loop...")
+        for step_idx, t in enumerate(timesteps):
+            if step_idx % 50 == 0 or step_idx < 5:  # Log every 50 steps and first 5 steps
+                logger.info(f"Denoising step {step_idx + 1}/{len(timesteps)}, t={t.item():.4f}")
+            
             # Create timestep tensor
             timestep = t.expand(combined_latents.shape[0])
-            
             if guidance_scale > 1.0:
                 # Duplicate latents for CFG
                 latent_model_input = torch.cat([combined_latents] * 2)
                 timestep = torch.cat([timestep] * 2)
-                
                 # Prepare prompt embeddings for CFG
                 encoder_hidden_states = torch.cat([negative_prompt_embeds, prompt_embeds])
                 encoder_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask])
@@ -335,18 +387,52 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 latent_model_input = combined_latents
                 encoder_hidden_states = prompt_embeds
                 encoder_attention_mask = prompt_attention_mask
+                
+             
+            # Create video coordinates for transformer
+            # Calculate total sequence length including prev + curr
+            total_frames = combined_latents.shape[1] // (latent_height * latent_width)
+            video_coords = self._prepare_video_ids(
+                latent_model_input.shape[0],
+                total_frames,
+                latent_height,
+                latent_width,
+                patch_size=self.transformer_spatial_patch_size,
+                patch_size_t=self.transformer_temporal_patch_size,
+                device=device,
+            )
+            video_coords = self._scale_video_ids(
+                video_coords,
+                scale_factor=self.vae_spatial_compression_ratio,
+                scale_factor_t=self.vae_temporal_compression_ratio,
+                frame_index=0,
+                device=device,
+            ).float()
             
             # Predict noise
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                num_frames=latent_frames,
-                height=latent_height,
-                width=latent_width,
-                return_dict=False,
-            )[0]
+            if step_idx == 0:  # Log detailed info for first step
+                logger.info(f"Transformer input shapes:")
+                logger.info(f"  hidden_states: {latent_model_input.shape}")
+                logger.info(f"  timestep: {timestep.unsqueeze(-1).float().shape}")  
+                logger.info(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+                logger.info(f"  video_coords: {video_coords.shape}")
+                
+            try:
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep.unsqueeze(-1).float(),
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    video_coords=video_coords,
+                    return_dict=False,
+                )[0]
+                
+                if step_idx == 0:
+                    logger.info(f"Transformer output shape: {noise_pred.shape}")
+                    
+            except Exception as e:
+                logger.error(f"Transformer forward failed at step {step_idx}: {e}")
+                raise
             
             # Apply CFG
             if guidance_scale > 1.0:
@@ -361,15 +447,74 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 combined_latents, prev_latent, conditioning_mask, prev_seq_len
             )
         
+        logger.info("Denoising completed. Starting decoding...")
+        
         # Extract only the current part for decoding
         current_part = combined_latents[:, prev_seq_len:prev_seq_len + curr_seq_len]
+        logger.info(f"Extracted current part shape: {current_part.shape}")
         
-        # Reshape for VAE decoding
-        current_part = current_part.view(1, self.transformer.config.in_channels, latent_frames, latent_height, latent_width)
+        # First unpack latents to proper VAE format
+        logger.info("Unpacking latents...")
+        current_part = self._unpack_latents(
+            current_part,
+            latent_frames,
+            latent_height,
+            latent_width,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
+        logger.info(f"Unpacked latents shape: {current_part.shape}")
         
-        # Decode to video
-        video_frames = self.vae.decode(current_part, return_dict=False)[0]
-        video_frames = self.video_processor.postprocess_video(video_frames, output_type='pil')
+        # Denormalize latents using VAE normalization parameters
+        logger.info("Denormalizing latents...")
+        current_part = self._denormalize_latents(
+            current_part, 
+            self.vae.latents_mean, 
+            self.vae.latents_std,
+            self.vae.config.scaling_factor
+        )
+        logger.info(f"Denormalized latents shape: {current_part.shape}")
+        
+        # Decode to video with proper timestep handling
+        logger.info("Starting VAE decoding...")
+        logger.info(f"Final latents for VAE: {current_part.shape}")
+        
+        # Ensure correct dtype for VAE
+        current_part = current_part.to(prompt_embeds.dtype)
+        
+        try:
+            # Handle timestep conditioning if needed
+            timestep = None
+            if hasattr(self.vae.config, 'timestep_conditioning') and self.vae.config.timestep_conditioning:
+                # Use decode_timestep if available, otherwise default to 0.0
+                decode_timestep = kwargs.get('decode_timestep', 0.0)
+                if not isinstance(decode_timestep, list):
+                    decode_timestep = [decode_timestep]
+                timestep = torch.tensor(decode_timestep, device=device, dtype=current_part.dtype)
+                
+                # Apply decode noise scale if specified
+                decode_noise_scale = kwargs.get('decode_noise_scale')
+                if decode_noise_scale is not None:
+                    if not isinstance(decode_noise_scale, list):
+                        decode_noise_scale = [decode_noise_scale]
+                    decode_noise_scale = torch.tensor(decode_noise_scale, device=device, dtype=current_part.dtype)[:, None, None, None, None]
+                    noise = torch.randn_like(current_part)
+                    current_part = (1 - decode_noise_scale) * current_part + decode_noise_scale * noise
+            
+            logger.info(f"VAE decode with timestep: {timestep}")
+            video_frames = self.vae.decode(current_part, timestep, return_dict=False)[0]
+            logger.info(f"VAE decode output shape: {video_frames.shape}")
+            
+            # Post-process video
+            logger.info("Post-processing video...")
+            output_type = kwargs.get('output_type', 'pil')
+            video_frames = self.video_processor.postprocess_video(video_frames, output_type=output_type)
+            logger.info(f"Post-processed video frames: {len(video_frames) if isinstance(video_frames, list) else 'single tensor'}")
+            
+        except Exception as e:
+            logger.exception("VAE decoding failed") 
+            logger.error(f"VAE decoding failed: {e}")
+            raise
         
         # Return in the same format as parent pipeline
         from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
@@ -388,6 +533,8 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             prev_latent = prev_latent.expand(combined_latents.shape[0], -1, -1)
         
         # Apply mask: where mask is True, use original prev_latent
+        # Note: conditioning_mask is passed but we use prev_seq_len for simplicity
+        # The prev part should always be preserved
         combined_latents[:, :prev_seq_len] = prev_latent
         
         return combined_latents
@@ -409,46 +556,94 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             prev_seq_len: Pseq
             curr_seq_len: Cseq
         """
+        from ltxv_trainer import logger
+        
         if prev_latent is None:
             return curr_latent, 0, curr_latent.shape[1]
+        
+        logger.info(f"_concat_prev_curr input shapes: prev_latent={prev_latent.shape}, curr_latent={curr_latent.shape}")
+        
+        # Ensure both tensors have the same number of dimensions
+        if prev_latent.dim() != curr_latent.dim():
+            logger.error(f"Dimension mismatch: prev_latent.dim()={prev_latent.dim()}, curr_latent.dim()={curr_latent.dim()}")
+            # Try to fix dimension mismatch
+            if prev_latent.dim() == 2 and curr_latent.dim() == 3:
+                prev_latent = prev_latent.unsqueeze(0)
+                logger.info(f"Fixed prev_latent shape: {prev_latent.shape}")
+            elif prev_latent.dim() == 3 and curr_latent.dim() == 2:
+                curr_latent = curr_latent.unsqueeze(0)
+                logger.info(f"Fixed curr_latent shape: {curr_latent.shape}")
+        
+        # Ensure batch dimensions match
+        if prev_latent.shape[0] != curr_latent.shape[0]:
+            logger.warning(f"Batch dimension mismatch: {prev_latent.shape[0]} vs {curr_latent.shape[0]}")
+            # Expand the smaller batch to match
+            if prev_latent.shape[0] == 1 and curr_latent.shape[0] > 1:
+                prev_latent = prev_latent.expand(curr_latent.shape[0], -1, -1)
+            elif curr_latent.shape[0] == 1 and prev_latent.shape[0] > 1:
+                curr_latent = curr_latent.expand(prev_latent.shape[0], -1, -1)
+        
+        # Ensure channel dimensions match
+        if prev_latent.shape[-1] != curr_latent.shape[-1]:
+            logger.error(f"Channel dimension mismatch: {prev_latent.shape[-1]} vs {curr_latent.shape[-1]}")
+            raise ValueError(f"Channel dimensions must match: {prev_latent.shape[-1]} != {curr_latent.shape[-1]}")
         
         prev_seq_len = prev_latent.shape[1]
         curr_seq_len = curr_latent.shape[1]
         
+        logger.info(f"Final shapes before concat: prev_latent={prev_latent.shape}, curr_latent={curr_latent.shape}")
         concat_latent = torch.cat([prev_latent, curr_latent], dim=1)
+        logger.info(f"Concatenated shape: {concat_latent.shape}")
+        
         return concat_latent, prev_seq_len, curr_seq_len
     
-    def encode_video_to_latent(self, video: torch.Tensor) -> torch.Tensor:
+    def encode_video_to_latent(self, video) -> torch.Tensor:
         """
         Encode video to latent space for use as prev_latent conditioning.
         
         Args:
-            video: Video tensor [frames, channels, height, width] or [batch, frames, channels, height, width]
+            video: Video tensor, PIL images, or video frames
             
         Returns:
             Latent tensor in sequence format [seq_len, channels] for conditioning
         """
         with torch.no_grad():
-            # Ensure video has batch dimension
+            # Handle different input types (PIL images, etc.)
+            if isinstance(video, list):
+                # Convert PIL images to tensor
+                import numpy as np
+                from PIL import Image
+                frames = []
+                for frame in video:
+                    if isinstance(frame, Image.Image):
+                        frame_array = np.array(frame).transpose(2, 0, 1)  # HWC -> CHW
+                        frames.append(torch.from_numpy(frame_array))
+                video = torch.stack(frames, dim=0)  # [frames, channels, height, width]
+            
+            # Ensure video has batch dimension and correct format for VAE: [B, C, F, H, W]
             if video.dim() == 4:  # [frames, channels, height, width]
-                video = video.unsqueeze(0)  # [1, frames, channels, height, width]
+                video = video.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, frames, channels, height, width] -> [1, channels, frames, height, width]
             
             # Move to device and normalize
-            video = video.to(self.device, dtype=torch.float32)
+            device = self.device
+            video = video.to(device, dtype=torch.float32)
             
-            # Normalize to [-1, 1] if needed
-            if video.min() >= 0.0 and video.max() <= 1.0:
-                video = video * 2.0 - 1.0
+            # Normalize to [-1, 1] based on input range
+            if video.max() > 1.0:  # PIL images are typically 0-255
+                video = video / 255.0  # [0, 255] -> [0, 1]
+                video = video * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+            elif video.min() >= 0.0 and video.max() <= 1.0:  # Already in [0, 1]
+                video = video * 2.0 - 1.0  # [0, 1] -> [-1, 1]
             
             # Encode using VAE
+            from ltxv_trainer.ltxv_pipeline import retrieve_latents
             latent_dist = self.vae.encode(video)
+            latent = retrieve_latents(latent_dist)
             
-            if hasattr(latent_dist, 'sample'):
-                latent = latent_dist.sample()
-            elif hasattr(latent_dist, 'latent_dist'):
-                latent = latent_dist.latent_dist.sample()  
-            else:
-                latent = latent_dist
+            # Normalize latents like in the pipeline
+            latent = self._normalize_latents(
+                latent, self.vae.latents_mean, self.vae.latents_std
+            )
                 
             # Convert to sequence format [seq_len, channels]
             batch, latent_channels, latent_frames, latent_height, latent_width = latent.shape

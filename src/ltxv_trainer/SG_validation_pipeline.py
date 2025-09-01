@@ -101,15 +101,27 @@ class MultiShotValidationPipeline:
                 pipeline_inputs["prev_latent"] = prev_latent
                 pipeline_inputs["use_prev_conditioning"] = True
                 logger.info(f"Using previous shot conditioning for shot {shot_idx + 1}")
-            
             # Generate the video using SGMultiShotPipeline
-            with autocast(self.device.type, dtype=torch.bfloat16):
-                result = self.pipeline(**pipeline_inputs)
-                videos = result.frames
-                
-                # Store latent representation for next shot conditioning
-                if len(videos) > 0:
-                    prev_latent = self.pipeline.encode_video_to_latent(videos[0])
+            logger.info(f"Calling pipeline with inputs: {list(pipeline_inputs.keys())}")
+            try:
+                with autocast(self.device.type, dtype=torch.bfloat16):
+                    logger.info("Pipeline generation starting...")
+                    result = self.pipeline(**pipeline_inputs)
+                    logger.info("Pipeline generation completed")
+                    videos = result.frames
+                    logger.info(f"Generated videos count: {len(videos) if videos else 0}")
+                    
+                    # Store latent representation for next shot conditioning
+                    if len(videos) > 0:
+                        logger.info("Encoding video to latent for next shot...")
+                        prev_latent = self.pipeline.encode_video_to_latent(videos[0])
+                        logger.info(f"Encoded latent shape: {prev_latent.shape}")
+                    else:
+                        logger.warning("No videos generated!")
+                        
+            except Exception as e:
+                logger.error(f"Pipeline generation failed for shot {shot_idx + 1}: {e}")
+                raise
             
             # Save the generated video
             if videos:
@@ -134,19 +146,91 @@ def create_multi_shot_validation_pipeline(
 ) -> MultiShotValidationPipeline:
     """Create a multi-shot validation pipeline."""
     
-    # Create SOS token generator
-    sos_generator = SOSTokenLatents(d_model=d_model)
+    # Create SOS token generator and move to device
+    sos_generator = SOSTokenLatents(d_model=d_model).to(device)
+    
+    # Unwrap models and ensure all parameters are on the correct device
+    unwrapped_vae = accelerator.unwrap_model(vae)
+    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+    unwrapped_transformer = accelerator.unwrap_model(transformer)
+    
+    # Force all model parameters to the correct device (skip 8-bit models)
+    def safe_to_device(model, device, model_name):
+        """Safely move model to device, handling 8-bit quantized models."""
+        try:
+            # Check if model is 8-bit quantized
+            is_8bit = hasattr(model, 'is_loaded_in_8bit') and model.is_loaded_in_8bit
+            if not is_8bit:
+                model = model.to(device)
+            else:
+                logger.info(f"{model_name} is 8-bit quantized, skipping device move")
+            return model
+        except Exception as e:
+            logger.warning(f"Could not move {model_name} to device: {e}")
+            return model
+    
+    unwrapped_vae = safe_to_device(unwrapped_vae, device, "VAE")
+    unwrapped_text_encoder = safe_to_device(unwrapped_text_encoder, device, "TextEncoder") 
+    unwrapped_transformer = safe_to_device(unwrapped_transformer, device, "Transformer")
+    
+    # Ensure all model parameters are actually on the device (for non-8bit models)
+    for model, name in [(unwrapped_vae, "VAE"), (unwrapped_text_encoder, "TextEncoder"), (unwrapped_transformer, "Transformer")]:
+        # Skip 8-bit quantized models
+        is_8bit = hasattr(model, 'is_loaded_in_8bit') and model.is_loaded_in_8bit
+        if is_8bit:
+            logger.info(f"Skipping parameter check for 8-bit {name}")
+            continue
+            
+        for param_name, param in model.named_parameters():
+            if param.device != device:
+                logger.warning(f"Moving {name} parameter {param_name} from {param.device} to {device}")
+                try:
+                    param.data = param.data.to(device)
+                except Exception as e:
+                    logger.warning(f"Could not move {name} parameter {param_name}: {e}")
+        for buffer_name, buffer in model.named_buffers():
+            if buffer.device != device:
+                logger.warning(f"Moving {name} buffer {buffer_name} from {buffer.device} to {device}")
+                try:
+                    buffer.data = buffer.data.to(device)
+                except Exception as e:
+                    logger.warning(f"Could not move {name} buffer {buffer_name}: {e}")
+
+    # Create a fresh scheduler copy and ensure device placement
+    scheduler_copy = deepcopy(scheduler)
+    if hasattr(scheduler_copy, 'to'):
+        scheduler_copy = scheduler_copy.to(device)
     
     # Create the SGMultiShotPipeline with multi-shot capabilities
     multishot_pipeline = SGMultiShotPipeline(
-        scheduler=deepcopy(scheduler),
-        vae=accelerator.unwrap_model(vae),
-        text_encoder=accelerator.unwrap_model(text_encoder), 
+        scheduler=scheduler_copy,
+        vae=unwrapped_vae,
+        text_encoder=unwrapped_text_encoder, 
         tokenizer=tokenizer,
-        transformer=accelerator.unwrap_model(transformer),
+        transformer=unwrapped_transformer,
         sos_token_generator=sos_generator
     )
+    
+    # Ensure pipeline components are on the correct device
     multishot_pipeline.set_progress_bar_config(disable=True)
+    multishot_pipeline = multishot_pipeline.to(device)
+    
+    # Force all pipeline submodules to the correct device (skip 8-bit models)
+    if hasattr(multishot_pipeline, 'vae') and multishot_pipeline.vae is not None:
+        multishot_pipeline.vae = safe_to_device(multishot_pipeline.vae, device, "Pipeline VAE")
+    if hasattr(multishot_pipeline, 'text_encoder') and multishot_pipeline.text_encoder is not None:
+        multishot_pipeline.text_encoder = safe_to_device(multishot_pipeline.text_encoder, device, "Pipeline TextEncoder")
+    if hasattr(multishot_pipeline, 'transformer') and multishot_pipeline.transformer is not None:
+        multishot_pipeline.transformer = safe_to_device(multishot_pipeline.transformer, device, "Pipeline Transformer")
+    
+    # Set pipeline execution device (if possible)
+    try:
+        multishot_pipeline._execution_device = device
+    except (AttributeError, TypeError):
+        # If we can't set _execution_device directly, it should be handled by the pipeline's to() method
+        logger.info("Could not set _execution_device directly, relying on pipeline.to(device)")
+        pass
+
     
     # Create and return the multi-shot validation pipeline
     return MultiShotValidationPipeline(

@@ -43,7 +43,8 @@ validation:
   guidance_scale: 3.0
   skip_initial_validation: true
   enable_multi_shot : True
-
+  num_shots : 3
+  sos_latent_dim : 128
 
 checkpoints:
   interval: 500

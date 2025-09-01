@@ -341,8 +341,6 @@ def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingSt
     mode = conditioning_config.mode
     if mode == "none":
         strategy = StandardTrainingStrategy(conditioning_config)
-    elif mode == "reference_video":
-        strategy = ReferenceVideoTrainingStrategy(conditioning_config)
     else:
         raise ValueError(f"Unknown conditioning mode: {mode}")
 

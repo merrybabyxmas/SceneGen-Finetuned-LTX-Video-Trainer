@@ -305,7 +305,7 @@ class PrecomputedDataset(Dataset):
         Latent 형식 [Seq, D] 에 맞춰 SOS token 생성
         """
         device = ref.device if ref.is_cuda else "cpu"
-        print(f"ref shape : {ref.shape}")
+        # print(f"ref shape : {ref.shape}")
 
         if ref.dim() != 2:
             raise ValueError(f"[SOS] Unexpected latent shape {ref.shape}, expected [Seq, D]")
@@ -331,7 +331,11 @@ if __name__ == "__main__":
     loader = DataLoader(ds, batch_size=4, shuffle=True)
     for batch in loader:
         # print(batch)
-        print(batch["latent_conditions"]["latents"].shape)
-        print(batch["prev_conditions"]["latents"].shape)
+        print("-----------------")
+        # print(batch)
+        print(256//32)
+        print("-----------------")
+        break
+        
         
         
