@@ -366,6 +366,32 @@ class FlowMatchingConfig(ConfigBaseModel):
     )
 
 
+class DebugConfig(ConfigBaseModel):
+    """Configuration for debug frame generation"""
+
+    enable_debug_frames: bool = Field(
+        default=False,
+        description="Whether to enable debug frame generation during training",
+    )
+
+    debug_gpu_id: int = Field(
+        default=1,
+        description="GPU ID to use for debug frame generation (separate from training)",
+        ge=0,
+    )
+
+    debug_interval: int = Field(
+        default=500,
+        description="Number of steps between debug frame generations",
+        gt=0,
+    )
+
+    enable_batch_visualization: bool = Field(
+        default=False,
+        description="Whether to save comprehensive batch visualization for first 2 batches showing prev/curr latents, noisy versions, and denoised results",
+    )
+
+
 class LtxvTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
@@ -381,6 +407,7 @@ class LtxvTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
 
     # General configuration
     seed: int = Field(

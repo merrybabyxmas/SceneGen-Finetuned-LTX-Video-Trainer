@@ -46,10 +46,10 @@ def main(
         try:
             gpu_list = subprocess.check_output(["nvidia-smi", "-L"], encoding="utf-8")
             num_processes = len(gpu_list.split("\n")) - 1
-            logger.debug(f"Found {num_processes} GPUs:\n{gpu_list}")
+            logger.info(f"Found {num_processes} GPUs")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.error(f"Failed to get GPU count from nvidia-smi: {e}")
-            logger.error("Falling back to 1 GPU")
+            logger.error(f"GPU detection failed: {e}")
+            logger.error("Using 1 GPU")
             num_processes = 1
 
     # Convert args to form that can be passed to the training script

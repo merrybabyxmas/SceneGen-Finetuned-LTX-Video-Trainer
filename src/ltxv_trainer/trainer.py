@@ -83,7 +83,7 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 COMPILE_WARMUP_STEPS = 5
-MEMORY_CHECK_INTERVAL = 200
+MEMORY_CHECK_INTERVAL = 500
 
 
 class TrainingStats(BaseModel):
@@ -111,6 +111,7 @@ class LtxvTrainer:
         self._prepare_models_for_training()
         self._dataset = None
         self._global_step = -1
+        self._current_epoch = 0
         self._checkpoint_paths = []
         self._init_wandb()
         self._training_strategy = get_training_strategy(self._config.conditioning)
@@ -133,7 +134,6 @@ class LtxvTrainer:
 
         # Use the same seed for all processes and ensure deterministic operations
         set_seed(cfg.seed)
-        logger.debug(f"Process {self._accelerator.process_index} using seed: {cfg.seed}")
 
         if cfg.model.training_mode == "lora" and not cfg.model.load_checkpoint:
             self._init_lora_weights()
@@ -215,8 +215,10 @@ class LtxvTrainer:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    self._current_epoch += 1  # Increment epoch when dataloader resets
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
+                    logger.info(f"📈 Starting epoch {self._current_epoch}")
 
                 # Measure compilation time (first COMPILE_WARMUP_STEPS steps)
                 if step == COMPILE_WARMUP_STEPS and cfg.acceleration.compile_with_inductor:
@@ -231,7 +233,7 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
+                    loss = self._training_step(batch, is_optimization_step)
                     self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
@@ -296,21 +298,19 @@ class LtxvTrainer:
                             total_time=total_time,
                         )
 
-                        # Log metrics to W&B
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        # Log essential metrics to W&B only every 10 steps
+                        if self._global_step % 10 == 0:
+                            self._log_metrics(
+                                {
+                                    "train/loss": loss.item(),
+                                    "train/learning_rate": current_lr,
+                                    "train/global_step": self._global_step,
+                                }
+                            )
 
-                        if disable_progress_bars and self._global_step % 20 == 0:
+                        if disable_progress_bars and self._global_step % 50 == 0:
                             logger.info(
-                                f"Step {self._global_step}/{cfg.optimization.steps} - "
-                                f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, "
-                                f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
+                                f"Step {self._global_step}/{cfg.optimization.steps} - Loss: {loss.item():.4f}"
                             )
 
                     # Sample GPU memory periodically
@@ -381,13 +381,19 @@ class LtxvTrainer:
                 self._wandb_run.finish()
 
         self._accelerator.end_training()
+        
+        # Initialize comfy_path to None by default
+        comfy_path = None
+        if IS_MAIN_PROCESS and 'saved_path' in locals():
+            comfy_path = saved_path.parent / f"comfy_{saved_path.name}"
 
         return comfy_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _training_step(self, batch: dict[str, dict[str, Tensor]], is_optimization_step: bool = False) -> Tensor:
         """Perform a single training step using the configured strategy."""
         # Use strategy to prepare the training batch
         training_batch = self._training_strategy.prepare_batch(batch, self._timestep_sampler)
+
 
         # Use strategy to prepare model inputs
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
@@ -395,10 +401,597 @@ class LtxvTrainer:
         # Run transformer forward pass
         model_pred = self._transformer(**model_inputs)[0]
 
+        # Save batch visualization for first 2 batches (only on optimization steps)
+        if (IS_MAIN_PROCESS and 
+            is_optimization_step and
+            hasattr(self._config.debug, 'enable_batch_visualization') and 
+            self._config.debug.enable_batch_visualization and 
+            self._global_step % self._config.debug.debug_interval == 0):
+            self._save_batch_visualization(batch, training_batch, model_pred)
+
+        # Save debug frames with model prediction if enabled in config
+        if (IS_MAIN_PROCESS and 
+            self._config.debug.enable_debug_frames and 
+            self._global_step % self._config.debug.debug_interval == 0):
+            self._save_debug_frames(batch, training_batch, model_pred)
+
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(model_pred, training_batch)
 
         return loss
+
+    @torch.no_grad()
+    def _save_debug_frames(self, batch: dict[str, dict[str, Tensor]], training_batch, model_pred: Tensor = None) -> None:
+        """Save debug frames to visualize training progress."""
+        try:
+            from PIL import Image
+            import numpy as np
+            
+            # Create debug directory
+            debug_dir = Path(self._config.output_dir) / "debug_frames"
+            debug_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Use separate debug GPU with availability check
+            try:
+                debug_gpu_id = self._config.debug.debug_gpu_id
+                # Check if debug GPU is available and different from current device
+                if debug_gpu_id < torch.cuda.device_count() and debug_gpu_id != self._accelerator.device.index:
+                    debug_device = torch.device(f"cuda:{debug_gpu_id}")
+                    logger.info(f"🔍 Using separate debug GPU: {debug_device}")
+                else:
+                    # Fallback to training GPU if debug GPU not available
+                    debug_device = self._accelerator.device
+                    logger.info(f"🔍 Debug GPU {debug_gpu_id} not available, using training GPU: {debug_device}")
+            except Exception as e:
+                debug_device = self._accelerator.device
+                logger.warning(f"🔍 Debug GPU setup failed, using training GPU: {e}")
+            
+            # Move VAE to debug device temporarily
+            self._vae.to(debug_device)
+            
+            # Get first sample from batch
+            batch_idx = 0
+            
+            # Extract original clean latents from the raw batch
+            curr_lat_dict = batch["latent_conditions"]
+            if torch.is_tensor(curr_lat_dict):
+                curr_clean_latents = curr_lat_dict[batch_idx:batch_idx+1]  # (1, Seq, D)
+            else:
+                curr_clean_latents = curr_lat_dict["latents"][batch_idx:batch_idx+1]  # (1, Seq, D)
+            
+            # Extract previous clean latents if available
+            prev_clean_latents = None
+            if batch.get("prev_conditions", None) is not None:
+                prev_dict = batch["prev_conditions"]
+                if not torch.is_tensor(prev_dict):
+                    prev_clean_latents = prev_dict["latents"][batch_idx:batch_idx+1]
+                else:
+                    prev_clean_latents = prev_dict[batch_idx:batch_idx+1]
+            
+            # Get noisy latents from training batch (first sample)
+            # For multi-shot: extract current shot portion
+            if hasattr(training_batch, 'latents'):
+                full_latents = training_batch.latents[batch_idx:batch_idx+1]  # (1, Total_Seq, D)
+                
+                if prev_clean_latents is not None:
+                    # Extract current shot portion (after previous shot)
+                    prev_seq_len = prev_clean_latents.shape[1]
+                    curr_noisy_latents = full_latents[:, prev_seq_len:]  # Current shot with noise
+                else:
+                    curr_noisy_latents = full_latents  # No previous shot, all is current
+            else:
+                return  # Skip if no latents found
+            
+            # Get dimensions from training batch
+            H, W = training_batch.height, training_batch.width
+            frames_per_sample = H * W
+            
+            # Extract first frame latents (HxW tokens)
+            if curr_clean_latents.shape[1] >= frames_per_sample:
+                curr_clean_first_frame = curr_clean_latents[:, :frames_per_sample]  # (1, H*W, D)
+                curr_noisy_first_frame = curr_noisy_latents[:, :frames_per_sample]  # (1, H*W, D)
+                
+                # Extract previous first frame if available
+                prev_clean_first_frame = None
+                if prev_clean_latents is not None and prev_clean_latents.shape[1] >= frames_per_sample:
+                    prev_clean_first_frame = prev_clean_latents[:, :frames_per_sample]  # (1, H*W, D)
+                
+                logger.info(f"Current clean frame shape: {curr_clean_first_frame.shape}")
+                if prev_clean_first_frame is not None:
+                    logger.info(f"Previous clean frame shape: {prev_clean_first_frame.shape}")
+                logger.info(f"Dimensions H={H}, W={W}, frames_per_sample={frames_per_sample}")
+                
+                # Calculate proper VAE latent dimensions
+                # LTX Video VAE uses 32x spatial downsampling, 8x temporal downsampling
+                vae_h = H // 1  # Spatial downsampling factor
+                vae_w = W // 1  
+                vae_channels = 128  # LTX latent channels
+                
+                logger.info(f"VAE dimensions: {vae_channels}x{vae_h}x{vae_w}")
+                
+                # Reshape properly: (1, H*W, 128) -> (1, 128, vae_h, vae_w)
+                try:
+                    # Take only the spatial part (first frame)
+                    spatial_tokens = vae_h * vae_w
+                    if curr_clean_first_frame.shape[1] >= spatial_tokens:
+                        # Current latents
+                        curr_clean_spatial = curr_clean_first_frame[:, :spatial_tokens, :]  # (1, spatial_tokens, 128)
+                        curr_noisy_spatial = curr_noisy_first_frame[:, :spatial_tokens, :]
+                        
+                        # Previous latents (if available)
+                        prev_clean_spatial = None
+                        if prev_clean_first_frame is not None:
+                            prev_clean_spatial = prev_clean_first_frame[:, :spatial_tokens, :]
+                        
+                        # Reshape to proper 5D VAE format: (batch, channels, frames, height, width)
+                        vae_f = 1  # Single frame for debugging
+                        curr_clean_reshaped = curr_clean_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
+                        curr_noisy_reshaped = curr_noisy_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
+                        
+                        prev_clean_reshaped = None
+                        if prev_clean_spatial is not None:
+                            prev_clean_reshaped = prev_clean_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
+
+                        logger.info(f"Final VAE input shapes: curr_clean={curr_clean_reshaped.shape}, curr_noisy={curr_noisy_reshaped.shape}")
+                        if prev_clean_reshaped is not None:
+                            logger.info(f"Previous clean shape: {prev_clean_reshaped.shape}")
+                        
+                        # Move latents to debug device
+                        curr_clean_reshaped = curr_clean_reshaped.to(debug_device)
+                        curr_noisy_reshaped = curr_noisy_reshaped.to(debug_device)
+                        if prev_clean_reshaped is not None:
+                            prev_clean_reshaped = prev_clean_reshaped.to(debug_device)
+                    else:
+                        logger.warning(f"Not enough spatial tokens: {curr_clean_first_frame.shape[1]} < {spatial_tokens}")
+                        return
+                except Exception as e:
+                    logger.error(f"Failed to reshape latents: {e}")
+                    return
+                # Decode with VAE on debug device
+                with autocast(debug_device.type, dtype=torch.bfloat16):
+                    try:
+                        # Use timestep tensor for VAE decode
+                        timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
+                        
+                        # Decode current latents
+                        curr_clean_result = self._vae.decode(curr_clean_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        curr_noisy_result = self._vae.decode(curr_noisy_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        
+                        # Decode previous latents if available
+                        prev_clean_result = None
+                        if prev_clean_reshaped is not None:
+                            prev_clean_result = self._vae.decode(prev_clean_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        
+                        # Handle different return formats for current latents
+                        if isinstance(curr_clean_result, (list, tuple)):
+                            curr_clean_decoded = curr_clean_result[0]
+                        else:
+                            curr_clean_decoded = curr_clean_result
+                            
+                        if isinstance(curr_noisy_result, (list, tuple)):
+                            curr_noisy_decoded = curr_noisy_result[0] 
+                        else:
+                            curr_noisy_decoded = curr_noisy_result
+                        
+                        # Handle previous latents
+                        prev_clean_decoded = None
+                        if prev_clean_result is not None:
+                            if isinstance(prev_clean_result, (list, tuple)):
+                                prev_clean_decoded = prev_clean_result[0]
+                            else:
+                                prev_clean_decoded = prev_clean_result
+                        
+                        # Compute denoised latents if model prediction is available
+                        curr_denoised_decoded = None
+                        if model_pred is not None:
+                            try:
+                                # Get current portion of model prediction
+                                if prev_clean_latents is not None:
+                                    prev_seq_len = prev_clean_latents.shape[1]
+                                    curr_model_pred = model_pred[batch_idx:batch_idx+1, prev_seq_len:]
+                                else:
+                                    curr_model_pred = model_pred[batch_idx:batch_idx+1]
+                                
+                                # Extract first frame from model prediction
+                                curr_model_pred_first = curr_model_pred[:, :frames_per_sample]  # (1, H*W, D)
+                                curr_model_pred_spatial = curr_model_pred_first[:, :spatial_tokens, :]
+                                curr_model_pred_reshaped = curr_model_pred_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
+                                curr_model_pred_reshaped = curr_model_pred_reshaped.to(debug_device)
+                                
+                                # Compute denoised latents using flow matching
+                                # For flow matching: denoised = noisy - sigma * predicted_velocity
+                                sigmas = training_batch.sigmas[batch_idx:batch_idx+1].to(debug_device)  # (1, 1, 1)
+                                
+                                # Flow matching denoising: x_0 = x_t - sigma * v_pred
+                                # where v_pred is the velocity field predicted by the model
+                                sigma_reshaped = sigmas.view(-1, 1, 1, 1, 1)  # Shape for broadcasting
+                                
+                                # Compute denoised latents using flow matching
+                                curr_denoised_reshaped = curr_noisy_reshaped - sigma_reshaped * curr_model_pred_reshaped
+                                
+                                # Decode denoised latents
+                                curr_denoised_result = self._vae.decode(curr_denoised_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                                
+                                if isinstance(curr_denoised_result, (list, tuple)):
+                                    curr_denoised_decoded = curr_denoised_result[0]
+                                else:
+                                    curr_denoised_decoded = curr_denoised_result
+                                    
+                            except Exception as e:
+                                logger.warning(f"Failed to compute denoised frame: {e}")
+                                curr_denoised_decoded = None
+                            
+                    except Exception as e:
+                        logger.warning(f"VAE decode failed: {e}")
+                        return
+                
+                # Convert to images and save
+                def tensor_to_image(tensor):
+                    # Handle 5D VAE output: (1, 3, 1, H, W) -> (H, W, 3)
+                    logger.info(f"tensor_to_image input shape: {tensor.shape}")
+                    
+                    # Remove batch and frame dimensions: (1, 3, 1, H, W) -> (3, H, W)
+                    img = tensor.squeeze(0).squeeze(1) if tensor.dim() == 5 else tensor.squeeze(0)
+                    
+                    # Normalize and convert: (3, H, W) -> (H, W, 3)
+                    img = img.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+                    img = img.permute(1, 2, 0).cpu().float().numpy()  # Convert to float32 before numpy
+                    img = (img * 255).astype(np.uint8)
+                    return Image.fromarray(img)
+                
+                # Convert current latents to images
+                curr_clean_img = tensor_to_image(curr_clean_decoded)
+                curr_noisy_img = tensor_to_image(curr_noisy_decoded)
+                
+                # Convert previous latents to images if available
+                prev_clean_img = None
+                if prev_clean_decoded is not None:
+                    prev_clean_img = tensor_to_image(prev_clean_decoded)
+                
+                # Convert denoised latents to images if available
+                curr_denoised_img = None
+                if curr_denoised_decoded is not None:
+                    curr_denoised_img = tensor_to_image(curr_denoised_decoded)
+                
+                # Save images
+                step_str = f"{self._global_step:06d}"
+                
+                # Save current frames
+                curr_clean_img.save(debug_dir / f"step_{step_str}_curr_clean_first_frame.png")
+                curr_noisy_img.save(debug_dir / f"step_{step_str}_curr_noisy_first_frame.png")
+                
+                # Save denoised frame if available
+                if curr_denoised_img is not None:
+                    curr_denoised_img.save(debug_dir / f"step_{step_str}_curr_denoised_first_frame.png")
+                
+                # Save previous frame if available
+                if prev_clean_img is not None:
+                    prev_clean_img.save(debug_dir / f"step_{step_str}_prev_clean_first_frame.png")
+                
+                saved_files = ["curr_clean", "curr_noisy"]
+                if curr_denoised_img is not None:
+                    saved_files.append("curr_denoised")
+                if prev_clean_img is not None:
+                    saved_files.append("prev_clean")
+                    
+                logger.info(f"🔍 Debug frames saved for step {self._global_step}: {', '.join(saved_files)}")
+            
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save debug frames: {e}")
+            # Ensure VAE is back on CPU even if error occurs
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
+
+    @torch.no_grad()
+    def _save_denoised_debug_frame(self, batch: dict[str, dict[str, Tensor]], training_batch, model_pred: Tensor) -> None:
+        """Save denoised frame using model prediction."""
+        try:
+            from PIL import Image
+            import numpy as np
+            
+            debug_dir = Path(self._config.output_dir) / "debug_frames"
+            debug_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Use separate debug GPU
+            debug_device = torch.device(f"cuda:{self._config.debug.debug_gpu_id}")
+            
+            # Move VAE to debug device temporarily
+            self._vae.to(debug_device)
+            
+            batch_idx = 0
+            
+            # Get current shot portion from noisy latents in training batch
+            full_latents = training_batch.latents[batch_idx:batch_idx+1]  # (1, Total_Seq, D)
+            
+            # Extract current shot portion if there's previous shot
+            prev_lat = None
+            if batch.get("prev_conditions", None) is not None:
+                prev_dict = batch["prev_conditions"]
+                if not torch.is_tensor(prev_dict):
+                    prev_lat = prev_dict["latents"][batch_idx:batch_idx+1]
+                else:
+                    prev_lat = prev_dict[batch_idx:batch_idx+1]
+            
+            if prev_lat is not None:
+                prev_seq_len = prev_lat.shape[1]
+                noisy_latents = full_latents[:, prev_seq_len:]  # Current shot with noise
+                model_pred_curr = model_pred[batch_idx:batch_idx+1, prev_seq_len:]  # Model prediction for current shot
+            else:
+                noisy_latents = full_latents
+                model_pred_curr = model_pred[batch_idx:batch_idx+1]
+            
+            # Get dimensions
+            H, W = training_batch.height, training_batch.width
+            frames_per_sample = H * W
+            
+            if noisy_latents.shape[1] >= frames_per_sample:
+                # Extract first frame
+                noisy_first_frame = noisy_latents[:, :frames_per_sample]  # (1, H*W, D)
+                pred_noise_first_frame = model_pred_curr[:, :frames_per_sample]  # (1, H*W, D)
+                
+                # Compute denoised latent using flow matching: x_0 = x_t - sigma * v_pred
+                # Note: This assumes model predicts velocity field (flow matching parameterization)
+                sigma = training_batch.sigmas[batch_idx:batch_idx+1, 0, 0].to(debug_device)  # (1,)
+                denoised_first_frame = noisy_first_frame - sigma.view(-1, 1, 1) * pred_noise_first_frame
+                
+                # Calculate proper VAE latent dimensions
+                vae_h = H // 1  # Spatial downsampling factor
+                vae_w = W // 1  
+                vae_channels = 128  # LTX latent channels
+                
+                # Reshape properly for VAE
+                try:
+                    spatial_tokens = vae_h * vae_w
+                    if denoised_first_frame.shape[1] >= spatial_tokens:
+                        denoised_spatial = denoised_first_frame[:, :spatial_tokens, :]  # (1, spatial_tokens, 128)
+                        # Reshape to 5D VAE format
+                        vae_f = 1  # Single frame for debugging
+                        denoised_reshaped = denoised_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
+                        # Move latents to debug device
+                        denoised_reshaped = denoised_reshaped.to(debug_device)
+                    else:
+                        logger.warning(f"Not enough spatial tokens for denoised: {denoised_first_frame.shape[1]} < {spatial_tokens}")
+                        return
+                except Exception as e:
+                    logger.error(f"Failed to reshape denoised latents: {e}")
+                    return
+                
+                # Decode with VAE on debug device
+                with autocast(debug_device.type, dtype=torch.bfloat16):
+                    try:
+                        # Use timestep tensor for VAE decode
+                        timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
+                        denoised_result = self._vae.decode(denoised_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        
+                        # Handle different return formats
+                        if isinstance(denoised_result, (list, tuple)):
+                            denoised_decoded = denoised_result[0]
+                        else:
+                            denoised_decoded = denoised_result
+                            
+                    except Exception as e:
+                        logger.warning(f"VAE decode failed: {e}")
+                        return
+                
+                # Convert to image and save
+                def tensor_to_image(tensor):
+                    # Handle 5D VAE output: (1, 3, 1, H, W) -> (H, W, 3)
+                    logger.info(f"tensor_to_image input shape (denoised): {tensor.shape}")
+                    
+                    # Remove batch and frame dimensions: (1, 3, 1, H, W) -> (3, H, W)
+                    img = tensor.squeeze(0).squeeze(1) if tensor.dim() == 5 else tensor.squeeze(0)
+                    
+                    # Normalize and convert: (3, H, W) -> (H, W, 3)
+                    img = img.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+                    img = img.permute(1, 2, 0).cpu().float().numpy()  # Convert to float32 before numpy
+                    img = (img * 255).astype(np.uint8)
+                    return Image.fromarray(img)
+                
+                denoised_img = tensor_to_image(denoised_decoded)
+                
+                # Save image
+                step_str = f"{self._global_step:06d}"
+                denoised_img.save(debug_dir / f"step_{step_str}_denoised_first_frame.png")
+                
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save denoised debug frame: {e}")
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
+
+    @torch.no_grad()
+    def _save_batch_visualization(self, batch: dict[str, dict[str, Tensor]], training_batch, model_pred: Tensor = None) -> None:
+        """Save batch visualization showing prev/curr latents and transitions for first 2 batches."""
+        try:
+            from PIL import Image
+            import numpy as np
+            
+            # Create batch visualization directory
+            batch_viz_dir = Path(self._config.output_dir) / "batch_visualization"
+            batch_viz_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Use debug GPU
+            try:
+                debug_gpu_id = self._config.debug.debug_gpu_id
+                if debug_gpu_id < torch.cuda.device_count() and debug_gpu_id != self._accelerator.device.index:
+                    debug_device = torch.device(f"cuda:{debug_gpu_id}")
+                else:
+                    debug_device = self._accelerator.device
+            except Exception:
+                debug_device = self._accelerator.device
+            
+            # Move VAE to debug device temporarily
+            self._vae.to(debug_device)
+            
+            batch_idx = 0  # Focus on first sample in batch
+            
+            # Extract original clean latents from raw batch
+            curr_lat_dict = batch["latent_conditions"]
+            if torch.is_tensor(curr_lat_dict):
+                curr_clean_latents = curr_lat_dict[batch_idx:batch_idx+1]  # (1, 1008, 128)
+            else:
+                curr_clean_latents = curr_lat_dict["latents"][batch_idx:batch_idx+1]  # (1, 1008, 128)
+            
+            # Extract prev latents (SOS) if available
+            prev_clean_latents = None
+            if batch.get("prev_conditions", None) is not None:
+                prev_dict = batch["prev_conditions"]
+                if not torch.is_tensor(prev_dict):
+                    prev_clean_latents = prev_dict["latents"][batch_idx:batch_idx+1]  # (1, 1008, 128)
+                else:
+                    prev_clean_latents = prev_dict[batch_idx:batch_idx+1]  # (1, 1008, 128)
+            
+            # Get concatenated noisy latents from training batch
+            full_latents = training_batch.latents[batch_idx:batch_idx+1]  # (1, 2016, 128) or (1, 1008, 128)
+            
+            # Separate prev (clean SOS) and curr (noisy) portions
+            if prev_clean_latents is not None:
+                prev_seq_len = prev_clean_latents.shape[1]  # 1008
+                noisy_curr_latents = full_latents[:, prev_seq_len:]  # (1, 1008, 128) - current with noise
+                clean_prev_latents_from_batch = full_latents[:, :prev_seq_len]  # (1, 1008, 128) - prev (should be clean)
+            else:
+                # No previous shot, all latents are current
+                noisy_curr_latents = full_latents
+                clean_prev_latents_from_batch = None
+            
+            # VAE latent channels
+            vae_channels = 128
+            
+            # Helper function to decode and save latents as video
+            def decode_and_save_video(latents, suffix, step, shot_type=""):
+                try:
+                    # Calculate total tokens for the video (F * H * W) using actual batch metadata
+                    total_tokens = training_batch.num_frames * training_batch.height * training_batch.width
+                    
+                    if latents.shape[1] >= total_tokens:
+                        # Extract full video latents
+                        video_latents = latents[:, :total_tokens]  # (1, F*H*W, 128)
+                        
+                        # Reshape to 5D VAE format for full video: (batch, channels, frames, height, width)
+                        batch_F = training_batch.num_frames
+                        batch_H = training_batch.height 
+                        batch_W = training_batch.width
+                        reshaped = video_latents.transpose(1, 2).reshape(1, vae_channels, batch_F, batch_H, batch_W)
+                        reshaped = reshaped.to(debug_device)
+                        
+                        # Decode full video
+                        with autocast(debug_device.type, dtype=torch.bfloat16):
+                            timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
+                            result = self._vae.decode(reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                            
+                            if isinstance(result, (list, tuple)):
+                                decoded = result[0]  # (1, 3, F, H, W)
+                            else:
+                                decoded = result
+                        
+                        # Convert to video format and save
+                        # decoded: (1, 3, F, H, W) -> (F, H, W, 3) for video export
+                        video_tensor = decoded.squeeze(0)  # (3, F, H, W)
+                        video_tensor = video_tensor.permute(1, 2, 3, 0)  # (F, H, W, 3)
+                        video_tensor = video_tensor.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+                        
+                        # Convert to numpy and scale to [0, 255]
+                        video_np = video_tensor.cpu().float().numpy()
+                        video_np = (video_np * 255).astype(np.uint8)
+                        
+                        # Convert to list of PIL Images for video export
+                        video_frames = [Image.fromarray(frame) for frame in video_np]
+                        
+                        # Save as MP4 video
+                        step_str = f"epoch_{self._current_epoch:02d}_batch_{step:02d}"
+                        shot_prefix = f"{shot_type}_" if shot_type else ""
+                        video_path = batch_viz_dir / f"{step_str}_{shot_prefix}{suffix}.mp4"
+                        
+                        # Use diffusers export_to_video function
+                        from diffusers.utils import export_to_video
+                        export_to_video(video_frames, str(video_path), fps=24)
+                        
+                        return True
+                        
+                    else:
+                        logger.warning(f"Not enough tokens for full video: {latents.shape[1]} < {total_tokens}")
+                        return False
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to decode video {suffix}: {e}")
+                    return False
+            
+            # Save visualizations for this batch
+            step = self._global_step
+            saved_count = 0
+            
+            # 1. Save prev latents (SOS/previous shot) - clean
+            if prev_clean_latents is not None:
+                shot_type = "SOS" if step == 1 else "prev"
+                if decode_and_save_video(prev_clean_latents, "prev_clean", step, shot_type):
+                    saved_count += 1
+                    
+                # Also save prev from training batch to verify it's clean
+                if decode_and_save_video(clean_prev_latents_from_batch, "prev_from_training_batch", step, shot_type):
+                    saved_count += 1
+                
+                if step == 1:
+                    logger.info(f"Batch {step}: Using SOS token as previous latent (first shot)")
+                else:
+                    logger.info(f"Batch {step}: Using previous shot latent")
+            else:
+                # Should not happen in multi-shot training
+                logger.warning(f"Batch {step}: No previous latent found - this shouldn't happen in multi-shot training")
+            
+            # 2. Save curr latents - clean (before noise)
+            if decode_and_save_video(curr_clean_latents, "curr_clean", step, "curr"):
+                saved_count += 1
+            
+            # 3. Save curr latents - noisy (after noise)
+            if decode_and_save_video(noisy_curr_latents, "curr_noisy", step, "curr"):
+                saved_count += 1
+            
+            # 4. Save curr latents - denoised (model prediction)
+            if model_pred is not None:
+                # Extract current shot portion from model prediction
+                if prev_clean_latents is not None:
+                    prev_seq_len = prev_clean_latents.shape[1]
+                    model_pred_curr = model_pred[batch_idx:batch_idx+1, prev_seq_len:]  # Current shot prediction
+                else:
+                    model_pred_curr = model_pred[batch_idx:batch_idx+1]
+                
+                # Compute denoised latent: noisy_latent - predicted_noise (epsilon parameterization)
+                denoised_curr_latents = noisy_curr_latents - model_pred_curr
+                
+                if decode_and_save_video(denoised_curr_latents, "curr_denoised", step, "curr"):
+                    saved_count += 1
+            
+            # 4. Additional verification messages
+            if step == 1:  # First batch
+                logger.info("🔍 First batch detected")
+                logger.info("   SOS token is being used as prev latent")
+                logger.info("   Check: epoch_00_batch_01_SOS_prev_clean.mp4 contains the SOS token")
+            elif step == 2:  # Second batch
+                logger.info("🔍 Second batch detected") 
+                logger.info("   Check: epoch_00_batch_01_curr_curr_clean.mp4 should match epoch_00_batch_02_prev_prev_clean.mp4")
+                logger.info("   This verifies the SOS→curr transition is working correctly")
+            
+            if saved_count > 0:
+                logger.info(f"🎥 Batch visualization saved: {saved_count} videos for batch {step}")
+            
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save batch visualization: {e}")
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
 
     @staticmethod
     def _print_config(config: BaseModel) -> None:
@@ -499,7 +1092,8 @@ class LtxvTrainer:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
-        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        if IS_MAIN_PROCESS:
+            logger.info(f"Trainable params: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -508,7 +1102,8 @@ class LtxvTrainer:
 
     def _setup_lora(self) -> None:
         """Configure LoRA adapters for the transformer. Only called in LoRA training mode."""
-        logger.debug(f"Adding LoRA adapter with rank {self._config.lora.rank}")
+        if IS_MAIN_PROCESS:
+            logger.info(f"Adding LoRA adapter with rank {self._config.lora.rank}")
         lora_config = LoraConfig(
             r=self._config.lora.rank,
             lora_alpha=self._config.lora.alpha,
@@ -597,7 +1192,8 @@ class LtxvTrainer:
             data_sources = self._training_strategy.get_data_sources()
 
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
-            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+            if IS_MAIN_PROCESS:
+                logger.info(f"Dataset loaded: {len(self._dataset):,} samples")
 
         dataloader = DataLoader(
             self._dataset,
@@ -612,7 +1208,6 @@ class LtxvTrainer:
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
-        logger.debug("Initializing LoRA weights...")
         for _, module in self._transformer.named_modules():
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
@@ -700,9 +1295,7 @@ class LtxvTrainer:
 
         # Log information about distributed training
         if self._accelerator.num_processes > 1:
-            logger.info(f"Distributed training enabled with {self._accelerator.num_processes} processes")
-            logger.info(f"Local batch size: {self._config.optimization.batch_size}")
-            logger.info(f"Global batch size: {self._config.optimization.batch_size * self._accelerator.num_processes}")
+            logger.info(f"Distributed training: {self._accelerator.num_processes} processes, global batch: {self._config.optimization.batch_size * self._accelerator.num_processes}")
 
     @torch.no_grad()
     @torch.compiler.set_stance("force_eager")
@@ -783,17 +1376,18 @@ class LtxvTrainer:
                 export_to_video(video, str(video_path), fps=24)
                 video_paths.append(video_path)
                 i += 1
-            progress.update(task, advance=1)
+            if hasattr(progress, 'update'):
+                progress.update(task, advance=1)
 
-        progress.remove_task(task)
+        if hasattr(progress, 'remove_task'):
+            progress.remove_task(task)
 
         # Move unused components back to CPU.
         self._vae.to("cpu")
         if not self._config.acceleration.load_text_encoder_in_8bit:
             self._text_encoder.to("cpu")
 
-        rel_outputs_path = output_dir.relative_to(self._config.output_dir)
-        logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+        logger.info(f"🎥 Validation samples saved for step {self._global_step}")
         return video_paths
 
     @torch.no_grad()
@@ -801,13 +1395,13 @@ class LtxvTrainer:
     def _sample_multi_shot_videos(self, progress: Progress) -> list[Path] | None:
         """Run multi-shot validation by generating sequential video shots from a single prompt."""
         
-        # Create multi-shot validation pipeline
+        # Create multi-shot validation pipeline (use same safe approach as single-shot)
         multi_shot_pipeline = create_multi_shot_validation_pipeline(
-            scheduler=self._scheduler,
-            vae=self._vae,
-            text_encoder=self._text_encoder,
+            scheduler=deepcopy(self._scheduler),  # Copy scheduler like single-shot validation
+            vae=self._accelerator.unwrap_model(self._vae),  # Unwrap like single-shot validation
+            text_encoder=self._accelerator.unwrap_model(self._text_encoder),  # Unwrap like single-shot validation
             tokenizer=self._tokenizer,
-            transformer=self._transformer,
+            transformer=self._accelerator.unwrap_model(self._transformer),  # Unwrap like single-shot validation
             device=self._accelerator.device,
             accelerator=self._accelerator,
             d_model=self._config.validation.sos_latent_dim
@@ -821,7 +1415,6 @@ class LtxvTrainer:
         
         # Generate multi-shot sequence for each validation prompt
         for i, prompt in enumerate(self._config.validation.prompts):
-            logger.info(f"Generating multi-shot sequence {i+1}/{len(self._config.validation.prompts)}")
             
             try:
                 video_paths = multi_shot_pipeline.generate_multi_shot_sequence(
@@ -833,7 +1426,7 @@ class LtxvTrainer:
                     inference_steps=self._config.validation.inference_steps,
                     guidance_scale=self._config.validation.guidance_scale,
                     negative_prompt=self._config.validation.negative_prompt,
-                    seed=self._config.validation.seed + i  # Different seed for each sequence
+                    seed=self._config.validation.seed   # Different seed for each sequence
                 )
                 
                 all_video_paths.extend(video_paths)
@@ -848,11 +1441,10 @@ class LtxvTrainer:
             self._text_encoder.to("cpu")
         
         if all_video_paths:
-            rel_outputs_path = output_dir.relative_to(self._config.output_dir)
-            logger.info(f"🎬 Multi-shot validation samples for step {self._global_step} saved in {rel_outputs_path}")
+            logger.info(f"🎬 Multi-shot validation samples saved for step {self._global_step}")
             return all_video_paths
         else:
-            logger.warning("No multi-shot videos were generated successfully")
+            logger.warning("Multi-shot validation failed")
             return None
 
     @staticmethod
@@ -884,7 +1476,6 @@ class LtxvTrainer:
         prefix = "model" if self._config.model.training_mode == "full" else "lora"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
-        rel_saved_weights_path = saved_weights_path.relative_to(self._config.output_dir)
 
         # Get model state dict
         unwrapped_model = self._accelerator.unwrap_model(self._transformer)
@@ -892,7 +1483,7 @@ class LtxvTrainer:
         if self._config.model.training_mode == "full":
             state_dict = unwrapped_model.state_dict()
             save_file(state_dict, saved_weights_path)
-            logger.info(f"💾 Model weights for step {self._global_step} saved in {rel_saved_weights_path}")
+            logger.info(f"💾 Model checkpoint saved: step {self._global_step}")
         elif self._config.model.training_mode == "lora":
             state_dict = get_peft_model_state_dict(unwrapped_model)
             # Adjust layer names to standard formatting.
@@ -902,7 +1493,7 @@ class LtxvTrainer:
                 transformer_lora_layers=state_dict,
                 weight_name=filename,
             )
-            logger.info(f"💾 LoRA weights for step {self._global_step} saved in {rel_saved_weights_path}")
+            logger.info(f"💾 LoRA checkpoint saved: step {self._global_step}")
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
@@ -919,7 +1510,6 @@ class LtxvTrainer:
             for old_checkpoint in checkpoints_to_remove:
                 if old_checkpoint.exists():
                     old_checkpoint.unlink()
-                    logger.debug(f"Removed old checkpoints: {old_checkpoint}")
             # Update the list to only contain kept checkpoints
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
 
@@ -932,7 +1522,7 @@ class LtxvTrainer:
         with open(config_path, "w") as f:
             yaml.dump(self._config.model_dump(), f, default_flow_style=False, indent=2)
 
-        logger.info(f"💾 Training configuration saved to: {config_path.relative_to(self._config.output_dir)}")
+        logger.info("💾 Training configuration saved")
 
     def _init_wandb(self) -> None:
         """Initialize Weights & Biases run."""

@@ -219,10 +219,14 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             logger.info(f"Device detection failed, using cuda:0: {e}")
             device = torch.device('cuda:0')
         
-        # Calculate expected latent dimensions
-        latent_frames = num_frames // 7  # VAE temporal downsampling
-        latent_height = height // 32      # VAE spatial downsampling  
-        latent_width = width // 32
+        # Calculate expected latent dimensions (consistent with training strategy)
+        # VAE downsampling factors should match the actual model configuration
+        vae_temporal_downsample = getattr(self.vae, 'temporal_downsample_factor', 7)  # Usually 7 for LTX
+        vae_spatial_downsample = getattr(self.vae, 'spatial_downsample_factor', 32)   # Usually 32 for LTX
+        
+        latent_frames = num_frames // vae_temporal_downsample + 1
+        latent_height = height // vae_spatial_downsample
+        latent_width = width // vae_spatial_downsample
         curr_seq_len = latent_frames * latent_height * latent_width
         
         logger.info(f"Calculated latent dimensions: frames={latent_frames}, h={latent_height}, w={latent_width}, seq_len={curr_seq_len}")
@@ -253,22 +257,20 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         logger.info(f"Multi-shot conditioning: prev_seq={prev_seq_len}, curr_seq={curr_seq_len}, total={total_seq_len}")
         logger.info(f"prev_latent final shape: {prev_latent.shape}, device: {prev_latent.device}")
         
-        # 2. Create conditioning mask
-        # prev part: all True (fully conditioned)
-        # curr part: first frame True (partial conditioning), rest False  
+        # 2. Create conditioning mask - simplified approach
+        # prev part: all True (keep previous shot unchanged)
+        # curr part: all False (allow full denoising for current shot)
         batch_size = 1  # Single video generation
         conditioning_mask = torch.zeros(batch_size, total_seq_len, dtype=torch.bool, device=device)
         
-        # Mark prev part as fully conditioned
+        # Mark prev part as fully conditioned (will be preserved during denoising)
         conditioning_mask[:, :prev_seq_len] = True
         
-        # Mark first frame of curr part as conditioned (optional)
-        # first_frame_tokens = latent_height * latent_width
-        # curr_start = prev_seq_len
-        # curr_first_frame_end = min(curr_start + first_frame_tokens, total_seq_len)
-        # conditioning_mask[:, curr_start:curr_first_frame_end] = True  # Optional first frame conditioning
+        # Current part remains False to allow normal denoising
+        # This ensures the current shot is generated normally while prev shot provides context
         
         logger.info(f"Created conditioning mask shape: {conditioning_mask.shape}, prev_conditioned: {conditioning_mask[:, :prev_seq_len].sum().item()}")
+        logger.info(f"Conditioning strategy: prev={prev_seq_len} tokens fixed, curr={curr_seq_len} tokens denoising")
         
         # 3. Prepare latents for generation
         # We'll modify the standard generation to use our custom conditioning
@@ -336,14 +338,13 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         logger.info(f"Prompt encoding completed. prompt_embeds shape: {prompt_embeds.shape}, device: {prompt_embeds.device}")
         logger.info(f"Using CFG: {guidance_scale > 1.0}, guidance_scale: {guidance_scale}")
         
-        # Calculate latent dimensions (use standard LTX-Video scaling factors)
-        vae_scale_factor_temporal = getattr(self.vae, 'temporal_scale_factor', 32)
-        vae_scale_factor_spatial = getattr(self.vae, 'spatial_scale_factor', 32)
+        # Calculate latent dimensions (consistent with earlier calculations)
+        vae_temporal_downsample = getattr(self.vae, 'temporal_downsample_factor', 7)
+        vae_spatial_downsample = getattr(self.vae, 'spatial_downsample_factor', 32)
         
-        
-        latent_frames = num_frames // 7
-        latent_height = height // vae_scale_factor_spatial
-        latent_width = width // vae_scale_factor_spatial
+        latent_frames = num_frames // vae_temporal_downsample
+        latent_height = height // vae_spatial_downsample
+        latent_width = width // vae_spatial_downsample
         latent_shape = (1, latent_frames * latent_height * latent_width, self.transformer.config.in_channels)
         logger.info(f"  F : {num_frames}, H : {height}, W : {width}")
         logger.info(f"  Initializing latents with shape : {latent_frames}x{latent_height}x{latent_width}")        
@@ -390,17 +391,37 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 
              
             # Create video coordinates for transformer
-            # Calculate total sequence length including prev + curr
-            total_frames = combined_latents.shape[1] // (latent_height * latent_width)
+            # For combined latents (prev + curr), we need proper coordinate handling
+            total_seq_len = combined_latents.shape[1]
+            
+            # Generate coordinates that match the actual combined sequence length
             video_coords = self._prepare_video_ids(
                 latent_model_input.shape[0],
-                total_frames,
+                latent_frames,
                 latent_height,
                 latent_width,
                 patch_size=self.transformer_spatial_patch_size,
                 patch_size_t=self.transformer_temporal_patch_size,
                 device=device,
             )
+            
+            # If combined sequence is longer than base coordinates, extend them properly
+            if total_seq_len > video_coords.shape[-1]:
+                # Create additional coordinates for the prev sequence part
+                additional_coords = video_coords.clone()  # Same pattern for consistency
+                video_coords = torch.cat([additional_coords, video_coords], dim=-1)
+            
+            # Ensure coordinates match the exact sequence length
+            if video_coords.shape[-1] != total_seq_len:
+                # Trim or extend to match exact length
+                if video_coords.shape[-1] > total_seq_len:
+                    video_coords = video_coords[..., :total_seq_len]
+                else:
+                    # Pad with zeros if needed (shouldn't happen in normal cases)
+                    padding = total_seq_len - video_coords.shape[-1]
+                    pad_coords = torch.zeros(*video_coords.shape[:-1], padding, device=device, dtype=video_coords.dtype)
+                    video_coords = torch.cat([video_coords, pad_coords], dim=-1)
+            
             video_coords = self._scale_video_ids(
                 video_coords,
                 scale_factor=self.vae_spatial_compression_ratio,

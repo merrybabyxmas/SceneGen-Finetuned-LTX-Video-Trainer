@@ -38,20 +38,40 @@ def _sinusoidal_pos_emb(n_positions: int, dim: int) -> torch.Tensor:
 class SOSTokenLatents(nn.Module):
     """
     SOS token generator for latent sequence [Seq, D].
-    - learnable base token [1, D] (trunc_normal init)
+    - fixed base token [1, D] (trunc_normal init, non-learnable)
     - sinusoidal positional embedding -> project to D and add
     - outputs [Seq, D]
     """
-    def __init__(self, d_model: int = 128, pe_dim: Optional[int] = None):
+    def __init__(self, d_model: int = 128, pe_dim: Optional[int] = None, use_zero_init: bool = True):
         super().__init__()
         self.d_model = d_model
-        self.base = nn.Parameter(torch.empty(1, d_model))
-        _trunc_normal_(self.base, std=0.02)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        
+        # Fixed base token (non-learnable)
+        if use_zero_init:
+            # Simple zero initialization for maximum stability
+            base_token = torch.zeros(1, d_model)
+        else:
+            # Truncated normal initialization (original approach)
+            base_token = torch.empty(1, d_model)
+            _trunc_normal_(base_token, std=0.02)
+        self.register_buffer('base', base_token)  # Non-learnable, fixed initialization
+        
+        # Fixed alpha value (non-learnable) - minimal influence
+        self.register_buffer('alpha', torch.tensor(0.001))  # Very small fixed value
 
         pe_dim = pe_dim or min(64, d_model)
         self.pe_proj = nn.Linear(pe_dim, d_model, bias=False)
-        nn.init.xavier_uniform_(self.pe_proj.weight)
+        
+        if use_zero_init:
+            # Zero initialize projection weights for stability
+            nn.init.zeros_(self.pe_proj.weight)
+        else:
+            # Xavier initialization (original approach)
+            nn.init.xavier_uniform_(self.pe_proj.weight)
+        
+        # Freeze pe_proj to make everything non-learnable
+        for param in self.pe_proj.parameters():
+            param.requires_grad = False
 
     def forward(self, seq_len: int, device=None) -> torch.Tensor:
         if device is None:
@@ -66,7 +86,7 @@ class SOSTokenLatents(nn.Module):
         pe_c = self.pe_proj(pe)  # (Seq, D)
 
         sos = base + self.alpha * pe_c
-        return sos.clamp(0.0, 1.0)  # (Seq, D)
+        return sos.clamp(-1.0, 1.0)  # (Seq, D) - match VAE latent range
 
 
 PRECOMPUTED_DIR_NAME = ".precomputed"
@@ -257,27 +277,41 @@ class PrecomputedDataset(Dataset):
         #       f"prev shot idx : {prev_shot_idx}")
 
         result = {}
+        
+        # 현재 샷 데이터 로드
         for dir_name, output_key in self.data_sources.items():
             source_root = self.source_paths[dir_name]
             try:
                 rel_data = entry["per_source_rel"][output_key]
                 data_path = source_root / rel_data
-                data = torch.load(data_path, map_location="cpu",weights_only=True)
+                data = torch.load(data_path, map_location="cpu", weights_only=True)
                 result[output_key] = data
-                
-                
-                if dir_name == "latents" and prev_shot_idx is not None:
-                    key = (video_id, prev_shot_idx, output_key)
-                    rel_prev = self._key_to_rel[key]
-                    prev_path = source_root / rel_prev
-                    data = torch.load(prev_path, map_location="cpu",weights_only=True)
-                    result["prev_conditions"] = data
-                elif dir_name == "latents" and prev_shot_idx is None:
-                    data = self._make_sos_like(data)                    
-                    result["prev_conditions"] = data
-                    continue
             except Exception as e:
                 raise RuntimeError(f"Failed to load {output_key} from {data_path}: {e}") from e
+                
+        # 이전 샷 데이터 로드 (latents만 처리)
+        if "latents" in self.data_sources:
+            latents_output_key = self.data_sources["latents"]
+            source_root = self.source_paths["latents"]
+            
+            if prev_shot_idx is not None:
+                # 이전 샷이 있는 경우 로드
+                try:
+                    key = (video_id, prev_shot_idx, latents_output_key)
+                    rel_prev = self._key_to_rel[key]
+                    prev_path = source_root / rel_prev
+                    prev_data = torch.load(prev_path, map_location="cpu", weights_only=True)
+                    result["prev_conditions"] = prev_data
+                except Exception as e:
+                    logging.warning(f"Failed to load prev shot {prev_shot_idx}: {e}, using SOS")
+                    # 이전 샷 로딩 실패시 SOS 사용
+                    curr_data = result[latents_output_key]
+                    result["prev_conditions"] = self._make_sos_like(curr_data)
+            else:
+                # 첫 번째 샷인 경우 SOS 토큰 생성
+                curr_data = result[latents_output_key]
+                result["prev_conditions"] = self._make_sos_like(curr_data)
+                    
         result["idx"] = index
         return result
     # ---------- helpers ----------
@@ -287,36 +321,77 @@ class PrecomputedDataset(Dataset):
         - dict{"latents": Tensor, ...} → latents만 SOS로 교체
         - Tensor → SOS tensor 생성
         """
-        if isinstance(ref, dict) and "latents" in ref:
-            tensor = ref["latents"]
-            sos_tensor = self._make_sos_tensor_like(tensor)
-            out = dict(ref)
-            out["latents"] = sos_tensor
-            return out
+        if isinstance(ref, dict):
+            if "latents" in ref:
+                tensor = ref["latents"]
+                sos_tensor = self._make_sos_tensor_like(tensor)
+                out = dict(ref)
+                out["latents"] = sos_tensor
+                return out
+            else:
+                logging.warning(f"[SOS] Dict ref missing 'latents' key, found keys: {list(ref.keys())}")
+                # 첫 번째 텐서 값을 사용하여 SOS 생성
+                first_tensor = None
+                for value in ref.values():
+                    if torch.is_tensor(value):
+                        first_tensor = value
+                        break
+                if first_tensor is not None:
+                    sos_tensor = self._make_sos_tensor_like(first_tensor)
+                    out = dict(ref)
+                    # 'latents' 키가 없으면 첫 번째 키를 사용
+                    first_key = next(iter(ref.keys()))
+                    out[first_key] = sos_tensor
+                    return out
+                else:
+                    logging.error("[SOS] No tensor found in dict ref")
+                    return torch.zeros(1, 128)
         elif torch.is_tensor(ref):
             return self._make_sos_tensor_like(ref)
         else:
-            # 알 수 없는 포맷: 빈 텐서 대신 None 반환을 피하기 위해 zero-like
-            logging.warning("[SOS] unknown ref format; returning zeros-like.")
-            return torch.zeros(1)
+            # 알 수 없는 포맷: 기본 SOS 텐서 반환
+            logging.warning(f"[SOS] unknown ref format: {type(ref)}, returning default SOS tensor.")
+            return torch.zeros(1, 128)
 
     def _make_sos_tensor_like(self, ref: torch.Tensor) -> torch.Tensor:
         """
-        Latent 형식 [Seq, D] 에 맞춰 SOS token 생성
+        Latent 형식에 맞춰 SOS token 생성
+        지원 형식:
+        - [Seq, D]: 직접 SOS 생성
+        - [B, Seq, D]: 배치 차원 유지하여 SOS 생성
         """
         device = ref.device if ref.is_cuda else "cpu"
+        dtype = ref.dtype
+        
         # print(f"ref shape : {ref.shape}")
 
-        if ref.dim() != 2:
-            raise ValueError(f"[SOS] Unexpected latent shape {ref.shape}, expected [Seq, D]")
-
-        seq_len, d_model = ref.shape
-
-        sos_gen = SOSTokenLatents(d_model=d_model).to(device)
-        with torch.no_grad():
-            out = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
-
-        return out
+        if ref.dim() == 2:
+            # [Seq, D] 형식
+            seq_len, d_model = ref.shape
+            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
+            with torch.no_grad():
+                out = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
+            return out.to(dtype)
+            
+        elif ref.dim() == 3:
+            # [B, Seq, D] 형식
+            batch_size, seq_len, d_model = ref.shape
+            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
+            with torch.no_grad():
+                # 각 배치에 대해 동일한 SOS 생성
+                base_sos = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
+                out = base_sos.unsqueeze(0).expand(batch_size, -1, -1)  # (B, Seq, D)
+            return out.to(dtype)
+            
+        else:
+            logging.error(f"[SOS] Unsupported latent tensor shape: {ref.shape}, expected [Seq, D] or [B, Seq, D]")
+            # 폴백: 가장 간단한 형태로 SOS 생성
+            d_model = ref.shape[-1] if ref.numel() > 0 else 128
+            seq_len = ref.shape[-2] if ref.dim() >= 2 else 1
+            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
+            with torch.no_grad():
+                out = sos_gen(seq_len=seq_len, device=device)
+            return out.to(dtype)
 
 
 
@@ -332,8 +407,11 @@ if __name__ == "__main__":
     for batch in loader:
         # print(batch)
         print("-----------------")
-        # print(batch)
-        print(256//32)
+        print(batch["latent_conditions"]["latents"].shape)
+        print(batch["latent_conditions"]["num_frames"])
+        print(batch["latent_conditions"]["height"])
+        print(batch["latent_conditions"]["width"])
+        
         print("-----------------")
         break
         

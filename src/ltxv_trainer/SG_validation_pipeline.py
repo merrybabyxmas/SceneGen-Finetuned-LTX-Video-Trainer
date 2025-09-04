@@ -125,6 +125,13 @@ class MultiShotValidationPipeline:
             
             # Save the generated video
             if videos:
+                # Debug: Check video dimensions
+                video = videos[0]
+                if isinstance(video, list) and len(video) > 0:
+                    logger.info(f"🎥 Multi-shot validation video frames: {len(video)}, first frame size: {video[0].size}")
+                elif hasattr(video, 'shape'):
+                    logger.info(f"🎥 Multi-shot validation video tensor shape: {video.shape}")
+                
                 video_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}.mp4"
                 export_to_video(videos[0], str(video_path), fps=24)
                 video_paths.append(video_path)
@@ -149,10 +156,11 @@ def create_multi_shot_validation_pipeline(
     # Create SOS token generator and move to device
     sos_generator = SOSTokenLatents(d_model=d_model).to(device)
     
-    # Unwrap models and ensure all parameters are on the correct device
-    unwrapped_vae = accelerator.unwrap_model(vae)
-    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
-    unwrapped_transformer = accelerator.unwrap_model(transformer)
+    # Models are already unwrapped from trainer.py, use them directly
+    # No need to unwrap again since trainer already calls accelerator.unwrap_model()
+    unwrapped_vae = vae
+    unwrapped_text_encoder = text_encoder
+    unwrapped_transformer = transformer
     
     # Force all model parameters to the correct device (skip 8-bit models)
     def safe_to_device(model, device, model_name):
@@ -173,28 +181,28 @@ def create_multi_shot_validation_pipeline(
     unwrapped_text_encoder = safe_to_device(unwrapped_text_encoder, device, "TextEncoder") 
     unwrapped_transformer = safe_to_device(unwrapped_transformer, device, "Transformer")
     
-    # Ensure all model parameters are actually on the device (for non-8bit models)
+    # WARNING: DO NOT directly modify model parameters during validation!
+    # The previous code was causing model collapse by modifying param.data and buffer.data
+    # Models should already be on the correct device from safe_to_device() calls above
+    # If device placement is still needed, it should be done through proper model.to(device) calls
+    
+    # Log device status for debugging without modifying parameters
     for model, name in [(unwrapped_vae, "VAE"), (unwrapped_text_encoder, "TextEncoder"), (unwrapped_transformer, "Transformer")]:
-        # Skip 8-bit quantized models
         is_8bit = hasattr(model, 'is_loaded_in_8bit') and model.is_loaded_in_8bit
         if is_8bit:
-            logger.info(f"Skipping parameter check for 8-bit {name}")
+            logger.info(f"{name} is 8-bit quantized, skipping device check")
             continue
             
+        # Only check and log, do not modify
+        param_devices = set()
+        buffer_devices = set()
         for param_name, param in model.named_parameters():
-            if param.device != device:
-                logger.warning(f"Moving {name} parameter {param_name} from {param.device} to {device}")
-                try:
-                    param.data = param.data.to(device)
-                except Exception as e:
-                    logger.warning(f"Could not move {name} parameter {param_name}: {e}")
+            param_devices.add(str(param.device))
         for buffer_name, buffer in model.named_buffers():
-            if buffer.device != device:
-                logger.warning(f"Moving {name} buffer {buffer_name} from {buffer.device} to {device}")
-                try:
-                    buffer.data = buffer.data.to(device)
-                except Exception as e:
-                    logger.warning(f"Could not move {name} buffer {buffer_name}: {e}")
+            buffer_devices.add(str(buffer.device))
+            
+        logger.info(f"{name} parameter devices: {param_devices}")
+        logger.info(f"{name} buffer devices: {buffer_devices}")
 
     # Create a fresh scheduler copy and ensure device placement
     scheduler_copy = deepcopy(scheduler)

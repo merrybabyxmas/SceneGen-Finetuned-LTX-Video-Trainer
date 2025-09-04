@@ -100,6 +100,7 @@ class TrainingStrategy(ABC):
         curr-shot 내부에서 '첫 프레임'을 conditioning 처리할지 확률적으로 결정
         # True 범위: 첫 프레임의 (H*W) 토큰 → ex) (B, H*W)=True, 나머지 False
         """
+        
         mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool, device=device)
         if (
             self.conditioning_config.first_frame_conditioning_p > 0
@@ -198,11 +199,12 @@ class StandardTrainingStrategy(TrainingStrategy):
     def __init__(self, conditioning_config: ConditioningConfig):
         super().__init__(conditioning_config)
 
-    def get_data_sources(self) -> list[str]:
+    def get_data_sources(self) -> dict[str, str]:
         """
         표준 학습에 필요한 소스:
-        - "latents": {"current_shot": {...}, "prev_shot": {... or SOS}}  # ← Dataset이 보장
-        - "conditions": scene/text 조건 (prev 구분이 있더라도 curr만 쓰면 충분)
+        - "latents": 현재 샷의 latent 데이터 (latent_conditions)
+        - "conditions": scene/text 조건 (text_conditions)
+        참고: prev_conditions는 데이터셋에서 자동으로 추가됨
         """
         return {"latents": "latent_conditions", "conditions": "text_conditions"}
     def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
@@ -217,12 +219,7 @@ class StandardTrainingStrategy(TrainingStrategy):
         prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
         
         
-        # print(f"-------------batch config-------------"
-        #       f"curr_lat : {curr_lat.shape}"
-        #       f"prev_lat : {prev_lat.shape}"
-        #       f"prompt_embeds : {prompt_embeds.shape}"
-        #       )
-
+ 
         # 3) 노이즈 샘플 & 시그마 (curr에만 적용)
         sigmas = timestep_sampler.sample_for(curr_lat)         # (B, Cseq, 1) 또는 전략 구현에 따라
         # ↓ 아래 연산에서 (B,1,1) 브로드캐스트를 기대하므로 reshape
@@ -262,8 +259,8 @@ class StandardTrainingStrategy(TrainingStrategy):
         else:
             targets = targets_curr  # (B, C, D)
 
-        # 8) timestep 생성: prev=0, curr=round(sigmas*1000)
-        sampled_t = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()  # (B,)
+        # 8) timestep 생성: prev=0, curr=sigmas (no scaling for flow matching)
+        sampled_t = sigmas.squeeze(-1).squeeze(-1)  # (B,) keep as float [0,1]
         timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_t)  # (B, P+C)
 
         # 9) ROPE scale & video coords (prev+curr 길이에 맞추어 준비)
@@ -285,22 +282,6 @@ class StandardTrainingStrategy(TrainingStrategy):
         else:
             video_coords = None
 
-        # return TrainingBatch(
-        #     latents=concat_lat,
-        #     targets=targets,
-        #     prompt_embeds=prompt_embeds,
-        #     prompt_attention_mask=prompt_attention_mask,
-        #     timesteps=timesteps,
-        #     sigmas=sigmas,
-        #     conditioning_mask=conditioning_mask,
-        #     num_frames=F,
-        #     height=H,
-        #     width=W,
-        #     fps=fps,
-        #     rope_interpolation_scale=rope_scale,
-        #     video_coords=video_coords,
-        # )
-        
         return TrainingBatch(
             latents=concat_lat,
             targets=targets,
@@ -328,8 +309,13 @@ class StandardTrainingStrategy(TrainingStrategy):
         """
         loss = (model_pred - batch.targets).pow(2)                    # (B, Seq, D)
         loss_mask = (~batch.conditioning_mask.unsqueeze(-1)).float()  # (B, Seq, 1)
-        loss = loss.mul(loss_mask).div(loss_mask.mean())              # 평균 정규화
-        return loss.mean()
+        masked_loss = loss * loss_mask                                # Apply mask
+        # Only compute loss on non-conditioning tokens
+        num_valid_tokens = loss_mask.sum()
+        if num_valid_tokens > 0:
+            return masked_loss.sum() / num_valid_tokens
+        else:
+            return torch.tensor(0.0, device=loss.device, requires_grad=True)
 
 
 # ------------------------------------------------------
@@ -350,7 +336,6 @@ def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingSt
 
 
 if __name__ == "__main__":
-    import os
     import time
     import torch
     from torch.utils.data import DataLoader

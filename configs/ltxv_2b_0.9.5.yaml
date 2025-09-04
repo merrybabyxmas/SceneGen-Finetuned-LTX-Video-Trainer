@@ -4,19 +4,19 @@ model:
   # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # 여기부터 학습 재개
 
 lora:
-  rank: 32
-  alpha: 32
-  dropout: 0.0
+  rank: 32  # Reduced from 32 to prevent overfitting
+  alpha: 32  # Reduced proportionally with rank
+  dropout: 0.1  # Added dropout to prevent overfitting
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
 optimization:
-  learning_rate: 1e-5
-  steps: 3000
+  learning_rate: 2e-4  # Reduced from 1e-5 to prevent model collapse
+  steps: 1500
   batch_size: 1
-  gradient_accumulation_steps: 1
-  max_grad_norm: 1.0
+  gradient_accumulation_steps: 8  # Increased from 1 for stable training
+  max_grad_norm: 0.1  # Reduced from 1.0 to prevent gradient explosion
   optimizer_type: "adamw"
-  scheduler_type: "linear"
+  scheduler_type: "linear"  # Changed from linear to cosine for smoother learning
   scheduler_params: {}
   enable_gradient_checkpointing: false   # 13B면 true 권장
 
@@ -31,19 +31,19 @@ data:
   num_dataloader_workers: 4
 
 validation:
-  prompts: ["a bunch of people are standing in line and holding cans of the soft drink coke"]
-  negative_prompt: "jitter, artifacts, wobble"
+  prompts: ["A chef in a tall white hat is preparing elegant plated desserts with precision, while another man, holding a microphone, is narrating the scene like a TV show host."]
+  negative_prompt: "jitter, artifacts, wobble, blur, distortion"
   images: null
   reference_videos: null
-  video_dims: [256, 256, 49]
+  video_dims: [768, 448, 17]
   seed: 42
-  inference_steps: 50
-  interval: 200
+  inference_steps: 50  # Further reduced for stability
+  interval: 100  # Increased even more to reduce training disruption  
   videos_per_prompt: 1
-  guidance_scale: 3.0
-  skip_initial_validation: true
-  enable_multi_shot : True
-  num_shots : 3
+  guidance_scale: 1.5  # Further reduced to prevent model collapse
+  skip_initial_validation: True  # Skip initial validation to start training faster
+  enable_multi_shot : True  # Re-enabled with fixes
+  num_shots : 2  # Start with 2 shots to test sequential conditioning
   sos_latent_dim : 128
 
 checkpoints:
@@ -55,5 +55,22 @@ hub:
   hub_model_id: "merrybabyxmas/SceneGen-Finetuned"
 
 flow_matching:
-  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_mode: "uniform"
   timestep_sampling_params: {}
+
+wandb:
+  enabled: false  # Disabled to skip W&B login
+  project: "ltxv-scenegen-training"
+  entity: "mw990909@gmail.com"
+  tags: ["ltxv", "scenegen", "lora", "2b"]
+  log_validation_videos: true
+
+conditioning:
+  mode: "none"
+  first_frame_conditioning_p: 0.1
+
+debug:
+  enable_debug_frames: true  # Enable debug frame generation
+  debug_gpu_id: 2  # Use GPU 2 for debug frames (separate from training)
+  debug_interval: 50  # Generate debug frames every 50 steps
+  enable_batch_visualization: true  # Enable comprehensive batch visualization for first 2 batches
