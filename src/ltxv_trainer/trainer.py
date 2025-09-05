@@ -63,6 +63,7 @@ from ltxv_trainer.SG_training_strategy import get_training_strategy
 
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb, convert_checkpoint
 from ltxv_trainer.video_utils import read_video
+from ltxv_trainer.ltxv_utils import decode_video
 
 
 # Disable irrelevant warnings from transformers
@@ -536,11 +537,11 @@ class LtxvTrainer:
                         if prev_clean_reshaped is not None:
                             logger.info(f"Previous clean shape: {prev_clean_reshaped.shape}")
                         
-                        # Move latents to debug device
-                        curr_clean_reshaped = curr_clean_reshaped.to(debug_device)
-                        curr_noisy_reshaped = curr_noisy_reshaped.to(debug_device)
-                        if prev_clean_reshaped is not None:
-                            prev_clean_reshaped = prev_clean_reshaped.to(debug_device)
+                        # Move latents to debug device (move the original sequence latents instead)
+                        curr_clean_first_frame = curr_clean_first_frame.to(debug_device)
+                        curr_noisy_first_frame = curr_noisy_first_frame.to(debug_device)
+                        if prev_clean_first_frame is not None:
+                            prev_clean_first_frame = prev_clean_first_frame.to(debug_device)
                     else:
                         logger.warning(f"Not enough spatial tokens: {curr_clean_first_frame.shape[1]} < {spatial_tokens}")
                         return
@@ -550,36 +551,44 @@ class LtxvTrainer:
                 # Decode with VAE on debug device
                 with autocast(debug_device.type, dtype=torch.bfloat16):
                     try:
-                        # Use timestep tensor for VAE decode
-                        timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
+                        # Decode current latents using ltxv_utils decode_video
+                        curr_clean_result = decode_video(
+                            vae=self._vae,
+                            latents=curr_clean_first_frame,
+                            num_frames=vae_f,
+                            height=vae_h,
+                            width=vae_w,
+                            device=debug_device,
+                            dtype=torch.bfloat16
+                        )  # decode_video returns (3, F, H, W)
                         
-                        # Decode current latents
-                        curr_clean_result = self._vae.decode(curr_clean_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
-                        curr_noisy_result = self._vae.decode(curr_noisy_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        curr_noisy_result = decode_video(
+                            vae=self._vae,
+                            latents=curr_noisy_first_frame,
+                            num_frames=vae_f,
+                            height=vae_h,
+                            width=vae_w,
+                            device=debug_device,
+                            dtype=torch.bfloat16
+                        )  # decode_video returns (3, F, H, W)
                         
                         # Decode previous latents if available
                         prev_clean_result = None
-                        if prev_clean_reshaped is not None:
-                            prev_clean_result = self._vae.decode(prev_clean_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                        if prev_clean_first_frame is not None:
+                            prev_clean_result = decode_video(
+                                vae=self._vae,
+                                latents=prev_clean_first_frame,
+                                num_frames=vae_f,
+                                height=vae_h,
+                                width=vae_w,
+                                device=debug_device,
+                                dtype=torch.bfloat16
+                            )  # decode_video returns (3, F, H, W)
                         
-                        # Handle different return formats for current latents
-                        if isinstance(curr_clean_result, (list, tuple)):
-                            curr_clean_decoded = curr_clean_result[0]
-                        else:
-                            curr_clean_decoded = curr_clean_result
-                            
-                        if isinstance(curr_noisy_result, (list, tuple)):
-                            curr_noisy_decoded = curr_noisy_result[0] 
-                        else:
-                            curr_noisy_decoded = curr_noisy_result
-                        
-                        # Handle previous latents
-                        prev_clean_decoded = None
-                        if prev_clean_result is not None:
-                            if isinstance(prev_clean_result, (list, tuple)):
-                                prev_clean_decoded = prev_clean_result[0]
-                            else:
-                                prev_clean_decoded = prev_clean_result
+                        # Results from decode_video are already in the correct format
+                        curr_clean_decoded = curr_clean_result
+                        curr_noisy_decoded = curr_noisy_result
+                        prev_clean_decoded = prev_clean_result
                         
                         # Compute denoised latents if model prediction is available
                         curr_denoised_decoded = None
@@ -595,8 +604,9 @@ class LtxvTrainer:
                                 # Extract first frame from model prediction
                                 curr_model_pred_first = curr_model_pred[:, :frames_per_sample]  # (1, H*W, D)
                                 curr_model_pred_spatial = curr_model_pred_first[:, :spatial_tokens, :]
-                                curr_model_pred_reshaped = curr_model_pred_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
-                                curr_model_pred_reshaped = curr_model_pred_reshaped.to(debug_device)
+                                
+                                # Move model prediction to debug device before operations
+                                curr_model_pred_spatial = curr_model_pred_spatial.to(debug_device)
                                 
                                 # Compute denoised latents using flow matching
                                 # For flow matching: denoised = noisy - sigma * predicted_velocity
@@ -604,18 +614,23 @@ class LtxvTrainer:
                                 
                                 # Flow matching denoising: x_0 = x_t - sigma * v_pred
                                 # where v_pred is the velocity field predicted by the model
-                                sigma_reshaped = sigmas.view(-1, 1, 1, 1, 1)  # Shape for broadcasting
+                                sigma_reshaped = sigmas.view(-1, 1, 1)  # Shape for broadcasting with (1, H*W, D)
                                 
-                                # Compute denoised latents using flow matching
-                                curr_denoised_reshaped = curr_noisy_reshaped - sigma_reshaped * curr_model_pred_reshaped
+                                # Compute denoised latents using flow matching in sequence format (all tensors on debug_device)
+                                curr_denoised_latents = curr_noisy_first_frame - sigma_reshaped * curr_model_pred_spatial
                                 
-                                # Decode denoised latents
-                                curr_denoised_result = self._vae.decode(curr_denoised_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
+                                # Decode denoised latents using ltxv_utils decode_video
+                                curr_denoised_result = decode_video(
+                                    vae=self._vae,
+                                    latents=curr_denoised_latents,
+                                    num_frames=vae_f,
+                                    height=vae_h,
+                                    width=vae_w,
+                                    device=debug_device,
+                                    dtype=torch.bfloat16
+                                )  # decode_video returns (3, F, H, W)
                                 
-                                if isinstance(curr_denoised_result, (list, tuple)):
-                                    curr_denoised_decoded = curr_denoised_result[0]
-                                else:
-                                    curr_denoised_decoded = curr_denoised_result
+                                curr_denoised_decoded = curr_denoised_result
                                     
                             except Exception as e:
                                 logger.warning(f"Failed to compute denoised frame: {e}")
@@ -627,15 +642,33 @@ class LtxvTrainer:
                 
                 # Convert to images and save
                 def tensor_to_image(tensor):
-                    # Handle 5D VAE output: (1, 3, 1, H, W) -> (H, W, 3)
+                    # Handle decode_video output which is (3, F, H, W) or (1, 3, F, H, W)
                     logger.info(f"tensor_to_image input shape: {tensor.shape}")
                     
-                    # Remove batch and frame dimensions: (1, 3, 1, H, W) -> (3, H, W)
-                    img = tensor.squeeze(0).squeeze(1) if tensor.dim() == 5 else tensor.squeeze(0)
+                    # Ensure tensor is on CPU first
+                    tensor = tensor.cpu()
+                    
+                    # Remove batch dimension if present and get first frame
+                    if tensor.dim() == 5:  # (1, 3, F, H, W)
+                        img = tensor.squeeze(0)[:, 0, :, :]  # (3, H, W) - first frame
+                    elif tensor.dim() == 4:  # (3, F, H, W)
+                        img = tensor[:, 0, :, :]  # (3, H, W) - first frame
+                    elif tensor.dim() == 3:  # Already (3, H, W)
+                        img = tensor
+                    else:
+                        # Fallback: squeeze and hope for the best
+                        img = tensor.squeeze()
+                        if img.dim() == 4:  # Still 4D after squeeze
+                            img = img[:, 0, :, :]  # Take first frame
+                    
+                    # Ensure we have 3D tensor (C, H, W)
+                    if img.dim() != 3:
+                        logger.warning(f"Unexpected tensor dimensions after processing: {img.shape}")
+                        return None
                     
                     # Normalize and convert: (3, H, W) -> (H, W, 3)
                     img = img.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
-                    img = img.permute(1, 2, 0).cpu().float().numpy()  # Convert to float32 before numpy
+                    img = img.permute(1, 2, 0).float().numpy()  # Convert to float32 before numpy
                     img = (img * 255).astype(np.uint8)
                     return Image.fromarray(img)
                 
@@ -652,6 +685,11 @@ class LtxvTrainer:
                 curr_denoised_img = None
                 if curr_denoised_decoded is not None:
                     curr_denoised_img = tensor_to_image(curr_denoised_decoded)
+                
+                # Skip saving if any conversion failed
+                if curr_clean_img is None or curr_noisy_img is None:
+                    logger.warning("Failed to convert some images, skipping debug frame saving")
+                    return
                 
                 # Save images
                 step_str = f"{self._global_step:06d}"
@@ -764,15 +802,16 @@ class LtxvTrainer:
                 # Decode with VAE on debug device
                 with autocast(debug_device.type, dtype=torch.bfloat16):
                     try:
-                        # Use timestep tensor for VAE decode
-                        timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
-                        denoised_result = self._vae.decode(denoised_reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
-                        
-                        # Handle different return formats
-                        if isinstance(denoised_result, (list, tuple)):
-                            denoised_decoded = denoised_result[0]
-                        else:
-                            denoised_decoded = denoised_result
+                        # Decode denoised latents using ltxv_utils decode_video
+                        denoised_decoded = decode_video(
+                            vae=self._vae,
+                            latents=denoised_first_frame,
+                            num_frames=vae_f,
+                            height=vae_h,
+                            width=vae_w,
+                            device=debug_device,
+                            dtype=torch.bfloat16
+                        )  # decode_video returns (3, F, H, W)
                             
                     except Exception as e:
                         logger.warning(f"VAE decode failed: {e}")
@@ -780,15 +819,31 @@ class LtxvTrainer:
                 
                 # Convert to image and save
                 def tensor_to_image(tensor):
-                    # Handle 5D VAE output: (1, 3, 1, H, W) -> (H, W, 3)
+                    # Handle decode_video output which is (3, F, H, W)
                     logger.info(f"tensor_to_image input shape (denoised): {tensor.shape}")
                     
-                    # Remove batch and frame dimensions: (1, 3, 1, H, W) -> (3, H, W)
-                    img = tensor.squeeze(0).squeeze(1) if tensor.dim() == 5 else tensor.squeeze(0)
+                    # Ensure tensor is on CPU first
+                    tensor = tensor.cpu()
+                    
+                    # Remove batch dimension if present and get first frame
+                    if tensor.dim() == 4:  # (3, F, H, W)
+                        img = tensor[:, 0, :, :]  # (3, H, W) - first frame
+                    elif tensor.dim() == 3:  # Already (3, H, W)
+                        img = tensor
+                    else:
+                        # Fallback: squeeze and hope for the best
+                        img = tensor.squeeze()
+                        if img.dim() == 4:  # Still 4D after squeeze
+                            img = img[:, 0, :, :]  # Take first frame
+                    
+                    # Ensure we have 3D tensor (C, H, W)
+                    if img.dim() != 3:
+                        logger.warning(f"Unexpected tensor dimensions after processing: {img.shape}")
+                        return None
                     
                     # Normalize and convert: (3, H, W) -> (H, W, 3)
                     img = img.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
-                    img = img.permute(1, 2, 0).cpu().float().numpy()  # Convert to float32 before numpy
+                    img = img.permute(1, 2, 0).float().numpy()  # Convert to float32 before numpy
                     img = (img * 255).astype(np.uint8)
                     return Image.fromarray(img)
                 
@@ -853,6 +908,13 @@ class LtxvTrainer:
             # Get concatenated noisy latents from training batch
             full_latents = training_batch.latents[batch_idx:batch_idx+1]  # (1, 2016, 128) or (1, 1008, 128)
             
+            
+            logger.info(f"[batch visualization info]\n"
+                        f"prev conditions shape : {prev_clean_latents.shape}\n"
+                        f"curr conditions shape : {curr_clean_latents.shape}\n"
+                        f"total latents shape : {full_latents.shape}")
+                        
+            
             # Separate prev (clean SOS) and curr (noisy) portions
             if prev_clean_latents is not None:
                 prev_seq_len = prev_clean_latents.shape[1]  # 1008
@@ -883,20 +945,22 @@ class LtxvTrainer:
                         reshaped = video_latents.transpose(1, 2).reshape(1, vae_channels, batch_F, batch_H, batch_W)
                         reshaped = reshaped.to(debug_device)
                         
-                        # Decode full video
+                        # Decode full video using ltxv_utils decode_video
                         with autocast(debug_device.type, dtype=torch.bfloat16):
-                            timestep = torch.zeros(1, device=debug_device, dtype=torch.long)
-                            result = self._vae.decode(reshaped / self._vae.config.scaling_factor, timestep, return_dict=False)
-                            
-                            if isinstance(result, (list, tuple)):
-                                decoded = result[0]  # (1, 3, F, H, W)
-                            else:
-                                decoded = result
-                        
+                            decoded = decode_video(
+                                vae=self._vae,
+                                latents=video_latents,
+                                num_frames=batch_F,
+                                height=batch_H,
+                                width=batch_W,
+                                device=debug_device,
+                                dtype=torch.bfloat16
+                            )  # decode_video returns (3, F, H, W)
+                        decoded = decoded.squeeze(0)
+                        logger.info(f"decoded shape :{decoded.shape}")
                         # Convert to video format and save
-                        # decoded: (1, 3, F, H, W) -> (F, H, W, 3) for video export
-                        video_tensor = decoded.squeeze(0)  # (3, F, H, W)
-                        video_tensor = video_tensor.permute(1, 2, 3, 0)  # (F, H, W, 3)
+                        # decode_video returns (3, F, H, W)
+                        video_tensor = decoded.permute(1, 2, 3, 0)  # (F, H, W, 3)
                         video_tensor = video_tensor.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
                         
                         # Convert to numpy and scale to [0, 255]
@@ -1413,6 +1477,12 @@ class LtxvTrainer:
         
         all_video_paths = []
         
+        # Create a task in the sampling progress
+        task = progress.add_task(
+            "multi-shot sampling",
+            total=len(self._config.validation.prompts),
+        )
+        
         # Generate multi-shot sequence for each validation prompt
         for i, prompt in enumerate(self._config.validation.prompts):
             
@@ -1434,6 +1504,14 @@ class LtxvTrainer:
             except Exception as e:
                 logger.error(f"Failed to generate multi-shot sequence for prompt {i+1}: {e}")
                 continue
+            
+            # Update progress
+            if hasattr(progress, 'update'):
+                progress.update(task, advance=1)
+        
+        # Remove progress task
+        if hasattr(progress, 'remove_task'):
+            progress.remove_task(task)
         
         # Move unused components back to CPU
         self._vae.to("cpu")

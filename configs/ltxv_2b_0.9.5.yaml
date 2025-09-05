@@ -4,8 +4,8 @@ model:
   # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # 여기부터 학습 재개
 
 lora:
-  rank: 32  # Reduced from 32 to prevent overfitting
-  alpha: 32  # Reduced proportionally with rank
+  rank: 64  # Reduced from 32 to prevent overfitting
+  alpha: 64  # Reduced proportionally with rank
   dropout: 0.1  # Added dropout to prevent overfitting
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
@@ -55,13 +55,13 @@ hub:
   hub_model_id: "merrybabyxmas/SceneGen-Finetuned"
 
 flow_matching:
-  timestep_sampling_mode: "uniform"
+  timestep_sampling_mode: "shifted_logit_normal"
   timestep_sampling_params: {}
 
 wandb:
-  enabled: false  # Disabled to skip W&B login
+  enabled: True  # Enabled with correct entity
   project: "ltxv-scenegen-training"
-  entity: "mw990909@gmail.com"
+  entity: "mw990909-sogang-university"  # Correct entity name from wandb account
   tags: ["ltxv", "scenegen", "lora", "2b"]
   log_validation_videos: true
 

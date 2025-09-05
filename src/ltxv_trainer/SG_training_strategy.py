@@ -189,6 +189,7 @@ def _concat_prev_curr(prev_lat: Tensor | None, curr_lat: Tensor) -> tuple[Tensor
     """
     if prev_lat is None:
         return curr_lat, 0, curr_lat.shape[1]
+    # logger.info(f"before concat, prev lat shape : {prev_lat.shape}")
     return torch.cat([prev_lat, curr_lat], dim=1), prev_lat.shape[1], curr_lat.shape[1]
 
 
