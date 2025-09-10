@@ -188,6 +188,12 @@ class DataConfig(ConfigBaseModel):
         description="Number of background processes for data loading (0 means synchronous loading)",
         ge=0,
     )
+    
+    dataset_size: int | None = Field(
+        default=None,
+        description="Limit the number of training samples. If None, use all available data. Useful for quick testing.",
+        ge=1,
+    )
 
 
 class ValidationConfig(ConfigBaseModel):

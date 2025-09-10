@@ -10,14 +10,15 @@ lora:
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
 optimization:
-  learning_rate: 2e-4  # Reduced from 1e-5 to prevent model collapse
-  steps: 2000
+  learning_rate: 2e-4  # REDUCED from 2e-4 to improve stability
+  steps: 2000  # REDUCED for quick testing
   batch_size: 1
-  gradient_accumulation_steps: 12  # Increased from 1 for stable training
-  max_grad_norm: 0.1  # Reduced from 1.0 to prevent gradient explosion
+  gradient_accumulation_steps: 6  # REDUCED for faster testing
+  max_grad_norm: 1.0  # INCREASED from 0.1 to allow better gradient flow
   optimizer_type: "adamw"
-  scheduler_type: "linear"  # Changed from linear to cosine for smoother learning
-  scheduler_params: {}
+  scheduler_type: "linear"  # CHANGED from linear to cosine for smoother learning
+  scheduler_params: 
+    eta_min: 0.000001  # Minimum learning rate for cosine scheduler (as float)
   enable_gradient_checkpointing: false   # 13B면 true 권장
 
 acceleration:
@@ -29,7 +30,7 @@ acceleration:
 data:
   preprocessed_data_root: "/home/jeongseon38/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 4
-  dataset_size: null  # Set to a number (e.g., 10) to limit dataset size for testing
+  dataset_size: 10  # ⭐ TESTING: Use only 10 samples
 
 validation:
   prompts: ["a guy talking in front of a wooden piece of furniture"]
@@ -38,8 +39,8 @@ validation:
   reference_videos: null
   video_dims: [768, 448, 17]
   seed: 42
-  inference_steps: 100  # Further reduced for stability
-  interval: 100  # Increased even more to reduce training disruption  
+  inference_steps: 50  # REDUCED from 50 for faster testing
+  interval: 50  # REDUCED - validate every 25 steps  
   videos_per_prompt: 1
   guidance_scale: 1.5  # Further reduced to prevent model collapse
   skip_initial_validation: True  # Skip initial validation to start training faster
@@ -48,22 +49,22 @@ validation:
   sos_latent_dim : 128
 
 checkpoints:
-  interval: 500
+  interval: 200  # REDUCED - save every 25 steps for testing
   keep_last_n: 3
 
 hub:
-  push_to_hub: True
+  push_to_hub: False  # DISABLED for testing
   hub_model_id: "merrybabyxmas/SceneGen-Finetuned"
 
 flow_matching:
-  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_mode: "uniform"  # CHANGED from shifted_logit_normal to uniform for stability
   timestep_sampling_params: {}
 
 wandb:
   enabled: True  # Enabled with correct entity
-  project: "ltxv-scenegen-training"
+  project: "ltxv-scenegen-training-test"
   entity: "mw990909-sogang-university"  # Correct entity name from wandb account
-  tags: ["ltxv", "scenegen", "lora", "2b"]
+  tags: ["ltxv", "scenegen", "lora", "2b", "test", "small-dataset"]
   log_validation_videos: true
 
 conditioning:
@@ -73,5 +74,5 @@ conditioning:
 debug:
   enable_debug_frames: true  # Enable debug frame generation
   debug_gpu_id: 2  # Use GPU 2 for debug frames (separate from training)
-  debug_interval: 50  # Generate debug frames every 50 steps
+  debug_interval: 10  # REDUCED - Generate debug frames every 10 steps for testing
   enable_batch_visualization: true  # Enable comprehensive batch visualization for first 2 batches

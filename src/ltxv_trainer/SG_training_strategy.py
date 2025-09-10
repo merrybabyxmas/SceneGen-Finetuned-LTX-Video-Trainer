@@ -32,7 +32,7 @@ DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 # --------------------------
 class TrainingBatch(BaseModel):
     latents: Tensor                # (B, Seq, D)  # ex) Seq = (prev_seq + curr_seq)
-    targets: Tensor                # (B, Seq, D)  # prev 구간은 0, curr 구간만 유효
+    targets: Tensor                # (B, curr_seq, D)  # Only current part targets (no masking needed)
 
     prompt_embeds: Tensor
     prompt_attention_mask: Tensor
@@ -49,6 +49,9 @@ class TrainingBatch(BaseModel):
 
     rope_interpolation_scale: list[float]
     video_coords: Tensor | None = None
+    
+    # Additional info for extracting current part
+    prev_seq_len: int = 0          # Length of previous sequence (0 if no prev)
 
     @computed_field
     @property
@@ -189,7 +192,6 @@ def _concat_prev_curr(prev_lat: Tensor | None, curr_lat: Tensor) -> tuple[Tensor
     """
     if prev_lat is None:
         return curr_lat, 0, curr_lat.shape[1]
-    # logger.info(f"before concat, prev lat shape : {prev_lat.shape}")
     return torch.cat([prev_lat, curr_lat], dim=1), prev_lat.shape[1], curr_lat.shape[1]
 
 
@@ -229,7 +231,7 @@ class StandardTrainingStrategy(TrainingStrategy):
         sigmas = sigmas.view(curr_lat.shape[0], 1, 1)          # (B,1,1)
 
         noise = torch.randn_like(curr_lat, device=curr_lat.device)  # (B, Cseq, D)
-        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise       # (B, Cseq, D)
+        noisy_curr =  sigmas * curr_lat + (1 - sigmas) * noise       # (B, Cseq, D)
 
         # 4) curr 내부 '첫 프레임 conditioning' 적용: 첫 프레임 토큰은 클린으로 대체
         first_mask_curr = self._create_first_frame_conditioning_mask(
@@ -242,7 +244,7 @@ class StandardTrainingStrategy(TrainingStrategy):
         noisy_curr = torch.where(first_mask_curr.unsqueeze(-1), curr_lat, noisy_curr)
 
         # 5) prev + curr concat
-        concat_lat, Pseq, Cseq = _concat_prev_curr(prev_lat, noisy_curr)  # (B, P+C, D)
+        concat_lat, Pseq, _ = _concat_prev_curr(prev_lat, noisy_curr)  # (B, P+C, D)
 
         # 6) conditioning mask 구성
         #    prev 전체 True(조건), curr은 first_frame만 True
@@ -252,13 +254,8 @@ class StandardTrainingStrategy(TrainingStrategy):
         else:
             conditioning_mask = first_mask_curr  # (B, C)
 
-        # 7) 타깃 구성: prev 구간은 0 (마스킹되므로 영향 X), curr 구간은 (noise - clean)
-        targets_curr = noise - curr_lat  # (B, Cseq, D)
-        if Pseq > 0:
-            zeros_prev = torch.zeros(curr_lat.shape[0], Pseq, curr_lat.shape[2], device=curr_lat.device, dtype=targets_curr.dtype)
-            targets = torch.cat([zeros_prev, targets_curr], dim=1)  # (B, P+C, D)
-        else:
-            targets = targets_curr  # (B, C, D)
+        # 7) 타깃 구성: Only current part targets (no prev padding needed)
+        targets = noise - curr_lat   # (B, Cseq, D) - Only current part targets
 
         # 8) timestep 생성: prev=0, curr=sigmas (no scaling for flow matching)
         sampled_t = sigmas.squeeze(-1).squeeze(-1)  # (B,) keep as float [0,1]
@@ -297,6 +294,7 @@ class StandardTrainingStrategy(TrainingStrategy):
             fps=fps,
             rope_interpolation_scale=rope_scale,
             video_coords=video_coords,
+            prev_seq_len=Pseq,
         )
         
         
@@ -304,14 +302,23 @@ class StandardTrainingStrategy(TrainingStrategy):
 
     def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
         """
-        마스킹 MSE
-        - prev 전체 & curr의 첫 프레임(조건)은 제외
-        - targets는 prev 구간 0으로 채워져 있음 (안전)
+        Direct MSE on current part only (no masking needed)
+        - model_pred: (B, curr_seq, D) - only current part prediction
+        - targets: (B, curr_seq, D) - only current part targets
         """
-        loss = (model_pred - batch.targets).pow(2)                    # (B, Seq, D)
-        loss_mask = (~batch.conditioning_mask.unsqueeze(-1)).float()  # (B, Seq, 1)
-        masked_loss = loss * loss_mask                                # Apply mask
-        # Only compute loss on non-conditioning tokens
+        # Apply masking only to current part first-frame conditioning if needed
+        if batch.prev_seq_len > 0:
+            # Extract current part conditioning mask (skip prev part)
+            curr_conditioning_mask = batch.conditioning_mask[:, batch.prev_seq_len:]  # (B, curr_seq)
+        else:
+            # No prev part, use full conditioning mask
+            curr_conditioning_mask = batch.conditioning_mask  # (B, curr_seq)
+        
+        # Compute loss only on non-conditioning tokens of current part
+        loss = (model_pred - batch.targets).pow(2)                          # (B, curr_seq, D)
+        loss_mask = (~curr_conditioning_mask.unsqueeze(-1)).float()         # (B, curr_seq, 1)
+        masked_loss = loss * loss_mask                                      # Apply mask
+        
         num_valid_tokens = loss_mask.sum()
         if num_valid_tokens > 0:
             return masked_loss.sum() / num_valid_tokens

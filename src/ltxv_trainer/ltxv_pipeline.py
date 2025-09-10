@@ -836,6 +836,8 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 256,
+        save_intermediate_steps: bool = False,
+        save_step_interval: int = 10,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1206,6 +1208,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         self._num_timesteps = len(timesteps)
 
         # 6. Denoising loop
+        intermediate_latents = [] if save_intermediate_steps else None
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1272,6 +1275,14 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
+                # Save intermediate steps every N steps
+                if save_intermediate_steps and (i % save_step_interval == 0 or i == len(timesteps) - 1):
+                    intermediate_latents.append({
+                        'step': i,
+                        'timestep': float(t),
+                        'latents': latents.clone().cpu()
+                    })
+                
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
@@ -1411,6 +1422,12 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (video,)
+            result = (video,)
+            if save_intermediate_steps:
+                result = result + (intermediate_latents,)
+            return result
 
-        return LTXPipelineOutput(frames=video)
+        result = LTXPipelineOutput(frames=video)
+        if save_intermediate_steps:
+            result.intermediate_latents = intermediate_latents
+        return result

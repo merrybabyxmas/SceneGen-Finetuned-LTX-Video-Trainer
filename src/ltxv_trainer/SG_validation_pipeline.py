@@ -115,7 +115,6 @@ class MultiShotValidationPipeline:
                     if len(videos) > 0:
                         logger.info("Encoding video to latent for next shot...")
                         prev_latent = self.pipeline.encode_video_to_latent(videos[0])
-                        logger.info(f"Encoded latent shape: {prev_latent.shape}")
                     else:
                         logger.warning("No videos generated!")
                         
@@ -130,7 +129,7 @@ class MultiShotValidationPipeline:
                 if isinstance(video, list) and len(video) > 0:
                     logger.info(f"🎥 Multi-shot validation video frames: {len(video)}, first frame size: {video[0].size}")
                 elif hasattr(video, 'shape'):
-                    logger.info(f"🎥 Multi-shot validation video tensor shape: {video.shape}")
+                    pass
                 
                 video_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}.mp4"
                 export_to_video(videos[0], str(video_path), fps=24)

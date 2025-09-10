@@ -64,6 +64,7 @@ from ltxv_trainer.SG_training_strategy import get_training_strategy
 from ltxv_trainer.utils import get_gpu_memory_gb, open_image_as_srgb, convert_checkpoint
 from ltxv_trainer.video_utils import read_video
 from ltxv_trainer.ltxv_utils import decode_video
+import PIL.Image
 
 
 # Disable irrelevant warnings from transformers
@@ -219,7 +220,8 @@ class LtxvTrainer:
                     self._current_epoch += 1  # Increment epoch when dataloader resets
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
-                    logger.info(f"📈 Starting epoch {self._current_epoch}")
+                    if self._current_epoch % 5 == 0:  # Log every 5th epoch only
+                        logger.info(f"📈 Starting epoch {self._current_epoch}")
 
                 # Measure compilation time (first COMPILE_WARMUP_STEPS steps)
                 if step == COMPILE_WARMUP_STEPS and cfg.acceleration.compile_with_inductor:
@@ -299,8 +301,8 @@ class LtxvTrainer:
                             total_time=total_time,
                         )
 
-                        # Log essential metrics to W&B only every 10 steps
-                        if self._global_step % 10 == 0:
+                        # Log essential metrics to W&B only every 25 steps
+                        if self._global_step % 25 == 0:
                             self._log_metrics(
                                 {
                                     "train/loss": loss.item(),
@@ -309,7 +311,7 @@ class LtxvTrainer:
                                 }
                             )
 
-                        if disable_progress_bars and self._global_step % 50 == 0:
+                        if disable_progress_bars and self._global_step % 100 == 0:
                             logger.info(
                                 f"Step {self._global_step}/{cfg.optimization.steps} - Loss: {loss.item():.4f}"
                             )
@@ -400,7 +402,10 @@ class LtxvTrainer:
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
         # Run transformer forward pass
-        model_pred = self._transformer(**model_inputs)[0]
+        full_model_pred = self._transformer(**model_inputs)[0]
+        
+        # Extract only current part from model prediction (skip prev part)
+        model_pred = self._extract_current_part_from_prediction(full_model_pred, batch, training_batch)
 
         # Save batch visualization for first 2 batches (only on optimization steps)
         if (IS_MAIN_PROCESS and 
@@ -420,6 +425,24 @@ class LtxvTrainer:
         loss = self._training_strategy.compute_loss(model_pred, training_batch)
 
         return loss
+
+    def _extract_current_part_from_prediction(self, full_model_pred: Tensor, batch: dict[str, dict[str, Tensor]], training_batch) -> Tensor:
+        """Extract only the current part from the full model prediction (prev+curr)."""
+        # Check if we have previous conditions (prev shot)
+        if batch.get("prev_conditions", None) is not None:
+            # Determine prev sequence length
+            prev_dict = batch["prev_conditions"]
+            if torch.is_tensor(prev_dict):
+                prev_seq_len = prev_dict.shape[1]
+            else:
+                prev_seq_len = prev_dict["latents"].shape[1]
+            
+            # Extract only current part: skip prev_seq_len tokens
+            curr_model_pred = full_model_pred[:, prev_seq_len:]  # (B, curr_seq, D)
+            return curr_model_pred
+        else:
+            # No previous shot, return full prediction
+            return full_model_pred
 
     @torch.no_grad()
     def _save_debug_frames(self, batch: dict[str, dict[str, Tensor]], training_batch, model_pred: Tensor = None) -> None:
@@ -497,9 +520,6 @@ class LtxvTrainer:
                 if prev_clean_latents is not None and prev_clean_latents.shape[1] >= frames_per_sample:
                     prev_clean_first_frame = prev_clean_latents[:, :frames_per_sample]  # (1, H*W, D)
                 
-                logger.info(f"Current clean frame shape: {curr_clean_first_frame.shape}")
-                if prev_clean_first_frame is not None:
-                    logger.info(f"Previous clean frame shape: {prev_clean_first_frame.shape}")
                 logger.info(f"Dimensions H={H}, W={W}, frames_per_sample={frames_per_sample}")
                 
                 # Calculate proper VAE latent dimensions
@@ -533,9 +553,6 @@ class LtxvTrainer:
                         if prev_clean_spatial is not None:
                             prev_clean_reshaped = prev_clean_spatial.transpose(1, 2).reshape(1, vae_channels, vae_f, vae_h, vae_w)
 
-                        logger.info(f"Final VAE input shapes: curr_clean={curr_clean_reshaped.shape}, curr_noisy={curr_noisy_reshaped.shape}")
-                        if prev_clean_reshaped is not None:
-                            logger.info(f"Previous clean shape: {prev_clean_reshaped.shape}")
                         
                         # Move latents to debug device (move the original sequence latents instead)
                         curr_clean_first_frame = curr_clean_first_frame.to(debug_device)
@@ -543,7 +560,7 @@ class LtxvTrainer:
                         if prev_clean_first_frame is not None:
                             prev_clean_first_frame = prev_clean_first_frame.to(debug_device)
                     else:
-                        logger.warning(f"Not enough spatial tokens: {curr_clean_first_frame.shape[1]} < {spatial_tokens}")
+                        logger.warning(f"Not enough spatial tokens for processing")
                         return
                 except Exception as e:
                     logger.error(f"Failed to reshape latents: {e}")
@@ -594,12 +611,8 @@ class LtxvTrainer:
                         curr_denoised_decoded = None
                         if model_pred is not None:
                             try:
-                                # Get current portion of model prediction
-                                if prev_clean_latents is not None:
-                                    prev_seq_len = prev_clean_latents.shape[1]
-                                    curr_model_pred = model_pred[batch_idx:batch_idx+1, prev_seq_len:]
-                                else:
-                                    curr_model_pred = model_pred[batch_idx:batch_idx+1]
+                                # model_pred now contains only current part (already extracted in _training_step)
+                                curr_model_pred = model_pred[batch_idx:batch_idx+1]  # (1, curr_seq, D)
                                 
                                 # Extract first frame from model prediction
                                 curr_model_pred_first = curr_model_pred[:, :frames_per_sample]  # (1, H*W, D)
@@ -643,7 +656,6 @@ class LtxvTrainer:
                 # Convert to images and save
                 def tensor_to_image(tensor):
                     # Handle decode_video output which is (3, F, H, W) or (1, 3, F, H, W)
-                    logger.info(f"tensor_to_image input shape: {tensor.shape}")
                     
                     # Ensure tensor is on CPU first
                     tensor = tensor.cpu()
@@ -663,7 +675,7 @@ class LtxvTrainer:
                     
                     # Ensure we have 3D tensor (C, H, W)
                     if img.dim() != 3:
-                        logger.warning(f"Unexpected tensor dimensions after processing: {img.shape}")
+                        logger.warning(f"Unexpected tensor dimensions after processing")
                         return None
                     
                     # Normalize and convert: (3, H, W) -> (H, W, 3)
@@ -691,18 +703,24 @@ class LtxvTrainer:
                     logger.warning("Failed to convert some images, skipping debug frame saving")
                     return
                 
-                # Save images
+                # Save images with timestep information
                 step_str = f"{self._global_step:06d}"
+                # Get the sampled timestep for this batch (current shot)
+                if hasattr(training_batch, 'sigmas'):
+                    timestep_val = float(training_batch.sigmas[batch_idx, 0, 0].item())
+                    timestep_str = f"_t{timestep_val:.3f}"
+                else:
+                    timestep_str = ""
                 
-                # Save current frames
-                curr_clean_img.save(debug_dir / f"step_{step_str}_curr_clean_first_frame.png")
-                curr_noisy_img.save(debug_dir / f"step_{step_str}_curr_noisy_first_frame.png")
+                # Save current frames with timestep info
+                curr_clean_img.save(debug_dir / f"step_{step_str}{timestep_str}_curr_clean_first_frame.png")
+                curr_noisy_img.save(debug_dir / f"step_{step_str}{timestep_str}_curr_noisy_first_frame.png")
                 
                 # Save denoised frame if available
                 if curr_denoised_img is not None:
-                    curr_denoised_img.save(debug_dir / f"step_{step_str}_curr_denoised_first_frame.png")
+                    curr_denoised_img.save(debug_dir / f"step_{step_str}{timestep_str}_curr_denoised_first_frame.png")
                 
-                # Save previous frame if available
+                # Save previous frame if available (no timestep since it's clean)
                 if prev_clean_img is not None:
                     prev_clean_img.save(debug_dir / f"step_{step_str}_prev_clean_first_frame.png")
                 
@@ -793,7 +811,7 @@ class LtxvTrainer:
                         # Move latents to debug device
                         denoised_reshaped = denoised_reshaped.to(debug_device)
                     else:
-                        logger.warning(f"Not enough spatial tokens for denoised: {denoised_first_frame.shape[1]} < {spatial_tokens}")
+                        logger.warning(f"Not enough spatial tokens for denoised processing")
                         return
                 except Exception as e:
                     logger.error(f"Failed to reshape denoised latents: {e}")
@@ -820,7 +838,6 @@ class LtxvTrainer:
                 # Convert to image and save
                 def tensor_to_image(tensor):
                     # Handle decode_video output which is (3, F, H, W)
-                    logger.info(f"tensor_to_image input shape (denoised): {tensor.shape}")
                     
                     # Ensure tensor is on CPU first
                     tensor = tensor.cpu()
@@ -838,7 +855,7 @@ class LtxvTrainer:
                     
                     # Ensure we have 3D tensor (C, H, W)
                     if img.dim() != 3:
-                        logger.warning(f"Unexpected tensor dimensions after processing: {img.shape}")
+                        logger.warning(f"Unexpected tensor dimensions after processing")
                         return None
                     
                     # Normalize and convert: (3, H, W) -> (H, W, 3)
@@ -849,9 +866,12 @@ class LtxvTrainer:
                 
                 denoised_img = tensor_to_image(denoised_decoded)
                 
-                # Save image
+                # Save image with timestep information
                 step_str = f"{self._global_step:06d}"
-                denoised_img.save(debug_dir / f"step_{step_str}_denoised_first_frame.png")
+                # Get the sampled timestep for this batch
+                timestep_val = float(sigma.item())
+                timestep_str = f"_t{timestep_val:.3f}"
+                denoised_img.save(debug_dir / f"step_{step_str}{timestep_str}_denoised_first_frame.png")
                 
             # Move VAE back to CPU
             self._vae.to("cpu")
@@ -957,7 +977,6 @@ class LtxvTrainer:
                                 dtype=torch.bfloat16
                             )  # decode_video returns (3, F, H, W)
                         decoded = decoded.squeeze(0)
-                        logger.info(f"decoded shape :{decoded.shape}")
                         # Convert to video format and save
                         # decode_video returns (3, F, H, W)
                         video_tensor = decoded.permute(1, 2, 3, 0)  # (F, H, W, 3)
@@ -970,10 +989,17 @@ class LtxvTrainer:
                         # Convert to list of PIL Images for video export
                         video_frames = [Image.fromarray(frame) for frame in video_np]
                         
-                        # Save as MP4 video
+                        # Save as MP4 video with timestep info
                         step_str = f"epoch_{self._current_epoch:02d}_batch_{step:02d}"
                         shot_prefix = f"{shot_type}_" if shot_type else ""
-                        video_path = batch_viz_dir / f"{step_str}_{shot_prefix}{suffix}.mp4"
+                        
+                        # Add timestep info for noisy videos
+                        timestep_str = ""
+                        if "noisy" in suffix and hasattr(training_batch, 'sigmas'):
+                            timestep_val = float(training_batch.sigmas[batch_idx, 0, 0].item())
+                            timestep_str = f"_t{timestep_val:.3f}"
+                        
+                        video_path = batch_viz_dir / f"{step_str}_{shot_prefix}{suffix}{timestep_str}.mp4"
                         
                         # Use diffusers export_to_video function
                         from diffusers.utils import export_to_video
@@ -982,7 +1008,7 @@ class LtxvTrainer:
                         return True
                         
                     else:
-                        logger.warning(f"Not enough tokens for full video: {latents.shape[1]} < {total_tokens}")
+                        logger.warning(f"Not enough tokens for full video processing")
                         return False
                         
                 except Exception as e:
@@ -1021,12 +1047,8 @@ class LtxvTrainer:
             
             # 4. Save curr latents - denoised (model prediction)
             if model_pred is not None:
-                # Extract current shot portion from model prediction
-                if prev_clean_latents is not None:
-                    prev_seq_len = prev_clean_latents.shape[1]
-                    model_pred_curr = model_pred[batch_idx:batch_idx+1, prev_seq_len:]  # Current shot prediction
-                else:
-                    model_pred_curr = model_pred[batch_idx:batch_idx+1]
+                # model_pred now contains only current part (already extracted in _training_step)
+                model_pred_curr = model_pred[batch_idx:batch_idx+1]  # Current part prediction
                 
                 # Compute denoised latent: noisy_latent - predicted_noise (epsilon parameterization)
                 denoised_curr_latents = noisy_curr_latents - model_pred_curr
@@ -1255,7 +1277,11 @@ class LtxvTrainer:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            self._dataset = PrecomputedDataset(
+                self._config.data.preprocessed_data_root, 
+                data_sources=data_sources,
+                dataset_size=self._config.data.dataset_size
+            )
             if IS_MAIN_PROCESS:
                 logger.info(f"Dataset loaded: {len(self._dataset):,} samples")
 
@@ -1307,6 +1333,8 @@ class LtxvTrainer:
             return None
 
         if scheduler_type == "linear":
+            # Remove parameters that LinearLR doesn't support
+            params.pop("eta_min", None)  # LinearLR doesn't support eta_min
             scheduler = LinearLR(
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
@@ -1315,21 +1343,31 @@ class LtxvTrainer:
                 **params,
             )
         elif scheduler_type == "cosine":
+            eta_min = params.pop("eta_min", 0)
+            # Ensure eta_min is a float (in case it's passed as string from YAML)
+            if isinstance(eta_min, str):
+                eta_min = float(eta_min)
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=steps,
-                eta_min=params.get("eta_min", 0),
+                eta_min=eta_min,
                 **params,
             )
         elif scheduler_type == "cosine_with_restarts":
+            eta_min = params.pop("eta_min", 5e-5)
+            # Ensure eta_min is a float (in case it's passed as string from YAML)
+            if isinstance(eta_min, str):
+                eta_min = float(eta_min)
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
                 T_0=params.pop("T_0", steps // 4),  # First restart cycle length
                 T_mult=params.pop("T_mult", 1),  # Multiplicative factor for cycle lengths
-                eta_min=params.pop("eta_min", 5e-5),
+                eta_min=eta_min,
                 **params,
             )
         elif scheduler_type == "polynomial":
+            # Remove parameters that PolynomialLR doesn't support
+            params.pop("eta_min", None)  # PolynomialLR doesn't support eta_min
             scheduler = PolynomialLR(
                 optimizer,
                 total_iters=steps,
@@ -1337,6 +1375,8 @@ class LtxvTrainer:
                 **params,
             )
         elif scheduler_type == "step":
+            # Remove parameters that StepLR doesn't support
+            params.pop("eta_min", None)  # StepLR doesn't support eta_min
             scheduler = StepLR(
                 optimizer,
                 step_size=params.pop("step_size", steps // 2),
@@ -1413,6 +1453,8 @@ class LtxvTrainer:
                 "guidance_scale": self._config.validation.guidance_scale,
                 "generator": generator,
                 "output_reference_comparison": True,
+                "save_intermediate_steps": True,
+                "save_step_interval": max(1, self._config.validation.inference_steps // 5),  # Save every 20% of steps
             }
 
             # Load and add first frame image, if provided
@@ -1434,6 +1476,10 @@ class LtxvTrainer:
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
                 result = pipeline(**pipeline_inputs)
                 videos = result.frames
+                
+                # Save intermediate steps if available
+                if hasattr(result, 'intermediate_latents') and result.intermediate_latents:
+                    self._save_intermediate_validation_steps(result.intermediate_latents, prompt, j)
 
             for video in videos:
                 video_path = output_dir / f"step_{self._global_step:06d}_{i}.mp4"
@@ -1451,7 +1497,8 @@ class LtxvTrainer:
         if not self._config.acceleration.load_text_encoder_in_8bit:
             self._text_encoder.to("cpu")
 
-        logger.info(f"🎥 Validation samples saved for step {self._global_step}")
+        if IS_MAIN_PROCESS:
+            logger.info(f"🎥 Validation samples saved for step {self._global_step}")
         return video_paths
 
     @torch.no_grad()
@@ -1519,10 +1566,12 @@ class LtxvTrainer:
             self._text_encoder.to("cpu")
         
         if all_video_paths:
-            logger.info(f"🎬 Multi-shot validation samples saved for step {self._global_step}")
+            if IS_MAIN_PROCESS:
+                logger.info(f"🎬 Multi-shot validation samples saved for step {self._global_step}")
             return all_video_paths
         else:
-            logger.warning("Multi-shot validation failed")
+            if IS_MAIN_PROCESS:
+                logger.warning("Multi-shot validation failed")
             return None
 
     @staticmethod
@@ -1622,6 +1671,56 @@ class LtxvTrainer:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
             self._wandb_run.log(metrics)
+    
+    def _save_intermediate_validation_steps(self, intermediate_latents: list, prompt: str, prompt_idx: int) -> None:
+        """Save intermediate validation steps as videos for ODE visualization."""
+        try:
+            from pathlib import Path
+            
+            # Create intermediate steps directory
+            intermediate_dir = Path(self._config.output_dir) / "intermediate_steps"
+            intermediate_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Move VAE to device temporarily
+            self._vae.to(self._accelerator.device)
+            
+            for step_data in intermediate_latents:
+                step_num = step_data['step']
+                timestep = step_data['timestep']
+                latents = step_data['latents'].to(self._accelerator.device)
+                
+                # Decode latents to video frames
+                with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
+                    # Simple decode using VAE
+                    decoded = self._vae.decode(latents)[0]
+                    
+                    # Convert to video format (B, C, F, H, W) -> (B, F, H, W, C)
+                    decoded = decoded.permute(0, 2, 3, 4, 1).cpu()
+                    decoded = decoded.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+                    
+                    # Convert to list of PIL images
+                    frames = []
+                    for b in range(decoded.shape[0]):
+                        for f in range(decoded.shape[1]):
+                            frame = decoded[b, f].numpy()
+                            frame = (frame * 255).astype('uint8')
+                            frames.append(PIL.Image.fromarray(frame))
+                    
+                    # Save as video
+                    video_path = intermediate_dir / f"step_{self._global_step:06d}_prompt_{prompt_idx}_ode_step_{step_num:02d}_t{timestep:.3f}.mp4"
+                    export_to_video(frames, str(video_path), fps=24)
+            
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+            
+            logger.info(f"🎬 Saved {len(intermediate_latents)} intermediate ODE steps for validation")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save intermediate validation steps: {e}")
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
 
     def _log_validation_videos(self, video_paths: list[Path], prompts: list[str]) -> None:
         """Log validation videos to Weights & Biases."""

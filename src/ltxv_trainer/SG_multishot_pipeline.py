@@ -241,21 +241,17 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 self.sos_token_generator = self.sos_token_generator.to(device)
                 logger.info(f"Moved SOS generator to {device}")
             prev_latent = self.sos_token_generator(curr_seq_len, device=device)
-            logger.info(f"Generated SOS prev_latent shape: {prev_latent.shape}")
             
         # Ensure prev_latent is on correct device and has batch dimension
-        logger.info(f"prev_latent initial shape: {prev_latent.shape}, dim: {prev_latent.dim()}")
         if prev_latent.dim() == 2:  # [seq_len, channels]
             prev_latent = prev_latent.unsqueeze(0)  # [1, seq_len, channels]
             logger.info(f"Added batch dimension to prev_latent: {prev_latent.shape}")
         prev_latent = prev_latent.to(device)
-        logger.info(f"prev_latent after device move: {prev_latent.shape}, device: {prev_latent.device}")
         
         prev_seq_len = prev_latent.shape[1]
         total_seq_len = prev_seq_len + curr_seq_len
         
         logger.info(f"Multi-shot conditioning: prev_seq={prev_seq_len}, curr_seq={curr_seq_len}, total={total_seq_len}")
-        logger.info(f"prev_latent final shape: {prev_latent.shape}, device: {prev_latent.device}")
         
         # 2. Create conditioning mask - simplified approach
         # prev part: all True (keep previous shot unchanged)
@@ -269,7 +265,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         # Current part remains False to allow normal denoising
         # This ensures the current shot is generated normally while prev shot provides context
         
-        logger.info(f"Created conditioning mask shape: {conditioning_mask.shape}, prev_conditioned: {conditioning_mask[:, :prev_seq_len].sum().item()}")
         logger.info(f"Conditioning strategy: prev={prev_seq_len} tokens fixed, curr={curr_seq_len} tokens denoising")
         
         # 3. Prepare latents for generation
@@ -335,7 +330,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 max_sequence_length=kwargs.get('max_sequence_length', 256)
             )
         )
-        logger.info(f"Prompt encoding completed. prompt_embeds shape: {prompt_embeds.shape}, device: {prompt_embeds.device}")
         logger.info(f"Using CFG: {guidance_scale > 1.0}, guidance_scale: {guidance_scale}")
         
         # Calculate latent dimensions (consistent with earlier calculations)
@@ -347,20 +341,15 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         latent_width = width // vae_spatial_downsample
         latent_shape = (1, latent_frames * latent_height * latent_width, self.transformer.config.in_channels)
         logger.info(f"  F : {num_frames}, H : {height}, W : {width}")
-        logger.info(f"  Initializing latents with shape : {latent_frames}x{latent_height}x{latent_width}")        
-        logger.info(f"  Initializing latents with shape: {latent_shape}")
         # Initialize current latents with noise
         curr_latents = randn_tensor(latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
-        logger.info(f"  Created curr_latents shape: {curr_latents.shape}, device: {curr_latents.device}")
         
         # Combine prev + current latents
-        logger.info(f"  Before concat - prev_latent shape: {prev_latent.shape}, curr_latents shape: {curr_latents.shape}")
         try:
             combined_latents, prev_seq_len, _ = self._concat_prev_curr(prev_latent, curr_latents)
-            logger.info(f"Combined latents shape: {combined_latents.shape}, prev_seq_len: {prev_seq_len}")
         except Exception as e:
             logger.error(f"Failed to concat prev and curr latents: {e}")
-            logger.error(f"prev_latent shape: {prev_latent.shape}, curr_latents shape: {curr_latents.shape}")
+            logger.error(f"Latent dimension mismatch error")
             raise
         
         # Set up scheduler
@@ -432,11 +421,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             
             # Predict noise
             if step_idx == 0:  # Log detailed info for first step
-                logger.info(f"Transformer input shapes:")
-                logger.info(f"  hidden_states: {latent_model_input.shape}")
-                logger.info(f"  timestep: {timestep.unsqueeze(-1).float().shape}")  
-                logger.info(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
-                logger.info(f"  video_coords: {video_coords.shape}")
+                pass
                 
             try:
                 noise_pred = self.transformer(
@@ -449,7 +434,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 )[0]
                 
                 if step_idx == 0:
-                    logger.info(f"Transformer output shape: {noise_pred.shape}")
+                    pass
                     
             except Exception as e:
                 logger.error(f"Transformer forward failed at step {step_idx}: {e}")
@@ -472,7 +457,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         
         # Extract only the current part for decoding
         current_part = combined_latents[:, prev_seq_len:prev_seq_len + curr_seq_len]
-        logger.info(f"Extracted current part shape: {current_part.shape}")
         
         # First unpack latents to proper VAE format
         logger.info("Unpacking latents...")
@@ -484,7 +468,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
-        logger.info(f"Unpacked latents shape: {current_part.shape}")
         
         # Denormalize latents using VAE normalization parameters
         logger.info("Denormalizing latents...")
@@ -494,11 +477,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             self.vae.latents_std,
             self.vae.config.scaling_factor
         )
-        logger.info(f"Denormalized latents shape: {current_part.shape}")
         
         # Decode to video with proper timestep handling
         logger.info("Starting VAE decoding...")
-        logger.info(f"Final latents for VAE: {current_part.shape}")
         
         # Ensure correct dtype for VAE
         current_part = current_part.to(prompt_embeds.dtype)
@@ -524,7 +505,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             
             logger.info(f"VAE decode with timestep: {timestep}")
             video_frames = self.vae.decode(current_part, timestep, return_dict=False)[0]
-            logger.info(f"VAE decode output shape: {video_frames.shape}")
             
             # Post-process video
             logger.info("Post-processing video...")
@@ -582,7 +562,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         if prev_latent is None:
             return curr_latent, 0, curr_latent.shape[1]
         
-        logger.info(f"_concat_prev_curr input shapes: prev_latent={prev_latent.shape}, curr_latent={curr_latent.shape}")
         
         # Ensure both tensors have the same number of dimensions
         if prev_latent.dim() != curr_latent.dim():
@@ -590,14 +569,12 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             # Try to fix dimension mismatch
             if prev_latent.dim() == 2 and curr_latent.dim() == 3:
                 prev_latent = prev_latent.unsqueeze(0)
-                logger.info(f"Fixed prev_latent shape: {prev_latent.shape}")
             elif prev_latent.dim() == 3 and curr_latent.dim() == 2:
                 curr_latent = curr_latent.unsqueeze(0)
-                logger.info(f"Fixed curr_latent shape: {curr_latent.shape}")
         
         # Ensure batch dimensions match
         if prev_latent.shape[0] != curr_latent.shape[0]:
-            logger.warning(f"Batch dimension mismatch: {prev_latent.shape[0]} vs {curr_latent.shape[0]}")
+            logger.warning(f"Batch dimension mismatch detected")
             # Expand the smaller batch to match
             if prev_latent.shape[0] == 1 and curr_latent.shape[0] > 1:
                 prev_latent = prev_latent.expand(curr_latent.shape[0], -1, -1)
@@ -606,15 +583,13 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         
         # Ensure channel dimensions match
         if prev_latent.shape[-1] != curr_latent.shape[-1]:
-            logger.error(f"Channel dimension mismatch: {prev_latent.shape[-1]} vs {curr_latent.shape[-1]}")
+            logger.error(f"Channel dimension mismatch detected")
             raise ValueError(f"Channel dimensions must match: {prev_latent.shape[-1]} != {curr_latent.shape[-1]}")
         
         prev_seq_len = prev_latent.shape[1]
         curr_seq_len = curr_latent.shape[1]
         
-        logger.info(f"Final shapes before concat: prev_latent={prev_latent.shape}, curr_latent={curr_latent.shape}")
         concat_latent = torch.cat([prev_latent, curr_latent], dim=1)
-        logger.info(f"Concatenated shape: {concat_latent.shape}")
         
         return concat_latent, prev_seq_len, curr_seq_len
     

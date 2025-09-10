@@ -111,12 +111,14 @@ class PrecomputedDataset(Dataset):
         data_sources: Dict[str, str] | List[str] | None = None,
         sos_sources: Optional[set[str]] = None,
         num_shots: int = 0,  # 더이상 사용하지 않지만, 외부 호환을 위해 인자 유지
+        dataset_size: Optional[int] = None,  # 데이터셋 크기 제한
     ) -> None:
         super().__init__()
         self.data_root = self._setup_data_root(data_root)
         self.data_sources = self._normalize_data_sources(data_sources)
         self.sos_sources = sos_sources or set()
         self.num_shots = num_shots  # 미사용(호환성)
+        self.dataset_size = dataset_size
 
         self.source_paths = self._setup_source_paths()
 
@@ -135,6 +137,7 @@ class PrecomputedDataset(Dataset):
         self._discover_entries()
         self._prepare_prev_links()
         self._validate_entries()
+        self._limit_dataset_size()
 
     # ---------- setup helpers ----------
     @staticmethod
@@ -262,7 +265,27 @@ class PrecomputedDataset(Dataset):
         logging.info(f"[PrecomputedDataset] discovered {len(self.entries)} shots "
                      f"across sources: {dict(counts_per_source)}")
 
-    # ---------- dataset API ----------
+    def _limit_dataset_size(self) -> None:
+        """Limit dataset size if dataset_size is specified."""
+        if self.dataset_size is not None and len(self.entries) > self.dataset_size:
+            original_size = len(self.entries)
+            # Keep first N entries to maintain deterministic behavior
+            self.entries = self.entries[:self.dataset_size]
+            
+            # Update video_to_shots mapping for limited entries
+            self._video_to_shots.clear()
+            for entry in self.entries:
+                video_id = entry["video_id"]
+                shot_idx = entry["shot_idx"]
+                if shot_idx not in self._video_to_shots[video_id]:
+                    self._video_to_shots[video_id].append(shot_idx)
+            
+            # Re-sort shot lists
+            for video_id in self._video_to_shots:
+                self._video_to_shots[video_id].sort()
+            
+            logging.info(f"[PrecomputedDataset] Limited dataset from {original_size} to {self.dataset_size} samples")
+
     def __len__(self) -> int:
         return len(self.entries)
 
