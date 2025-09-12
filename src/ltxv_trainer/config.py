@@ -74,7 +74,7 @@ class LoraConfig(ConfigBaseModel):
 class ConditioningConfig(ConfigBaseModel):
     """Configuration for conditioning during training"""
 
-    mode: Literal["none", "reference_video"] = Field(
+    mode: Literal["none", "reference_video", "cross_attention"] = Field(
         default="none",
         description="Type of conditioning to use during training",
     )
@@ -89,6 +89,22 @@ class ConditioningConfig(ConfigBaseModel):
     reference_latents_dir: str = Field(
         default="ref_latents",
         description="Directory name for latents of reference videos when using reference_video mode",
+    )
+
+    # Cross attention specific settings
+    enable_attention_slicing: bool = Field(
+        default=True,
+        description="Enable attention slicing for memory optimization in cross attention mode",
+    )
+
+    attention_slice_size: int | None = Field(
+        default=None,
+        description="Size for attention slicing (None = auto-detect)",
+    )
+
+    enable_memory_efficient_attention: bool = Field(
+        default=True,
+        description="Enable memory efficient attention for cross attention mode",
     )
 
 
@@ -437,11 +453,9 @@ class LtxvTrainerConfig(ConfigBaseModel):
     def validate_conditioning_compatibility(self) -> "LtxvTrainerConfig":
         """Validate that conditioning and validation configurations are compatible."""
 
-        # Check that reference videos are provided when using reference_video conditioning
-        if self.conditioning.mode == "reference_video" and self.validation.reference_videos is None:
-            raise ValueError(
-                "reference_videos must be provided in validation config when conditioning.mode is 'reference_video'"
-            )
+        # Note: reference_videos validation removed for PC-CFM approach
+        # In PC-CFM mode, reference videos come from prev_conditions in dataset
+        # or SOS tokens for first shots - no explicit reference_videos config needed
 
         # Check that LoRA config is provided when training mode is lora
         if self.model.training_mode == "lora" and self.lora is None:

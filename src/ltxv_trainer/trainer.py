@@ -54,6 +54,7 @@ from ltxv_trainer.SG_datasets import PrecomputedDataset
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
 from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
+from ltxv_trainer.SG_multishot_pipeline import SGMultiShotPipeline
 from ltxv_trainer.SG_validation_pipeline import create_multi_shot_validation_pipeline
 
 from ltxv_trainer.quantization import quantize_model
@@ -402,10 +403,7 @@ class LtxvTrainer:
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
         # Run transformer forward pass
-        full_model_pred = self._transformer(**model_inputs)[0]
-        
-        # Extract only current part from model prediction (skip prev part)
-        model_pred = self._extract_current_part_from_prediction(full_model_pred, batch, training_batch)
+        model_pred = self._transformer(**model_inputs)[0]
 
         # Save batch visualization for first 2 batches (only on optimization steps)
         if (IS_MAIN_PROCESS and 
@@ -426,28 +424,16 @@ class LtxvTrainer:
 
         return loss
 
-    def _extract_current_part_from_prediction(self, full_model_pred: Tensor, batch: dict[str, dict[str, Tensor]], training_batch) -> Tensor:
-        """Extract only the current part from the full model prediction (prev+curr)."""
-        # Check if we have previous conditions (prev shot)
-        if batch.get("prev_conditions", None) is not None:
-            # Determine prev sequence length
-            prev_dict = batch["prev_conditions"]
-            if torch.is_tensor(prev_dict):
-                prev_seq_len = prev_dict.shape[1]
-            else:
-                prev_seq_len = prev_dict["latents"].shape[1]
-            
-            # Extract only current part: skip prev_seq_len tokens
-            curr_model_pred = full_model_pred[:, prev_seq_len:]  # (B, curr_seq, D)
-            return curr_model_pred
-        else:
-            # No previous shot, return full prediction
-            return full_model_pred
 
     @torch.no_grad()
     def _save_debug_frames(self, batch: dict[str, dict[str, Tensor]], training_batch, model_pred: Tensor = None) -> None:
         """Save debug frames to visualize training progress."""
         try:
+            # Skip debug frame saving for cross attention mode (different latent structure)
+            if self._config.conditioning.mode == "cross_attention":
+                logger.info("🔍 Debug frames skipped for cross attention mode")
+                return
+                
             from PIL import Image
             import numpy as np
             
@@ -1045,16 +1031,40 @@ class LtxvTrainer:
             if decode_and_save_video(noisy_curr_latents, "curr_noisy", step, "curr"):
                 saved_count += 1
             
-            # 4. Save curr latents - denoised (model prediction)
+            # 4. Save curr latents - denoised (model prediction) 
             if model_pred is not None:
-                # model_pred now contains only current part (already extracted in _training_step)
-                model_pred_curr = model_pred[batch_idx:batch_idx+1]  # Current part prediction
+                # For ReferenceVideoTrainingStrategy, model_pred has full sequence length (prev + curr)
+                # Need to extract current part only
+                if hasattr(training_batch, 'prev_seq_len') and training_batch.prev_seq_len > 0:
+                    # ReferenceVideoTrainingStrategy: extract current part from full prediction
+                    curr_seq_len = noisy_curr_latents.shape[1]
+                    model_pred_curr = model_pred[batch_idx:batch_idx+1, -curr_seq_len:]  # Extract current part
+                    logger.info(f"ReferenceVideo: Extracted current part from model_pred: {model_pred_curr.shape}")
+                else:
+                    # StandardTrainingStrategy: model_pred is already current part only
+                    model_pred_curr = model_pred[batch_idx:batch_idx+1]
+                    logger.info(f"Standard: Using full model_pred as current: {model_pred_curr.shape}")
                 
-                # Compute denoised latent: noisy_latent - predicted_noise (epsilon parameterization)
-                denoised_curr_latents = noisy_curr_latents - model_pred_curr
+                # Check if we're using PC-CFM strategy (targets is dict)
+                if isinstance(training_batch.targets, dict):
+                    # PC-CFM denoised calculation
+                    # In PC-CFM, model predicts the velocity field v_t
+                    # The denoised estimate is: x_t - sigma * v_t (flow backward)
+                    sigmas = training_batch.sigmas[batch_idx:batch_idx+1]  # (1, 1, 1)
+                    
+                    # PC-CFM: move backward along the predicted velocity field
+                    denoised_curr_latents = noisy_curr_latents - sigmas.squeeze(-1) * model_pred_curr
+                    logger.info(f"PC-CFM denoised calculation: noisy - sigma * velocity_pred")
+                else:
+                    # Standard strategy: model predicts noise (epsilon parameterization)
+                    denoised_curr_latents = noisy_curr_latents - model_pred_curr
+                    logger.info(f"Standard denoised calculation: noisy - noise_pred")
                 
                 if decode_and_save_video(denoised_curr_latents, "curr_denoised", step, "curr"):
                     saved_count += 1
+                    logger.info(f"✓ Denoised video saved for batch {step}")
+                else:
+                    logger.warning(f"❌ Failed to save denoised video for batch {step}")
             
             # 4. Additional verification messages
             if step == 1:  # First batch
@@ -1177,6 +1187,12 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
+        # Enable gradient checkpointing if requested (must be before accelerator.prepare)
+        if self._config.optimization.enable_gradient_checkpointing:
+            self._transformer.enable_gradient_checkpointing()
+            if IS_MAIN_PROCESS:
+                logger.info("✅ Gradient checkpointing enabled")
+
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         if IS_MAIN_PROCESS:
             logger.info(f"Trainable params: {sum(p.numel() for p in self._trainable_params):,}")
@@ -1237,9 +1253,6 @@ class LtxvTrainer:
         if not self._config.acceleration.load_text_encoder_in_8bit:
             self._text_encoder = self._text_encoder.to("cpu")
 
-        # Enable gradient checkpointing if requested
-        if self._config.optimization.enable_gradient_checkpointing:
-            self._transformer.enable_gradient_checkpointing()
 
     @staticmethod
     def _find_checkpoint(checkpoint_path: str | Path) -> Path | None:
@@ -1417,7 +1430,7 @@ class LtxvTrainer:
 
         use_images = self._config.validation.images is not None
 
-        pipeline = LTXConditionPipeline(
+        pipeline = SGMultiShotPipeline(
             scheduler=deepcopy(self._scheduler),
             vae=self._accelerator.unwrap_model(self._vae),
             text_encoder=self._accelerator.unwrap_model(self._text_encoder),
@@ -1471,6 +1484,7 @@ class LtxvTrainer:
             if self._config.validation.reference_videos is not None:
                 video_path = self._config.validation.reference_videos[j]
                 ref_video, _ = read_video(video_path)[:frames]
+                logger.info(f"ref video shape : {ref_video.shape}")
                 pipeline_inputs["reference_video"] = ref_video
 
             with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
@@ -1506,17 +1520,15 @@ class LtxvTrainer:
     def _sample_multi_shot_videos(self, progress: Progress) -> list[Path] | None:
         """Run multi-shot validation by generating sequential video shots from a single prompt."""
         
-        # Create multi-shot validation pipeline (use same safe approach as single-shot)
-        multi_shot_pipeline = create_multi_shot_validation_pipeline(
+        # Create SGMultiShotPipeline for multi-shot validation
+        multi_shot_pipeline = SGMultiShotPipeline(
             scheduler=deepcopy(self._scheduler),  # Copy scheduler like single-shot validation
             vae=self._accelerator.unwrap_model(self._vae),  # Unwrap like single-shot validation
             text_encoder=self._accelerator.unwrap_model(self._text_encoder),  # Unwrap like single-shot validation
             tokenizer=self._tokenizer,
             transformer=self._accelerator.unwrap_model(self._transformer),  # Unwrap like single-shot validation
-            device=self._accelerator.device,
-            accelerator=self._accelerator,
-            d_model=self._config.validation.sos_latent_dim
         )
+        multi_shot_pipeline.set_progress_bar_config(disable=True)
         
         # Create output directory for multi-shot samples
         output_dir = Path(self._config.output_dir) / "samples"
@@ -1534,22 +1546,69 @@ class LtxvTrainer:
         for i, prompt in enumerate(self._config.validation.prompts):
             
             try:
-                video_paths = multi_shot_pipeline.generate_multi_shot_sequence(
-                    prompt=prompt,  # Single prompt for all shots
-                    output_dir=output_dir,
-                    global_step=self._global_step,
-                    video_dims=self._config.validation.video_dims,
-                    num_shots=self._config.validation.num_shots,
-                    inference_steps=self._config.validation.inference_steps,
-                    guidance_scale=self._config.validation.guidance_scale,
-                    negative_prompt=self._config.validation.negative_prompt,
-                    seed=self._config.validation.seed   # Different seed for each sequence
-                )
+                # Generate multiple shots sequentially using reference latents
+                width, height, frames = self._config.validation.video_dims
+                num_shots = self._config.validation.num_shots
+                sequence_videos = []
+                previous_shot_latents = None
                 
-                all_video_paths.extend(video_paths)
+                for shot_idx in range(num_shots):
+                    generator = torch.Generator(device=self._accelerator.device).manual_seed(
+                        self._config.validation.seed + i * 100 + shot_idx  # Different seed per shot
+                    )
+                    
+                    # Pipeline inputs
+                    pipeline_inputs = {
+                        "prompt": prompt,
+                        "negative_prompt": self._config.validation.negative_prompt,
+                        "width": width,
+                        "height": height,
+                        "num_frames": frames,
+                        "num_inference_steps": self._config.validation.inference_steps,
+                        "guidance_scale": self._config.validation.guidance_scale,
+                        "generator": generator,
+                        "output_type": "pil",
+                    }
+                    
+                    # Add reference video based on shot index
+                    if shot_idx == 0:
+                        # First shot: use SOS token (handled internally by SGMultiShotPipeline)
+                        # The SOS token logic is handled internally by the pipeline when no reference_video is provided
+                        pass
+                    else:
+                        # Subsequent shots: use previous shot as reference
+                        if previous_shot_latents is not None:
+                            # Convert previous shot frames to tensor format expected by pipeline
+                            # previous_shot_latents should be a video tensor
+                            pipeline_inputs["reference_video"] = previous_shot_latents
+                    
+                    # Generate current shot
+                    with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
+                        result = multi_shot_pipeline(**pipeline_inputs)
+                        current_video = result.frames[0]  # Get first (and only) video from batch
+                    
+                    # Save current shot
+                    shot_path = output_dir / f"step_{self._global_step:06d}_prompt_{i}_shot_{shot_idx}.mp4"
+                    export_to_video(current_video, str(shot_path), fps=24)
+                    sequence_videos.append(shot_path)
+                    
+                    # Store current shot for next iteration as reference
+                    # Convert PIL images back to tensor format for reference
+                    if shot_idx < num_shots - 1:  # Don't need to convert the last shot
+                        import numpy as np
+                        frames_array = []
+                        for frame in current_video:
+                            frame_array = np.array(frame).transpose(2, 0, 1)  # HWC -> CHW
+                            frames_array.append(frame_array)
+                        previous_shot_latents = torch.from_numpy(np.stack(frames_array)).float() / 255.0  # [F, C, H, W], normalize to [0,1]
+                
+                all_video_paths.extend(sequence_videos)
+                logger.info(f"Generated {len(sequence_videos)} shots for prompt: '{prompt}'")
                 
             except Exception as e:
                 logger.error(f"Failed to generate multi-shot sequence for prompt {i+1}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
             
             # Update progress

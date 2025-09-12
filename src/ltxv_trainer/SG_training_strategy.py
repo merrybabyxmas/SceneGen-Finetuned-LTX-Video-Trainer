@@ -13,9 +13,10 @@ Training strategies for different conditioning modes (with prev-shot support).
 
 import random
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Union
 
 import torch
+import torch.nn.functional as F
 from pydantic import BaseModel, computed_field
 from torch import Tensor
 
@@ -27,12 +28,30 @@ from ltxv_trainer.timestep_samplers import TimestepSampler, UniformTimestepSampl
 DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 
 
+def pc_cfm_loss(model_output: Tensor, X0: Tensor, X1c: Tensor, X1p: Tensor, lambda_val: float = 1.0) -> Tensor:
+    """
+    PC-CFM loss function.
+    
+    Args:
+        model_output: Model prediction
+        X0: Initial noisy version of current shot
+        X1c: Clean current shot
+        X1p: Previous latent (or SOS token if first shot)
+        lambda_val: Lambda parameter for PC-CFM
+        
+    Returns:
+        PC-CFM loss value
+    """
+    target = (X1c - X0) + lambda_val * (X1p - X1c)
+    return F.mse_loss(model_output, target)
+
+
 # --------------------------
 # Batch container (동일)
 # --------------------------
 class TrainingBatch(BaseModel):
     latents: Tensor                # (B, Seq, D)  # ex) Seq = (prev_seq + curr_seq)
-    targets: Tensor                # (B, curr_seq, D)  # Only current part targets (no masking needed)
+    targets: Union[Tensor, dict]   # For StandardTraining: (B, curr_seq, D), For PC-CFM: dict with X0,X1c,X1p
 
     prompt_embeds: Tensor
     prompt_attention_mask: Tensor
@@ -306,6 +325,11 @@ class StandardTrainingStrategy(TrainingStrategy):
         - model_pred: (B, curr_seq, D) - only current part prediction
         - targets: (B, curr_seq, D) - only current part targets
         """
+        # Handle both Tensor and dict targets (for compatibility with PC-CFM)
+        if isinstance(batch.targets, dict):
+            # This shouldn't happen for StandardTrainingStrategy, but handle gracefully
+            raise ValueError("StandardTrainingStrategy received dict targets - use ReferenceVideoTrainingStrategy for PC-CFM")
+        
         # Apply masking only to current part first-frame conditioning if needed
         if batch.prev_seq_len > 0:
             # Extract current part conditioning mask (skip prev part)
@@ -326,22 +350,201 @@ class StandardTrainingStrategy(TrainingStrategy):
             return torch.tensor(0.0, device=loss.device, requires_grad=True)
 
 
-# ------------------------------------------------------
-# ReferenceVideo (IC-LoRA): prev-shot 자동 폴백 지원
+class ReferenceVideoTrainingStrategy(TrainingStrategy):
+    """Modified Reference video training strategy with PC-CFM loss.
+
+    This strategy implements training with previous shot conditioning where:
+    - Previous shot latents (clean) are concatenated with target latents (noised)
+    - Uses text prompts for conditioning (like StandardTrainingStrategy)
+    - Uses SOS token for first shot when no previous shot available
+    - PC-CFM loss instead of masked MSE loss
+    - Video coordinates are doubled to handle concatenated sequence
+    """
+
+    def __init__(self, conditioning_config: ConditioningConfig):
+        """Initialize the modified reference strategy.
+
+        Args:
+            conditioning_config: Configuration for conditioning behavior
+        """
+        super().__init__(conditioning_config)
+
+    def get_data_sources(self) -> dict[str, str]:
+        """Modified reference training requires latents, text conditions, and prev conditions."""
+        return {
+            "latents": "latent_conditions", 
+            "conditions": "text_conditions"
+            # Note: prev_conditions will be automatically added by dataset
+        }
+
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
+        """Prepare batch for modified reference training with prev latents and text conditions."""
+        # 1) Unpack current shot latents
+        curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
+        B, curr_seq_len, D = curr_lat.shape
+        
+        # 2) Get previous shot latents or use SOS token
+        ref_lat = None
+        if batch.get("prev_conditions") is not None:
+            # Use previous shot as reference
+            ref_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
+            logger.debug(f"Using previous shot as reference: {ref_lat.shape}")
+        else:
+            # First shot: generate SOS token as reference
+            from ltxv_trainer.SG_datasets import SOSTokenLatents
+            sos_generator = SOSTokenLatents(d_model=D, use_zero_init=False)
+            sos_generator = sos_generator.to(curr_lat.device)
+            ref_lat = sos_generator(curr_seq_len, device=curr_lat.device)  # (curr_seq_len, D)
+            ref_lat = ref_lat.unsqueeze(0).expand(B, -1, -1)  # (B, curr_seq_len, D)
+            logger.debug(f"Generated SOS token as reference: {ref_lat.shape}")
+        
+        ref_seq_len = ref_lat.shape[1]
+        
+        # 3) Unpack text conditions (same as StandardTrainingStrategy)
+        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
+        
+        # 4) Sample timesteps and add noise to current shot only
+        sigmas = timestep_sampler.sample_for(curr_lat)
+        if sigmas.dim() > 3:
+            raise ValueError("Unexpected sigma shape")
+        sigmas = sigmas.view(B, 1, 1)  # (B, 1, 1)
+        
+        noise = torch.randn_like(curr_lat, device=curr_lat.device)
+        noisy_curr = sigmas * curr_lat + (1 - sigmas) * noise  # X0 in PC-CFM
+        
+        # 5) Apply first frame conditioning to current shot
+        target_conditioning_mask = self._create_first_frame_conditioning_mask(
+            batch_size=B,
+            sequence_length=curr_seq_len,
+            height=H,
+            width=W,
+            device=curr_lat.device,
+        )
+        noisy_curr = torch.where(target_conditioning_mask.unsqueeze(-1), curr_lat, noisy_curr)
+        
+        # 6) Create combined conditioning mask
+        # Reference tokens are always conditioning
+        ref_conditioning_mask = torch.ones(B, ref_seq_len, dtype=torch.bool, device=curr_lat.device)
+        conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
+        
+        # 7) Create timesteps based on conditioning mask
+        sampled_t = sigmas.squeeze(-1).squeeze(-1)  # (B,)
+        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_t)
+        
+        # 8) Store components for PC-CFM loss (not regular targets)
+        # We need to store: X0 (noisy), X1c (clean curr), X1p (prev/SOS)
+        targets = {
+            'X0': noisy_curr,      # Initial noisy version
+            'X1c': curr_lat,       # Clean current shot  
+            'X1p': ref_lat,        # Previous shot or SOS token
+        }
+        
+        # 9) Concatenate reference and noisy current in sequence dimension
+        combined_latents = torch.cat([ref_lat, noisy_curr], dim=1)  # (B, ref_seq + curr_seq, D)
+        
+        # 10) Prepare video coordinates (doubled sequence)
+        rope_scale_factors = get_rope_scale_factors(fps)
+        raw_video_coords = prepare_video_coordinates(
+            num_frames=F,
+            height=H,
+            width=W,
+            batch_size=B,
+            sequence_multiplier=2,  # Reference + target
+            device=curr_lat.device,
+        )
+        
+        # Apply pre-scaling to coordinates
+        prescaled_f = raw_video_coords[..., 0] * rope_scale_factors[0]
+        prescaled_h = raw_video_coords[..., 1] * rope_scale_factors[1]
+        prescaled_w = raw_video_coords[..., 2] * rope_scale_factors[2]
+        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)
+        
+        return TrainingBatch(
+            latents=combined_latents,
+            targets=targets,  # Changed: now contains PC-CFM components
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            timesteps=timesteps,
+            sigmas=sigmas,
+            conditioning_mask=conditioning_mask,
+            num_frames=F,
+            height=H,
+            width=W,
+            fps=fps,
+            rope_interpolation_scale=rope_scale_factors,
+            video_coords=video_coords,
+            prev_seq_len=ref_seq_len,
+        )
+
+    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
+        """Compute PC-CFM loss on target portion only."""
+        # Extract target portion from model prediction (last part corresponds to current shot)
+        target_seq_len = batch.targets['X1c'].shape[1]  # Current shot sequence length
+        target_pred = model_pred[:, -target_seq_len:]  # Extract current shot prediction
+        
+        # Get PC-CFM loss components
+        X0 = batch.targets['X0']   # Noisy current shot
+        X1c = batch.targets['X1c'] # Clean current shot
+        X1p = batch.targets['X1p'] # Previous shot or SOS token
+        
+        # Apply PC-CFM loss: target = (X1c - X0) + lambda * (X1p - X1c)
+        lambda_val = 0.3
+        # For PC-CFM, we need to match sequence lengths properly
+        if X1p.shape[1] != X1c.shape[1]:
+            # If reference (X1p) has different sequence length, we need to handle it
+            # This can happen when prev shot has different length than current shot
+            if X1p.shape[1] > X1c.shape[1]:
+                # Truncate reference to match current shot length
+                X1p = X1p[:, :X1c.shape[1], :]
+            else:
+                # Pad reference to match current shot length (repeat last frame)
+                pad_len = X1c.shape[1] - X1p.shape[1]
+                last_frame = X1p[:, -1:, :].repeat(1, pad_len, 1)
+                X1p = torch.cat([X1p, last_frame], dim=1)
+                
+        pc_cfm_target = (X1c - X0) + lambda_val * (X1p - X1c)
+        
+        # Extract target portion conditioning mask for masking
+        target_conditioning_mask = batch.conditioning_mask[:, -target_seq_len:]
+        
+        # Compute MSE loss between model prediction and PC-CFM target
+        loss = (target_pred - pc_cfm_target).pow(2)
+        
+        # Apply mask to exclude conditioning tokens from loss
+        loss_mask = (~target_conditioning_mask.unsqueeze(-1)).float()
+        masked_loss = loss * loss_mask
+        
+        # Compute mean loss over valid (non-conditioning) tokens
+        num_valid_tokens = loss_mask.sum()
+        if num_valid_tokens > 0:
+            return masked_loss.sum() / num_valid_tokens
+        else:
+            return torch.tensor(0.0, device=loss.device, requires_grad=True)
 
 
-# --------------- Factory ---------------
 def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingStrategy:
-    mode = conditioning_config.mode
-    if mode == "none":
+    """Factory function to create the appropriate training strategy.
+
+    Args:
+        conditioning_config: Configuration for conditioning behavior
+
+    Returns:
+        The appropriate training strategy instance
+
+    Raises:
+        ValueError: If conditioning mode is not supported
+    """
+    conditioning_mode = conditioning_config.mode
+
+    if conditioning_mode == "none":
         strategy = StandardTrainingStrategy(conditioning_config)
+    elif conditioning_mode == "reference_video":
+        strategy = ReferenceVideoTrainingStrategy(conditioning_config)
     else:
-        raise ValueError(f"Unknown conditioning mode: {mode}")
+        raise ValueError(f"Unknown conditioning mode: {conditioning_mode}")
 
     logger.debug(f"🎯 Using {strategy.__class__.__name__}")
     return strategy
-
-
 
 if __name__ == "__main__":
     import time

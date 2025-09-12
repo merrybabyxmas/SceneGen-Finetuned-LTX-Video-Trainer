@@ -44,6 +44,14 @@ class TrainingBatch(BaseModel):
 
     # Conditioning information
     conditioning_mask: Tensor  # Boolean mask: True = conditioning token, False = target token
+    
+    # Cross attention conditioning (for multi-view generation)
+    cross_attention_latents: Tensor | None = None  # Previous shot latents for cross attention
+    cross_attention_mask: Tensor | None = None     # Mask for cross attention tokens
+    prev_seq_len: int = 0                          # Length of previous sequence
+    
+    # Enhanced cross attention conditioning
+    first_frame_mask: Tensor | None = None         # Mask for first frame conditioning
 
     # Video metadata
     num_frames: int  # Number of frames in the video
@@ -104,6 +112,33 @@ class TrainingStrategy(ABC):
         Returns:
             Prepared training batch with all necessary data
         """
+    
+    def prepare_model_inputs(self, training_batch: TrainingBatch) -> dict[str, Any]:
+        """Prepare inputs for the transformer model.
+        
+        Args:
+            training_batch: Prepared training batch
+            
+        Returns:
+            Dictionary of inputs for transformer forward pass
+        """
+        model_inputs = {
+            "hidden_states": training_batch.latents,
+            "timestep": training_batch.timesteps,
+            "encoder_hidden_states": training_batch.prompt_embeds,
+            "encoder_attention_mask": training_batch.prompt_attention_mask,
+        }
+        
+        # Add cross attention inputs if available
+        if training_batch.cross_attention_latents is not None:
+            model_inputs["cross_attention_hidden_states"] = training_batch.cross_attention_latents
+            model_inputs["cross_attention_mask"] = training_batch.cross_attention_mask
+            
+        # Add video coordinates if available
+        if training_batch.video_coords is not None:
+            model_inputs["video_coords"] = training_batch.video_coords
+            
+        return model_inputs
 
     def _create_timesteps_from_conditioning_mask(
         self, conditioning_mask: Tensor, sampled_timestep_values: Tensor
@@ -457,6 +492,9 @@ def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingSt
         strategy = StandardTrainingStrategy(conditioning_config)
     elif conditioning_mode == "reference_video":
         strategy = ReferenceVideoTrainingStrategy(conditioning_config)
+    elif conditioning_mode == "cross_attention":
+        from ltxv_trainer.SG_enhanced_cross_attention_strategy import EnhancedCrossAttentionTrainingStrategy
+        strategy = EnhancedCrossAttentionTrainingStrategy(conditioning_config)
     else:
         raise ValueError(f"Unknown conditioning mode: {conditioning_mode}")
 

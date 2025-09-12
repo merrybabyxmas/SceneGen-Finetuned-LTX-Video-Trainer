@@ -42,22 +42,22 @@ class SOSTokenLatents(nn.Module):
     - sinusoidal positional embedding -> project to D and add
     - outputs [Seq, D]
     """
-    def __init__(self, d_model: int = 128, pe_dim: Optional[int] = None, use_zero_init: bool = True):
+    def __init__(self, d_model: int = 128, pe_dim: Optional[int] = None, use_zero_init: bool = False):
         super().__init__()
         self.d_model = d_model
         
-        # Fixed base token (non-learnable)
+        # Fixed base token (non-learnable) - Use meaningful initialization for multi-view generation
         if use_zero_init:
             # Simple zero initialization for maximum stability
             base_token = torch.zeros(1, d_model)
         else:
-            # Truncated normal initialization (original approach)
+            # Truncated normal initialization (better for multi-view generation)
             base_token = torch.empty(1, d_model)
             _trunc_normal_(base_token, std=0.02)
         self.register_buffer('base', base_token)  # Non-learnable, fixed initialization
         
-        # Fixed alpha value (non-learnable) - minimal influence
-        self.register_buffer('alpha', torch.tensor(0.001))  # Very small fixed value
+        # Increased alpha value for better positional encoding influence
+        self.register_buffer('alpha', torch.tensor(0.1))  # Increased from 0.001 to 0.1
 
         pe_dim = pe_dim or min(64, d_model)
         self.pe_proj = nn.Linear(pe_dim, d_model, bias=False)
@@ -66,27 +66,106 @@ class SOSTokenLatents(nn.Module):
             # Zero initialize projection weights for stability
             nn.init.zeros_(self.pe_proj.weight)
         else:
-            # Xavier initialization (original approach)
+            # Xavier initialization (better for meaningful encoding)
             nn.init.xavier_uniform_(self.pe_proj.weight)
         
-        # Freeze pe_proj to make everything non-learnable
+        # Make pe_proj learnable for better multi-view adaptation
         for param in self.pe_proj.parameters():
-            param.requires_grad = False
+            param.requires_grad = True  # Changed from False to True
 
-    def forward(self, seq_len: int, device=None) -> torch.Tensor:
+    def _sinusoidal_1d(self, n: int, d: int, device) -> torch.Tensor:
+        import math, torch, torch.nn.functional as F
+        half = max(d // 2, 1)
+        pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)   # [n,1]
+        i = torch.arange(half, device=device, dtype=torch.float32)               # [half]
+        div = torch.exp(-math.log(10000.0) * i / max(half, 1))                   # [half]
+        emb = torch.cat([torch.sin(pos * div), torch.cos(pos * div)], dim=1)    # [n, 2*half]
+        if emb.shape[1] < d:
+            emb = F.pad(emb, (0, d - emb.shape[1]))
+        elif emb.shape[1] > d:
+            emb = emb[:, :d]
+        return emb  # [n, d]
+
+    # ---- path A: old API -> (Seq, D) ----
+    def _forward_seq(self, seq_len: int, device=None) -> torch.Tensor:
         if device is None:
             device = self.base.device
-
-        # base: [1, D] -> expand to [Seq, D]
-        base = self.base.to(device).expand(seq_len, -1)  # (Seq, D)
-
-        # sinusoidal pos emb [Seq, pe_dim] -> project -> [Seq, D]
         pe_dim = self.pe_proj.in_features
-        pe = _sinusoidal_pos_emb(seq_len, pe_dim).to(device)  # (Seq, pe_dim)
-        pe_c = self.pe_proj(pe)  # (Seq, D)
+        # 기존 구현과 동일: 1D sinusoidal -> proj -> base와 합
+        pe = _sinusoidal_pos_emb(seq_len, pe_dim).to(device) \
+             if "_sinusoidal_pos_emb" in globals() else self._sinusoidal_1d(seq_len, pe_dim, device)
+        pe_c = self.pe_proj(pe)                                  # (Seq, D)
+        base = self.base.to(device).expand(seq_len, -1)          # (Seq, D)
+        sos = base + self.alpha.to(device) * pe_c                # (Seq, D)
+        return sos.clamp(-1.0, 1.0)
 
-        sos = base + self.alpha * pe_c
-        return sos.clamp(-1.0, 1.0)  # (Seq, D) - match VAE latent range
+    # ---- path B: new API -> [B, D, F, H, W] ----
+    def _forward_grid(self, batch_size: int, num_frames: int, height: int, width: int, device=None) -> torch.Tensor:
+        import torch
+        if device is None:
+            device = self.base.device
+        B, F, H, W = batch_size, num_frames, height, width
+        D = self.d_model
+        seq_len = F * H * W
+
+        # 3D sinusoidal (t,h,w) 분해 후 concat
+        pe_dim = self.pe_proj.in_features
+        d_t = pe_dim // 3
+        d_h = pe_dim // 3
+        d_w = pe_dim - d_t - d_h
+
+        Et = self._sinusoidal_1d(F, d_t, device)  # [F, d_t]
+        Eh = self._sinusoidal_1d(H, d_h, device)  # [H, d_h]
+        Ew = self._sinusoidal_1d(W, d_w, device)  # [W, d_w]
+
+        Etg = Et[:, None, None, :]       # [F,1,1,d_t]
+        Ehg = Eh[None, :, None, :]       # [1,H,1,d_h]
+        Ewg = Ew[None, None, :, :]       # [1,1,W,d_w]
+        pe3d = torch.cat(
+            [Etg.expand(F, H, W, -1),
+             Ehg.expand(F, H, W, -1),
+             Ewg.expand(F, H, W, -1)],
+            dim=-1
+        ).reshape(seq_len, pe_dim)        # [Seq, pe_dim]
+
+        pe_c = self.pe_proj(pe3d)                             # [Seq, D]
+        base = self.base.to(device).expand(seq_len, -1)       # [Seq, D]
+        sos_seq = base + self.alpha.to(device) * pe_c         # [Seq, D]
+
+        # [Seq, D] -> [B, D, F, H, W]
+        sos_ch_first = sos_seq.transpose(0, 1).reshape(D, F, H, W)  # [D,F,H,W]
+        sos = sos_ch_first.unsqueeze(0).expand(B, -1, -1, -1, -1).contiguous()
+        return sos.clamp(-1.0, 1.0)                           # [B,D,F,H,W]
+
+    # ---- unified forward (both signatures supported) ----
+    def forward(self, *args, **kwargs):
+        """
+        Two calling styles supported:
+
+        A) Old (dataset):
+           forward(seq_len=..., device=...)           -> (Seq, D)
+
+        B) New (pipeline):
+           forward(batch_size=..., num_frames=..., height=..., width=..., device=...)
+                                                      -> [B, D, F, H, W]
+        """
+        if 'seq_len' in kwargs:
+            return self._forward_seq(seq_len=int(kwargs['seq_len']), device=kwargs.get('device', None))
+        required = ('batch_size', 'num_frames', 'height', 'width')
+        if all(k in kwargs for k in required):
+            return self._forward_grid(
+                batch_size=int(kwargs['batch_size']),
+                num_frames=int(kwargs['num_frames']),
+                height=int(kwargs['height']),
+                width=int(kwargs['width']),
+                device=kwargs.get('device', None),
+            )
+        # 친절한 에러
+        raise TypeError(
+            "SOSTokenLatents.forward expected either "
+            "`seq_len=<int>` or "
+            "`batch_size=<int>, num_frames=<int>, height=<int>, width=<int>`."
+        )
 
 
 PRECOMPUTED_DIR_NAME = ".precomputed"

@@ -1,262 +1,18 @@
-# ruff: noqa
+class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraLoaderMixin):
+    model_cpu_offload_seq = "text_encoder->transformer->vae"
+    _optional_components = []
+    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 
-# Copyright 2024 Lightricks and The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import inspect
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
-import PIL.Image
-import torch
-from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
-from diffusers.image_processor import PipelineImageInput
-from diffusers.loaders import FromSingleFileMixin, LTXVideoLoraLoaderMixin
-from diffusers.models.autoencoders import AutoencoderKLLTXVideo
-from diffusers.models.transformers import LTXVideoTransformer3DModel
-from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
-from diffusers.utils.torch_utils import randn_tensor
-from diffusers.video_processor import VideoProcessor
-from transformers import T5EncoderModel, T5TokenizerFast
-from torchvision.transforms.functional import center_crop, resize
-
-if is_torch_xla_available():
-    import torch_xla.core.xla_model as xm
-
-    XLA_AVAILABLE = True
-else:
-    XLA_AVAILABLE = False
-
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-EXAMPLE_DOC_STRING = """
-    Examples:
-        ```py
-        >>> import torch
-        >>> from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXConditionPipeline, LTXVideoCondition
-        >>> from diffusers.utils import export_to_video, load_video, load_image
-
-        >>> pipe = LTXConditionPipeline.from_pretrained("Lightricks/LTX-Video-0.9.5", torch_dtype=torch.bfloat16)
-        >>> pipe.to("cuda")
-
-        >>> # Load input image and video
-        >>> video = load_video(
-        ...     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cosmos/cosmos-video2world-input-vid.mp4"
-        ... )
-        >>> image = load_image(
-        ...     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cosmos/cosmos-video2world-input.jpg"
-        ... )
-
-        >>> # Create conditioning objects
-        >>> condition1 = LTXVideoCondition(
-        ...     image=image,
-        ...     frame_index=0,
-        ... )
-        >>> condition2 = LTXVideoCondition(
-        ...     video=video,
-        ...     frame_index=80,
-        ... )
-
-        >>> prompt = "The video depicts a long, straight highway stretching into the distance, flanked by metal guardrails. The road is divided into multiple lanes, with a few vehicles visible in the far distance. The surrounding landscape features dry, grassy fields on one side and rolling hills on the other. The sky is mostly clear with a few scattered clouds, suggesting a bright, sunny day. And then the camera switch to a winding mountain road covered in snow, with a single vehicle traveling along it. The road is flanked by steep, rocky cliffs and sparse vegetation. The landscape is characterized by rugged terrain and a river visible in the distance. The scene captures the solitude and beauty of a winter drive through a mountainous region."
-        >>> negative_prompt = "worst quality, inconsistent motion, blurry, jittery, distorted"
-
-        >>> # Generate video
-        >>> generator = torch.Generator("cuda").manual_seed(0)
-        >>> # Text-only conditioning is also supported without the need to pass `conditions`
-        >>> video = pipe(
-        ...     conditions=[condition1, condition2],
-        ...     prompt=prompt,
-        ...     negative_prompt=negative_prompt,
-        ...     width=768,
-        ...     height=512,
-        ...     num_frames=161,
-        ...     num_inference_steps=40,
-        ...     generator=generator,
-        ... ).frames[0]
-
-        >>> export_to_video(video, "output.mp4", fps=24)
-        ```
-"""
-
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
-def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-@dataclass
-class LTXVideoCondition:
-    """
-    Defines a single frame-conditioning item for LTX Video - a single frame or a sequence of frames.
-
-    Attributes:
-        image (`PIL.Image.Image`):
-            The image to condition the video on.
-        video (`List[PIL.Image.Image]`):
-            The video to condition the video on.
-        frame_index (`int`):
-            The frame index at which the image or video will conditionally effect the video generation.
-        strength (`float`, defaults to `1.0`):
-            The strength of the conditioning effect. A value of `1.0` means the conditioning effect is fully applied.
-    """
-
-    image: Optional[PIL.Image.Image] = None
-    video: Optional[List[PIL.Image.Image]] = None
-    frame_index: int = 0
-    strength: float = 1.0
-
-
-# from LTX-Video/ltx_video/schedulers/rf.py
-def linear_quadratic_schedule(num_steps, threshold_noise=0.025, linear_steps=None):
-    if linear_steps is None:
-        linear_steps = num_steps // 2
-    if num_steps < 2:
-        return torch.tensor([1.0])
-    linear_sigma_schedule = [i * threshold_noise / linear_steps for i in range(linear_steps)]
-    threshold_noise_step_diff = linear_steps - threshold_noise * num_steps
-    quadratic_steps = num_steps - linear_steps
-    quadratic_coef = threshold_noise_step_diff / (linear_steps * quadratic_steps**2)
-    linear_coef = threshold_noise / linear_steps - 2 * threshold_noise_step_diff / (quadratic_steps**2)
-    const = quadratic_coef * (linear_steps**2)
-    quadratic_sigma_schedule = [
-        quadratic_coef * (i**2) + linear_coef * i + const for i in range(linear_steps, num_steps)
-    ]
-    sigma_schedule = linear_sigma_schedule + quadratic_sigma_schedule + [1.0]
-    sigma_schedule = [1.0 - x for x in sigma_schedule]
-    return torch.tensor(sigma_schedule[:-1])
-
-
-# Copied from diffusers.pipelines.flux.pipeline_flux.calculate_shift
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
-    **kwargs,
-):
-    r"""
-    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
-    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
-
-    Args:
-        scheduler (`SchedulerMixin`):
-            The scheduler to get timesteps from.
-        num_inference_steps (`int`):
-            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
-            must be `None`.
-        device (`str` or `torch.device`, *optional*):
-            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
-            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
-
-    Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
-        second element is the number of inference steps.
-    """
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" timestep schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
-
-
-
-
-from typing import Any, Callable, Dict, List, Optional, Union
-import torch
-from diffusers.video_processor import VideoProcessor
-from diffusers.utils.torch_utils import randn_tensor
-
-from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline, LTXVideoCondition
-from ltxv_trainer.SG_datasets import SOSTokenLatents
-from ltxv_trainer import logger
-
-
-class SGMultiShotPipeline(LTXConditionPipeline):
-    """
-    Enhanced LTX Pipeline with multi-shot capabilities.
-    
-    Supports previous latent conditioning and conditioning masks for sequential video generation.
-    """
-    
     def __init__(
         self,
-        scheduler,
-        vae,
-        text_encoder,
-        tokenizer,
-        transformer,
-        sos_token_generator: Optional[SOSTokenLatents] = None,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: AutoencoderKLLTXVideo,
+        text_encoder: T5EncoderModel,
+        tokenizer: T5TokenizerFast,
+        transformer: LTXVideoTransformer3DModel,
     ):
-        super().__init__(
-            scheduler=scheduler,
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            transformer=transformer,
-        )
-        
+        super().__init__()
+
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -277,28 +33,15 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         self.transformer_temporal_patch_size = (
             self.transformer.config.patch_size_t if self.transformer is not None else 1
         )
-        # SOS token generator for first shot
-        self.sos_token_generator = sos_token_generator or SOSTokenLatents(d_model=128).to(self._execution_device)
-        
-        # Initialize video processor if not already done by parent
-        if not hasattr(self, 'video_processor') or self.video_processor is None:
-            vae_scale_factor = getattr(self.vae, 'spatial_compression_ratio', 32)
-            self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
-        
-    @property 
-    def device(self):
-        """Get the device of the pipeline."""
-        # Use override device if set
-        if hasattr(self, '_device_override') and self._device_override is not None:
-            return self._device_override
-        
-        # Try to get device from transformer (most reliable)
-        if hasattr(self, 'transformer') and hasattr(self.transformer, 'device'):
-            return self.transformer.device
-            
-        # Fallback to cuda:0
-        return torch.device('cuda:0')
 
+        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio)
+        self.tokenizer_max_length = (
+            self.tokenizer.model_max_length if getattr(self, "tokenizer", None) is not None else 128
+        )
+
+        self.default_height = 512
+        self.default_width = 704
+        self.default_frames = 121
 
     def _get_t5_prompt_embeds(
         self,
@@ -348,6 +91,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
         return prompt_embeds, prompt_attention_mask
 
+    # Copied from diffusers.pipelines.mochi.pipeline_mochi.MochiPipeline.encode_prompt
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -406,6 +150,92 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
         return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask
 
+    def check_inputs(
+        self,
+        prompt,
+        conditions,
+        image,
+        video,
+        frame_index,
+        strength,
+        height,
+        width,
+        callback_on_step_end_tensor_inputs=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        reference_video=None,
+    ):
+        if height % 32 != 0 or width % 32 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 32 but are {height} and {width}.")
+
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        if prompt is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt is None and prompt_embeds is None:
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+            )
+        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if prompt_embeds is not None and prompt_attention_mask is None:
+            raise ValueError("Must provide `prompt_attention_mask` when specifying `prompt_embeds`.")
+
+        if negative_prompt_embeds is not None and negative_prompt_attention_mask is None:
+            raise ValueError("Must provide `negative_prompt_attention_mask` when specifying `negative_prompt_embeds`.")
+
+        if prompt_embeds is not None and negative_prompt_embeds is not None:
+            if prompt_embeds.shape != negative_prompt_embeds.shape:
+                raise ValueError(
+                    "`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
+                    f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
+                    f" {negative_prompt_embeds.shape}."
+                )
+            if prompt_attention_mask.shape != negative_prompt_attention_mask.shape:
+                raise ValueError(
+                    "`prompt_attention_mask` and `negative_prompt_attention_mask` must have the same shape when passed directly, but"
+                    f" got: `prompt_attention_mask` {prompt_attention_mask.shape} != `negative_prompt_attention_mask`"
+                    f" {negative_prompt_attention_mask.shape}."
+                )
+
+        if conditions is not None and (image is not None or video is not None):
+            raise ValueError("If `conditions` is provided, `image` and `video` must not be provided.")
+
+        if conditions is None:
+            if isinstance(image, list) and isinstance(frame_index, list) and len(image) != len(frame_index):
+                raise ValueError(
+                    "If `conditions` is not provided, `image` and `frame_index` must be of the same length."
+                )
+            elif isinstance(image, list) and isinstance(strength, list) and len(image) != len(strength):
+                raise ValueError("If `conditions` is not provided, `image` and `strength` must be of the same length.")
+            elif isinstance(video, list) and isinstance(frame_index, list) and len(video) != len(frame_index):
+                raise ValueError(
+                    "If `conditions` is not provided, `video` and `frame_index` must be of the same length."
+                )
+            elif isinstance(video, list) and isinstance(strength, list) and len(video) != len(strength):
+                raise ValueError("If `conditions` is not provided, `video` and `strength` must be of the same length.")
+
+        if reference_video is not None:
+            if not isinstance(reference_video, torch.Tensor):
+                raise ValueError(
+                    "`reference_video` must be a torch.Tensor with shape [F, C, H, W] as returned by read_video()."
+                )
+            if reference_video.ndim != 4:
+                raise ValueError(
+                    f"`reference_video` must be a 4D tensor with shape [F, C, H, W], but got shape {reference_video.shape}."
+                )
+
     @staticmethod
     def _prepare_video_ids(
         batch_size: int,
@@ -427,6 +257,23 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         latent_coords = latent_coords.reshape(batch_size, -1, num_frames * height * width)
 
         return latent_coords
+
+    @staticmethod
+    def _scale_video_ids(
+        video_ids: torch.Tensor,
+        scale_factor: int = 32,
+        scale_factor_t: int = 8,
+        frame_index: int = 0,
+        device: torch.device = None,
+    ) -> torch.Tensor:
+        scaled_latent_coords = (
+            video_ids
+            * torch.tensor([scale_factor_t, scale_factor, scale_factor], device=video_ids.device)[None, :, None]
+        )
+        scaled_latent_coords[:, 0] = (scaled_latent_coords[:, 0] + 1 - scale_factor_t).clamp(min=0)
+        scaled_latent_coords[:, 0] += frame_index
+
+        return scaled_latent_coords
 
     @staticmethod
     # Copied from diffusers.pipelines.ltx.pipeline_ltx.LTXPipeline._pack_latents
@@ -503,7 +350,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         # Trim down to a multiple of temporal_scale_factor frames plus 1
         num_frames = (num_frames - 1) // scale_factor * scale_factor + 1
         return num_frames
-
 
     @staticmethod
     def add_noise_to_image_conditioning_latents(
@@ -718,27 +564,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 256,
     ):
-        """
-        Generate video using the SGMultiShotPipeline with SOS token and reference video support.
-        
-        Args:
-            prompt: Text prompt for video generation
-            reference_video: Optional reference video tensor for multi-shot generation
-            height: Video height
-            width: Video width
-            num_frames: Number of frames to generate
-            num_inference_steps: Number of denoising steps
-            guidance_scale: Guidance scale for classifier-free guidance
-            generator: Random generator for reproducible results
-            output_type: Output format ("pil" or "tensor")
-            return_dict: Whether to return a dictionary
-        
-        Returns:
-            Generated video frames
-        
-        Examples:
-        
-        """
        
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -874,7 +699,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             dtype=torch.float32,
         )
 
-        # 4.5. Process reference video (if provided) or generate SOS token, and concatenate at the beginning
+        # 4.5. Process reference video (if provided) and concatenate at the beginning
         reference_latents = None
         reference_num_latents = 0
         if reference_video is not None:
@@ -983,79 +808,12 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     dtype=torch.float32,
                 )
                 conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
-        else:
-            # Generate SOS token as reference when no reference video is provided
-            # Calculate latent dimensions like for reference video processing
-            latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-            latent_height = height // self.vae_spatial_compression_ratio
-            latent_width = width // self.vae_spatial_compression_ratio
-            
-            # Generate SOS latents using the SOS token generator
-            sos_latents = self.sos_token_generator(
-                batch_size=batch_size * num_videos_per_prompt,
-                num_frames=latent_num_frames,
-                height=latent_height,
-                width=latent_width,
-                device=device
-            )
-            
-            # Create "clean" coordinates for SOS latents (as if no frame conditioning applied)
-            sos_video_coords = self._prepare_video_ids(
-                batch_size * num_videos_per_prompt,
-                latent_num_frames,
-                latent_height,
-                latent_width,
-                patch_size_t=self.transformer_temporal_patch_size,
-                patch_size=self.transformer_spatial_patch_size,
-                device=device,
-            )
-            sos_video_coords = self._scale_video_ids(
-                sos_video_coords,
-                scale_factor=self.vae_spatial_compression_ratio,
-                scale_factor_t=self.vae_temporal_compression_ratio,
-                frame_index=0,  # SOS token starts at frame 0
-                device=device,
-            )
-            
-            # Pack SOS latents
-            reference_latents = self._pack_latents(
-                sos_latents,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            )
-            reference_num_latents = reference_latents.size(1)
-            
-            # Concatenate SOS latents at the beginning: [sos_latents, frame_conditions, target_latents]
-            latents = torch.cat([reference_latents, latents], dim=1)
-            
-            # Update video coordinates: [sos_coords, existing_coords]
-            sos_video_coords = sos_video_coords.float()
-            video_coords = torch.cat([sos_video_coords, video_coords], dim=2)
-            
-            # Update conditioning mask to include SOS (frozen = strength 1.0)
-            if conditioning_mask is not None:
-                sos_conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                conditioning_mask = torch.cat([sos_conditioning_mask, conditioning_mask], dim=1)
-            else:
-                # If no frame conditioning, still create mask for SOS
-                conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                # Add zeros for target latents
-                target_conditioning_mask = torch.zeros(
-                    (batch_size * num_videos_per_prompt, latents.size(1) - reference_num_latents),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
 
         video_coords = video_coords.float()
         if reference_video is None:
             video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
 
-        init_latents = latents.clone() if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0 else None
+        init_latents = latents.clone() if is_conditioning_image_or_video or reference_video is not None else None
 
         if self.do_classifier_free_guidance:
             video_coords = torch.cat([video_coords, video_coords], dim=0)
@@ -1096,7 +854,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     )
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_video is not None:
                     conditioning_mask_model_input = (
                         torch.cat([conditioning_mask, conditioning_mask])
                         if self.do_classifier_free_guidance
@@ -1106,7 +864,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0]).unsqueeze(-1).float()
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_video is not None:
                     timestep = torch.min(timestep, (1 - conditioning_mask_model_input) * 1000.0)
 
                 noise_pred = self.transformer(
@@ -1127,7 +885,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 denoised_latents = self.scheduler.step(
                     -noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
                 )[0]
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_video is not None:
                     tokens_to_denoise_mask = (t / 1000 - 1e-6 < (1.0 - conditioning_mask)).unsqueeze(-1)
                     latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
                 else:
@@ -1233,7 +991,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 video = torch.cat(videos, dim=4)
         else:
             # Regular processing - just remove conditioning parts and output generated video
-            if reference_video is not None or reference_num_latents > 0:
+            if reference_video is not None:
                 # Remove reference latents
                 latents = latents[:, reference_num_latents:]
 
@@ -1284,55 +1042,3 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             return (video,)
 
         return LTXPipelineOutput(frames=video)
-    # """
-    # Encode video to latent space for use as prev_latent conditioning.
-    
-    # Args:
-    #     video: Video tensor, PIL images, or video frames
-        
-    # Returns:
-    #     Latent tensor in sequence format [seq_len, channels] for conditioning
-    # """
-    # with torch.no_grad():
-    #     # Handle different input types (PIL images, etc.)
-    #     if isinstance(video, list):
-    #         # Convert PIL images to tensor
-    #         import numpy as np
-    #         from PIL import Image
-    #         frames = []
-    #         for frame in video:
-    #             if isinstance(frame, Image.Image):
-    #                 frame_array = np.array(frame).transpose(2, 0, 1)  # HWC -> CHW
-    #                 frames.append(torch.from_numpy(frame_array))
-    #         video = torch.stack(frames, dim=0)  # [frames, channels, height, width]
-        
-    #     # Ensure video has batch dimension and correct format for VAE: [B, C, F, H, W]
-    #     if video.dim() == 4:  # [frames, channels, height, width]
-    #         video = video.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, frames, channels, height, width] -> [1, channels, frames, height, width]
-        
-    #     # Move to device and normalize
-    #     device = self.device
-    #     video = video.to(device, dtype=torch.float32)
-        
-    #     # Normalize to [-1, 1] based on input range
-    #     if video.max() > 1.0:  # PIL images are typically 0-255
-    #         video = video / 255.0  # [0, 255] -> [0, 1]
-    #         video = video * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-    #     elif video.min() >= 0.0 and video.max() <= 1.0:  # Already in [0, 1]
-    #         video = video * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-        
-    #     # Encode using VAE
-    #     latent_dist = self.vae.encode(video)
-    #     latent = retrieve_latents(latent_dist)
-        
-    #     # Normalize latents like in the pipeline
-    #     latent = self._normalize_latents(
-    #         latent, self.vae.latents_mean, self.vae.latents_std
-    #     )
-            
-    #     # Convert to sequence format [seq_len, channels]
-    #     batch, latent_channels, latent_frames, latent_height, latent_width = latent.shape
-    #     seq_len = latent_frames * latent_height * latent_width
-    #     latent = latent.view(batch, latent_channels, seq_len).permute(0, 2, 1).squeeze(0)
-        
-    #     return latent
