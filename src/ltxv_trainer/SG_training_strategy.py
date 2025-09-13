@@ -30,20 +30,22 @@ DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 
 def pc_cfm_loss(model_output: Tensor, X0: Tensor, X1c: Tensor, X1p: Tensor, lambda_val: float = 1.0) -> Tensor:
     """
-    PC-CFM loss function.
-    
+    PC-CFM loss function with correct velocity field target.
+
     Args:
-        model_output: Model prediction
-        X0: Initial noisy version of current shot
-        X1c: Clean current shot
-        X1p: Previous latent (or SOS token if first shot)
-        lambda_val: Lambda parameter for PC-CFM
-        
+        model_output: Model prediction (velocity field v_t)
+        X0: Initial noisy version of current shot (x_t)
+        X1c: Clean current shot (x_1^c)
+        X1p: Previous latent (x_1^p) or SOS token if first shot
+        lambda_val: Lambda parameter for PC-CFM interpolation
+
     Returns:
         PC-CFM loss value
     """
-    target = (X1c - X0) + lambda_val * (X1p - X1c)
-    return F.mse_loss(model_output, target)
+    # PC-CFM velocity target: v_t = (x_1^c - x_t) + λ(x_1^p - x_1^c)
+    # This represents the velocity field that moves from x_t towards a combination of current clean and previous
+    velocity_target = (X1c - X0) + lambda_val * (X1p - X1c)
+    return F.mse_loss(model_output, velocity_target)
 
 
 # --------------------------
@@ -488,7 +490,7 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         X1p = batch.targets['X1p'] # Previous shot or SOS token
         
         # Apply PC-CFM loss: target = (X1c - X0) + lambda * (X1p - X1c)
-        lambda_val = 0.3
+        lambda_val = 0.00
         # For PC-CFM, we need to match sequence lengths properly
         if X1p.shape[1] != X1c.shape[1]:
             # If reference (X1p) has different sequence length, we need to handle it

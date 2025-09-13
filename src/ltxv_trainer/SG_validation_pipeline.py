@@ -89,18 +89,29 @@ class MultiShotValidationPipeline:
                 "guidance_scale": guidance_scale,
                 "generator": generator,
                 "output_reference_comparison": True,
+                "return_latents": True,  # Return latents for next shot conditioning
             }
-            
+
             # Handle conditioning for multi-shot generation
             if shot_idx == 0:
                 # First shot: use SOS token conditioning
-                pipeline_inputs["use_sos_conditioning"] = True
+                latent_num_frames = (frames - 1) // 8 + 1  # VAE temporal compression ratio
+                latent_height = height // 32  # VAE spatial compression ratio
+                latent_width = width // 32
+
+                sos_latents = self.sos_token_generator(
+                    batch_size=1,
+                    num_frames=latent_num_frames,
+                    height=latent_height,
+                    width=latent_width,
+                    device=self.device
+                )
+                pipeline_inputs["reference_latents"] = sos_latents
                 logger.info("Using SOS token conditioning for first shot")
             else:
-                # Subsequent shots: use previous shot as conditioning
-                pipeline_inputs["prev_latent"] = prev_latent
-                pipeline_inputs["use_prev_conditioning"] = True
-                logger.info(f"Using previous shot conditioning for shot {shot_idx + 1}")
+                # Subsequent shots: use previous shot latents as conditioning
+                pipeline_inputs["reference_latents"] = prev_latent
+                logger.info(f"Using previous shot conditioning for shot {shot_idx + 1} (latent shape: {prev_latent.shape if prev_latent is not None else 'None'})")
             # Generate the video using SGMultiShotPipeline
             logger.info(f"Calling pipeline with inputs: {list(pipeline_inputs.keys())}")
             try:
@@ -156,11 +167,19 @@ class MultiShotValidationPipeline:
                                     logger.error(f"Alternative save also failed: {alt_error}")
                     
                     # Store latent representation for next shot conditioning
-                    if len(videos) > 0:
-                        logger.info("Encoding video to latent for next shot...")
+                    if hasattr(result, 'latents') and result.latents is not None:
+                        prev_latent = result.latents.clone()
+                        logger.info(f"Stored latents for next shot: {prev_latent.shape}")
+                    elif isinstance(result, dict) and 'latents' in result:
+                        prev_latent = result['latents'].clone() if hasattr(result['latents'], 'clone') else result['latents']
+                        logger.info(f"Stored latents from dict for next shot: {prev_latent.shape}")
+                    elif len(videos) > 0:
+                        logger.warning("No latents returned from pipeline, encoding video to latent for next shot...")
+                        # Fallback: encode video if latents not available
                         prev_latent = self.pipeline.encode_video_to_latent(videos[0])
                     else:
-                        logger.warning("No videos generated!")
+                        logger.warning("No videos or latents generated!")
+                        prev_latent = None
                         
             except Exception as e:
                 logger.error(f"Pipeline generation failed for shot {shot_idx + 1}: {e}")

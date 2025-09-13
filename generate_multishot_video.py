@@ -217,18 +217,29 @@ class MultiShotVideoGenerator:
                 "guidance_scale": guidance_scale,
                 "generator": generator,
                 "output_reference_comparison": True,
+                "return_latents": True,  # Return latents for next shot conditioning
             }
             
             # Handle conditioning for multi-shot generation
             if shot_idx == 0:
                 # First shot: use SOS token conditioning
-                pipeline_inputs["use_sos_conditioning"] = True
+                latent_num_frames = (num_frames - 1) // 8 + 1  # VAE temporal compression ratio
+                latent_height = height // 32  # VAE spatial compression ratio
+                latent_width = width // 32
+
+                sos_latents = self.sos_token_generator(
+                    batch_size=1,
+                    num_frames=latent_num_frames,
+                    height=latent_height,
+                    width=latent_width,
+                    device=self.device
+                )
+                pipeline_inputs["reference_latents"] = sos_latents
                 print("   🏁 Using SOS token conditioning for first shot")
             else:
-                # Subsequent shots: use previous shot as conditioning
-                pipeline_inputs["prev_latent"] = prev_latent
-                pipeline_inputs["use_prev_conditioning"] = True
-                print(f"   🔗 Using previous shot conditioning for shot {shot_idx + 1}")
+                # Subsequent shots: use previous shot latents as conditioning
+                pipeline_inputs["reference_latents"] = prev_latent
+                print(f"   🔗 Using previous shot conditioning for shot {shot_idx + 1} (latent shape: {prev_latent.shape if prev_latent is not None else 'None'})")
             
             try:
                 # Generate the shot
@@ -238,27 +249,36 @@ class MultiShotVideoGenerator:
                     with autocast(device_type, dtype=self.torch_dtype):
                         # Use multishot pipeline with modified conditioning
                         result = self.pipeline(**pipeline_inputs)
-                        
-                        if hasattr(result, 'frames') and result.frames:
-                            video = result.frames[0]  # Get first video from batch
-                            
+
+                        # Handle different result formats (dict or object)
+                        if isinstance(result, dict):
+                            video = result.get('frames')
+                            latents_result = result.get('latents')
+                        else:
+                            video = getattr(result, 'frames', None)
+                            latents_result = getattr(result, 'latents', None)
+
+                        if video is not None:
+                            if isinstance(video, list):
+                                video = video[0]  # Get first video from batch
+
                             # Save the video
                             safe_prompt = "".join(c if c.isalnum() or c in (' ', '-', '_') else '' for c in prompt)[:50]
                             video_filename = f"shot_{shot_idx+1:02d}_{safe_prompt}.mp4"
                             video_path = output_dir / video_filename
-                            
+
                             export_to_video(video, str(video_path), fps=8)
                             video_paths.append(str(video_path))
-                            
+
                             print(f"   ✅ Shot {shot_idx + 1} saved: {video_filename}")
-                            
+
                             # Store latent for next shot conditioning
-                            if hasattr(result, 'latents') and result.latents is not None:
-                                prev_latent = result.latents.clone()
+                            if latents_result is not None:
+                                prev_latent = latents_result.clone() if hasattr(latents_result, 'clone') else latents_result
                                 print(f"   📦 Stored latent for next shot: {prev_latent.shape}")
                             elif shot_idx < num_shots - 1:
                                 print(f"   ⚠️ Warning: No latent stored for next shot")
-                                
+
                         else:
                             print(f"   ❌ Failed to generate shot {shot_idx + 1}: No frames in result")
                             

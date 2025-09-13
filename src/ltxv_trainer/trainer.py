@@ -49,7 +49,7 @@ from torchvision.transforms import functional as F  # noqa: N812
 from ltxv_trainer import logger
 from ltxv_trainer.config import LtxvTrainerConfig
 # from ltxv_trainer.datasets import PrecomputedDataset
-from ltxv_trainer.SG_datasets import PrecomputedDataset
+from ltxv_trainer.SG_datasets import PrecomputedDataset, SOSTokenLatents
 
 from ltxv_trainer.hf_hub_utils import push_to_hub
 from ltxv_trainer.model_loader import load_ltxv_components
@@ -118,6 +118,7 @@ class LtxvTrainer:
         self._checkpoint_paths = []
         self._init_wandb()
         self._training_strategy = get_training_strategy(self._config.conditioning)
+        self._sos_token_generator = SOSTokenLatents(d_model=128).to(self._accelerator.device)
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -607,16 +608,20 @@ class LtxvTrainer:
                                 # Move model prediction to debug device before operations
                                 curr_model_pred_spatial = curr_model_pred_spatial.to(debug_device)
                                 
-                                # Compute denoised latents using flow matching
-                                # For flow matching: denoised = noisy - sigma * predicted_velocity
-                                sigmas = training_batch.sigmas[batch_idx:batch_idx+1].to(debug_device)  # (1, 1, 1)
-                                
-                                # Flow matching denoising: x_0 = x_t - sigma * v_pred
+                                # Compute denoised latents using PC-CFM flow matching
+                                # For PC-CFM: denoised = x_t - t * predicted_velocity (use timestep, not sigma)
+                                timesteps = training_batch.timesteps[batch_idx:batch_idx+1].to(debug_device)  # (1, seq_len)
+
+                                # Extract timestep for current part (average current timesteps)
+                                curr_timesteps = timesteps[:, training_batch.prev_seq_len:]  # (1, curr_seq_len)
+                                t_value = curr_timesteps.mean(dim=1).item()  # scalar value
+
+                                # PC-CFM denoising: x_0 = x_t - t * v_pred
                                 # where v_pred is the velocity field predicted by the model
-                                sigma_reshaped = sigmas.view(-1, 1, 1)  # Shape for broadcasting with (1, H*W, D)
-                                
-                                # Compute denoised latents using flow matching in sequence format (all tensors on debug_device)
-                                curr_denoised_latents = curr_noisy_first_frame - sigma_reshaped * curr_model_pred_spatial
+                                t_reshaped = torch.tensor(t_value, device=debug_device).view(1, 1, 1)  # Shape for broadcasting
+
+                                # Compute denoised latents using PC-CFM flow matching in sequence format (all tensors on debug_device)
+                                curr_denoised_latents = curr_noisy_first_frame - t_reshaped * curr_model_pred_spatial
                                 
                                 # Decode denoised latents using ltxv_utils decode_video
                                 curr_denoised_result = decode_video(
@@ -776,10 +781,12 @@ class LtxvTrainer:
                 noisy_first_frame = noisy_latents[:, :frames_per_sample]  # (1, H*W, D)
                 pred_noise_first_frame = model_pred_curr[:, :frames_per_sample]  # (1, H*W, D)
                 
-                # Compute denoised latent using flow matching: x_0 = x_t - sigma * v_pred
-                # Note: This assumes model predicts velocity field (flow matching parameterization)
-                sigma = training_batch.sigmas[batch_idx:batch_idx+1, 0, 0].to(debug_device)  # (1,)
-                denoised_first_frame = noisy_first_frame - sigma.view(-1, 1, 1) * pred_noise_first_frame
+                # Compute denoised latent using PC-CFM flow matching: x_0 = x_t - t * v_pred
+                # Note: For PC-CFM, use timestep rather than sigma
+                timesteps = training_batch.timesteps[batch_idx:batch_idx+1].to(debug_device)  # (1, seq_len)
+                curr_timesteps = timesteps[:, training_batch.prev_seq_len:]  # (1, curr_seq_len)
+                t_value = curr_timesteps.mean(dim=1)  # (1,)
+                denoised_first_frame = noisy_first_frame - t_value.view(-1, 1, 1) * pred_noise_first_frame
                 
                 # Calculate proper VAE latent dimensions
                 vae_h = H // 1  # Spatial downsampling factor
@@ -1049,12 +1056,16 @@ class LtxvTrainer:
                 if isinstance(training_batch.targets, dict):
                     # PC-CFM denoised calculation
                     # In PC-CFM, model predicts the velocity field v_t
-                    # The denoised estimate is: x_t - sigma * v_t (flow backward)
-                    sigmas = training_batch.sigmas[batch_idx:batch_idx+1]  # (1, 1, 1)
-                    
-                    # PC-CFM: move backward along the predicted velocity field
-                    denoised_curr_latents = noisy_curr_latents - sigmas.squeeze(-1) * model_pred_curr
-                    logger.info(f"PC-CFM denoised calculation: noisy - sigma * velocity_pred")
+                    # The denoised estimate is: x_0 = x_t - t * v_t (where t is timestep, not sigma)
+                    timesteps = training_batch.timesteps[batch_idx:batch_idx+1]  # (1, seq_len)
+
+                    # Extract timestep for current part (skip prev part if exists)
+                    curr_timesteps = timesteps[:, training_batch.prev_seq_len:]  # (1, curr_seq_len)
+                    t_values = curr_timesteps.mean(dim=1, keepdim=True).unsqueeze(-1)  # (1, 1, 1) for broadcasting
+
+                    # PC-CFM: move backward along the predicted velocity field using timestep
+                    denoised_curr_latents = noisy_curr_latents - t_values * model_pred_curr
+                    logger.info(f"PC-CFM denoised calculation: x_t - t * velocity_pred (t={t_values.item():.3f})")
                 else:
                     # Standard strategy: model predicts noise (epsilon parameterization)
                     denoised_curr_latents = noisy_curr_latents - model_pred_curr
@@ -1252,6 +1263,10 @@ class LtxvTrainer:
 
         if not self._config.acceleration.load_text_encoder_in_8bit:
             self._text_encoder = self._text_encoder.to("cpu")
+
+        # Move SOS token generator to the correct device
+        if hasattr(self, '_sos_token_generator'):
+            self._sos_token_generator = self._sos_token_generator.to(self._accelerator.device)
 
 
     @staticmethod
@@ -1561,6 +1576,11 @@ class LtxvTrainer:
                     pipeline_inputs = {
                         "prompt": prompt,
                         "negative_prompt": self._config.validation.negative_prompt,
+                        "conditions": [],  # Empty conditions list for multishot
+                        "image": None,     # No image conditioning for multishot
+                        "video": None,     # No video conditioning for multishot
+                        "frame_index": None,  # No frame indexing for multishot
+                        "strength": None,     # No strength parameter for multishot
                         "width": width,
                         "height": height,
                         "num_frames": frames,
@@ -1568,39 +1588,57 @@ class LtxvTrainer:
                         "guidance_scale": self._config.validation.guidance_scale,
                         "generator": generator,
                         "output_type": "pil",
+                        "return_latents": True,  # Return latents for next shot conditioning
                     }
-                    
-                    # Add reference video based on shot index
+
+                    # Add reference latents based on shot index
                     if shot_idx == 0:
-                        # First shot: use SOS token (handled internally by SGMultiShotPipeline)
-                        # The SOS token logic is handled internally by the pipeline when no reference_video is provided
-                        pass
+                        # First shot: use SOS token conditioning
+                        latent_num_frames = (frames - 1) // 8 + 1  # VAE temporal compression ratio
+                        latent_height = height // 32  # VAE spatial compression ratio
+                        latent_width = width // 32
+
+                        sos_latents = self._sos_token_generator(
+                            batch_size=1,
+                            num_frames=latent_num_frames,
+                            height=latent_height,
+                            width=latent_width,
+                            device=self._accelerator.device
+                        )
+                        pipeline_inputs["reference_latents"] = sos_latents
                     else:
-                        # Subsequent shots: use previous shot as reference
+                        # Subsequent shots: use previous shot latents as conditioning
                         if previous_shot_latents is not None:
-                            # Convert previous shot frames to tensor format expected by pipeline
-                            # previous_shot_latents should be a video tensor
-                            pipeline_inputs["reference_video"] = previous_shot_latents
+                            pipeline_inputs["reference_latents"] = previous_shot_latents
                     
                     # Generate current shot
                     with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
                         result = multi_shot_pipeline(**pipeline_inputs)
-                        current_video = result.frames[0]  # Get first (and only) video from batch
-                    
+
+                        # Handle different result formats (dict or object)
+                        if isinstance(result, dict):
+                            current_video = result.get('frames')
+                            latents_result = result.get('latents')
+                        else:
+                            current_video = getattr(result, 'frames', None)
+                            latents_result = getattr(result, 'latents', None)
+
+                        if current_video is not None:
+                            if isinstance(current_video, list):
+                                current_video = current_video[0]  # Get first video from batch
+
                     # Save current shot
                     shot_path = output_dir / f"step_{self._global_step:06d}_prompt_{i}_shot_{shot_idx}.mp4"
                     export_to_video(current_video, str(shot_path), fps=24)
                     sequence_videos.append(shot_path)
-                    
-                    # Store current shot for next iteration as reference
-                    # Convert PIL images back to tensor format for reference
-                    if shot_idx < num_shots - 1:  # Don't need to convert the last shot
-                        import numpy as np
-                        frames_array = []
-                        for frame in current_video:
-                            frame_array = np.array(frame).transpose(2, 0, 1)  # HWC -> CHW
-                            frames_array.append(frame_array)
-                        previous_shot_latents = torch.from_numpy(np.stack(frames_array)).float() / 255.0  # [F, C, H, W], normalize to [0,1]
+
+                    # Store latents for next shot conditioning
+                    if shot_idx < num_shots - 1:  # Don't need to store latents for the last shot
+                        if latents_result is not None:
+                            previous_shot_latents = latents_result.clone() if hasattr(latents_result, 'clone') else latents_result
+                        else:
+                            logger.warning(f"No latents returned for shot {shot_idx}, multishot sequence may be broken")
+                            previous_shot_latents = None
                 
                 all_video_paths.extend(sequence_videos)
                 logger.info(f"Generated {len(sequence_videos)} shots for prompt: '{prompt}'")

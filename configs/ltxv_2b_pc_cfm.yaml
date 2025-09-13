@@ -7,21 +7,21 @@ model:
   # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # Resume from checkpoint
 
 lora:
-  rank: 32  
-  alpha: 32  
+  rank: 64  
+  alpha: 64  
   dropout: 0.1  
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
-# PC-CFM specific conditioning configuration
+# SceneGen multishot conditioning configuration
 conditioning:
-  mode: "reference_video"  # Use reference video mode for PC-CFM
+  mode: "reference_video"  # Use reference_video mode (will be handled by SG_training_strategy)
   first_frame_conditioning_p: 0.1
 
 optimization:
   learning_rate: 2e-4  
   steps: 2000
   batch_size: 1
-  gradient_accumulation_steps: 1  
+  gradient_accumulation_steps: 4  
   max_grad_norm: 0.1  
   optimizer_type: "adamw"
   scheduler_type: "linear"
@@ -37,7 +37,7 @@ acceleration:
 data:
   preprocessed_data_root: "/home/jeongseon38/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 4
-  dataset_size: 10  # Set to a number (e.g., 10) to limit dataset size for testing
+  dataset_size: 1000  # Set to a number (e.g., 10) to limit dataset size for testing
 
 validation:
   prompts: ["a guy talking in front of a wooden piece of furniture"]
@@ -47,12 +47,12 @@ validation:
   video_dims: [768, 448, 17]
   seed: 42
   inference_steps: 50  
-  interval: 3
+  interval: 100
   videos_per_prompt: 1
   guidance_scale: 1.5  
   skip_initial_validation: True  
   enable_multi_shot: True  
-  num_shots: 2  
+  num_shots: 4
   sos_latent_dim: 128
 
 checkpoints:
@@ -76,6 +76,6 @@ wandb:
 
 debug:
   enable_debug_frames: true  
-  debug_gpu_id: 2  
-  debug_interval: 100  
+  debug_gpu_id: 3
+  debug_interval: 200  
   enable_batch_visualization: true

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from torch.utils.data import Dataset
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
@@ -505,17 +506,16 @@ if __name__ == "__main__":
     #     print(batch)
     it = iter(ds)
 
-    loader = DataLoader(ds, batch_size=4, shuffle=True)
+    loader = DataLoader(ds, batch_size=1, shuffle=False)
     for batch in loader:
         # print(batch)
         print("-----------------")
         print(batch["latent_conditions"]["latents"].shape)
-        print(batch["latent_conditions"]["num_frames"])
-        print(batch["latent_conditions"]["height"])
-        print(batch["latent_conditions"]["width"])
+        print(batch["prev_conditions"]["latents"].shape)
+
         
         print("-----------------")
-        break
+        
         
         
         

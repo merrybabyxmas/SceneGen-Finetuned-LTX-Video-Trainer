@@ -278,7 +278,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             self.transformer.config.patch_size_t if self.transformer is not None else 1
         )
         # SOS token generator for first shot
-        self.sos_token_generator = sos_token_generator or SOSTokenLatents(d_model=128).to(self._execution_device)
+        self.sos_token_generator = sos_token_generator or SOSTokenLatents(d_model=128)
         
         # Initialize video processor if not already done by parent
         if not hasattr(self, 'video_processor') or self.video_processor is None:
@@ -299,6 +299,71 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         # Fallback to cuda:0
         return torch.device('cuda:0')
 
+    def check_inputs(
+        self,
+        prompt=None,
+        conditions=None,
+        image=None,
+        video=None,
+        frame_index=None,
+        strength=None,
+        height=None,
+        width=None,
+        callback_on_step_end_tensor_inputs=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        reference_latents=None,  # Add support for reference_latents
+        **kwargs,
+    ):
+        """
+        Override parent check_inputs to handle reference_latents parameter.
+        """
+        # Manually build parent_kwargs to avoid locals() issues
+        parent_kwargs = {}
+
+        # Add only the parameters that parent class expects
+        if prompt is not None:
+            parent_kwargs['prompt'] = prompt
+
+        # Provide default values for required parameters that might be None
+        parent_kwargs['conditions'] = conditions if conditions is not None else []
+        parent_kwargs['image'] = image if image is not None else None
+        parent_kwargs['video'] = video if video is not None else None
+
+        # These are required positional arguments for the parent class
+        parent_kwargs['frame_index'] = frame_index if frame_index is not None else 0
+        parent_kwargs['strength'] = strength if strength is not None else 1.0
+        if height is not None:
+            parent_kwargs['height'] = height
+        if width is not None:
+            parent_kwargs['width'] = width
+        if callback_on_step_end_tensor_inputs is not None:
+            parent_kwargs['callback_on_step_end_tensor_inputs'] = callback_on_step_end_tensor_inputs
+        if prompt_embeds is not None:
+            parent_kwargs['prompt_embeds'] = prompt_embeds
+        if negative_prompt_embeds is not None:
+            parent_kwargs['negative_prompt_embeds'] = negative_prompt_embeds
+        if prompt_attention_mask is not None:
+            parent_kwargs['prompt_attention_mask'] = prompt_attention_mask
+        if negative_prompt_attention_mask is not None:
+            parent_kwargs['negative_prompt_attention_mask'] = negative_prompt_attention_mask
+
+        # Add other kwargs (excluding reference_latents)
+        for k, v in kwargs.items():
+            if k != 'reference_latents':
+                parent_kwargs[k] = v
+
+        # Call parent class check_inputs
+        super().check_inputs(**parent_kwargs)
+
+        # Additional validation for reference_latents if needed
+        if reference_latents is not None:
+            if not isinstance(reference_latents, torch.Tensor):
+                raise TypeError("reference_latents must be a torch.Tensor")
+            if reference_latents.dim() != 5:
+                raise ValueError("reference_latents must be a 5D tensor [B, C, F, H, W]")
 
     def _get_t5_prompt_embeds(
         self,
@@ -481,9 +546,21 @@ class SGMultiShotPipeline(LTXConditionPipeline):
     def _denormalize_latents(
         latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
     ) -> torch.Tensor:
+        # Safety check: ensure latents has proper shape
+        if latents.numel() == 0:
+            raise ValueError("Cannot denormalize empty latents tensor")
+
+        if latents.dim() != 5:
+            raise ValueError(f"Expected latents to be 5D [B, C, F, H, W], got shape {latents.shape}")
+
         # Denormalize latents across the channel dimension [B, C, F, H, W]
         latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+
+        # Ensure dimensional compatibility
+        if latents.size(1) != latents_mean.size(1):
+            raise ValueError(f"Channel dimension mismatch: latents has {latents.size(1)} channels, but mean/std have {latents_mean.size(1)} channels")
+
         latents = latents * latents_std / scaling_factor + latents_mean
         return latents
 
@@ -497,7 +574,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             target_num_frames (int): The target number of frames in the generated video.
         Returns:
             int: updated sequence length
-        """
+        """ 
         scale_factor = self.vae_temporal_compression_ratio
         num_frames = min(sequence_num_frames, target_num_frames - start_frame)
         # Trim down to a multiple of temporal_scale_factor frames plus 1
@@ -703,8 +780,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
-        reference_video: Optional[torch.Tensor] = None,
+        reference_latents: Optional[torch.Tensor] = None,
         output_reference_comparison: bool = False,
+        return_latents: bool = False,
         prompt_embeds: Optional[torch.Tensor] = None,
         prompt_attention_mask: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
@@ -723,7 +801,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         
         Args:
             prompt: Text prompt for video generation
-            reference_video: Optional reference video tensor for multi-shot generation
+            reference_latents: Optional reference latents tensor for multi-shot generation
             height: Video height
             width: Video width
             num_frames: Number of frames to generate
@@ -761,7 +839,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
-            reference_video=reference_video,
+            reference_latents=reference_latents,
         )
 
         self._guidance_scale = guidance_scale
@@ -874,65 +952,26 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             dtype=torch.float32,
         )
 
-        # 4.5. Process reference video (if provided) or generate SOS token, and concatenate at the beginning
-        reference_latents = None
+        # 4.5. Process reference latents conditioning
         reference_num_latents = 0
-        if reference_video is not None:
-            # Work with the original tensor format [F, C, H, W]
-            ref_frames = reference_video  # [F, C, H, W]
 
-            # Resize maintaining aspect ratio (resize all frames)
-            current_height, current_width = ref_frames.shape[2:]
-            aspect_ratio = current_width / current_height
-            target_aspect_ratio = width / height
+        if reference_latents is not None:
+            # Use provided reference latents directly (already encoded and normalized)
+            reference_latents = reference_latents.to(device, dtype=torch.float32)
 
-            if aspect_ratio > target_aspect_ratio:
-                # Width is relatively larger, resize based on height
-                resize_height = height
-                resize_width = int(resize_height * aspect_ratio)
-            else:
-                # Height is relatively larger, resize based on width
-                resize_width = width
-                resize_height = int(resize_width / aspect_ratio)
+            # Expand for batch and num_videos_per_prompt if needed
+            if reference_latents.size(0) != batch_size * num_videos_per_prompt:
+                reference_latents = reference_latents.repeat(batch_size * num_videos_per_prompt, 1, 1, 1, 1)
 
-            ref_frames = resize(ref_frames, [resize_height, resize_width], antialias=True)
-
-            # Center crop to target dimensions
-            ref_frames = center_crop(ref_frames, [height, width])
-
-            # Convert to VAE input format: [1, C, F, H, W] and proper range [-1, 1]
-            reference_tensor = ref_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, F, C, H, W] -> [1, C, F, H, W]
-            reference_tensor = reference_tensor * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-
-            # Trim reference video to proper frame count for temporal compression
-            ref_num_frames_input = reference_tensor.size(2)
-            ref_num_frames_output = self.trim_conditioning_sequence(0, ref_num_frames_input, num_frames)
-            reference_tensor = reference_tensor[:, :, :ref_num_frames_output]
-            reference_tensor = reference_tensor.to(device, dtype=vae_dtype)
-
-            # Ensure proper frame count for VAE temporal compression
-            if reference_tensor.size(2) % self.vae_temporal_compression_ratio != 1:
-                # Trim to make it compatible with temporal compression
-                ref_frames_to_keep = (
-                    (reference_tensor.size(2) - 1) // self.vae_temporal_compression_ratio
-                ) * self.vae_temporal_compression_ratio + 1
-                reference_tensor = reference_tensor[:, :, :ref_frames_to_keep]
-
-            # Expand reference tensor for batch and num_videos_per_prompt
-            reference_tensor = reference_tensor.repeat(batch_size * num_videos_per_prompt, 1, 1, 1, 1)
-
-            # Encode reference video to latents
-            reference_latents = retrieve_latents(self.vae.encode(reference_tensor), generator=generator)
-            reference_latents = self._normalize_latents(
-                reference_latents, self.vae.latents_mean, self.vae.latents_std
-            ).to(device, dtype=torch.float32)
+            # Ensure normalized latents format (if needed)
+            # Assume reference_latents are already properly normalized from trainer
 
             # Create "clean" coordinates for reference video (as if no frame conditioning applied)
             ref_latent_frames = reference_latents.size(2)
             ref_latent_height = reference_latents.size(3)
             ref_latent_width = reference_latents.size(4)
 
-            reference_video_coords = self._prepare_video_ids(
+            reference_coords = self._prepare_video_ids(
                 batch_size * num_videos_per_prompt,
                 ref_latent_frames,
                 ref_latent_height,
@@ -941,11 +980,11 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 patch_size=self.transformer_spatial_patch_size,
                 device=device,
             )
-            reference_video_coords = self._scale_video_ids(
-                reference_video_coords,
+            reference_coords = self._scale_video_ids(
+                reference_coords,
                 scale_factor=self.vae_spatial_compression_ratio,
                 scale_factor_t=self.vae_temporal_compression_ratio,
-                frame_index=0,  # Reference video starts at frame 0
+                frame_index=0,  # Reference latents start at frame 0
                 device=device,
             )
 
@@ -956,13 +995,14 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 self.transformer_temporal_patch_size,
             )
             reference_num_latents = reference_latents.size(1)
+            # logger.info(f"reference num latents : {reference_num_latents}")
 
             # Concatenate reference latents at the beginning: [reference_latents, frame_conditions, target_latents]
             latents = torch.cat([reference_latents, latents], dim=1)
 
             # Update video coordinates: [reference_coords, existing_coords]
-            reference_video_coords = reference_video_coords.float()
-            video_coords = torch.cat([reference_video_coords, video_coords], dim=2)
+            reference_coords = reference_coords.float()
+            video_coords = torch.cat([reference_coords, video_coords], dim=2)
             video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
 
             # Update conditioning mask to include reference (frozen = strength 1.0)
@@ -983,79 +1023,12 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     dtype=torch.float32,
                 )
                 conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
-        else:
-            # Generate SOS token as reference when no reference video is provided
-            # Calculate latent dimensions like for reference video processing
-            latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-            latent_height = height // self.vae_spatial_compression_ratio
-            latent_width = width // self.vae_spatial_compression_ratio
-            
-            # Generate SOS latents using the SOS token generator
-            sos_latents = self.sos_token_generator(
-                batch_size=batch_size * num_videos_per_prompt,
-                num_frames=latent_num_frames,
-                height=latent_height,
-                width=latent_width,
-                device=device
-            )
-            
-            # Create "clean" coordinates for SOS latents (as if no frame conditioning applied)
-            sos_video_coords = self._prepare_video_ids(
-                batch_size * num_videos_per_prompt,
-                latent_num_frames,
-                latent_height,
-                latent_width,
-                patch_size_t=self.transformer_temporal_patch_size,
-                patch_size=self.transformer_spatial_patch_size,
-                device=device,
-            )
-            sos_video_coords = self._scale_video_ids(
-                sos_video_coords,
-                scale_factor=self.vae_spatial_compression_ratio,
-                scale_factor_t=self.vae_temporal_compression_ratio,
-                frame_index=0,  # SOS token starts at frame 0
-                device=device,
-            )
-            
-            # Pack SOS latents
-            reference_latents = self._pack_latents(
-                sos_latents,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            )
-            reference_num_latents = reference_latents.size(1)
-            
-            # Concatenate SOS latents at the beginning: [sos_latents, frame_conditions, target_latents]
-            latents = torch.cat([reference_latents, latents], dim=1)
-            
-            # Update video coordinates: [sos_coords, existing_coords]
-            sos_video_coords = sos_video_coords.float()
-            video_coords = torch.cat([sos_video_coords, video_coords], dim=2)
-            
-            # Update conditioning mask to include SOS (frozen = strength 1.0)
-            if conditioning_mask is not None:
-                sos_conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                conditioning_mask = torch.cat([sos_conditioning_mask, conditioning_mask], dim=1)
-            else:
-                # If no frame conditioning, still create mask for SOS
-                conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                # Add zeros for target latents
-                target_conditioning_mask = torch.zeros(
-                    (batch_size * num_videos_per_prompt, latents.size(1) - reference_num_latents),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
 
         video_coords = video_coords.float()
-        if reference_video is None:
+        if reference_latents is None:
             video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
 
-        init_latents = latents.clone() if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0 else None
+        init_latents = latents.clone() if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0 else None
 
         if self.do_classifier_free_guidance:
             video_coords = torch.cat([video_coords, video_coords], dim=0)
@@ -1096,7 +1069,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     )
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
                     conditioning_mask_model_input = (
                         torch.cat([conditioning_mask, conditioning_mask])
                         if self.do_classifier_free_guidance
@@ -1106,7 +1079,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0]).unsqueeze(-1).float()
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
                     timestep = torch.min(timestep, (1 - conditioning_mask_model_input) * 1000.0)
 
                 noise_pred = self.transformer(
@@ -1127,7 +1100,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 denoised_latents = self.scheduler.step(
                     -noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
                 )[0]
-                if is_conditioning_image_or_video or reference_video is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
                     tokens_to_denoise_mask = (t / 1000 - 1e-6 < (1.0 - conditioning_mask)).unsqueeze(-1)
                     latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
                 else:
@@ -1149,8 +1122,8 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-        # Handle reference video output processing
-        if reference_video is not None and output_reference_comparison:
+        # Handle reference latents output processing
+        if reference_latents is not None and output_reference_comparison:
             # Split latents: [reference_latents, frame_conditions, target_latents]
             reference_latents_out = latents[:, :reference_num_latents]
             remaining_latents = latents[:, reference_num_latents:]
@@ -1233,7 +1206,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 video = torch.cat(videos, dim=4)
         else:
             # Regular processing - just remove conditioning parts and output generated video
-            if reference_video is not None or reference_num_latents > 0:
+            if reference_latents is not None or reference_num_latents > 0:
                 # Remove reference latents
                 latents = latents[:, reference_num_latents:]
 
@@ -1277,13 +1250,62 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 video = self.vae.decode(latents, timestep, return_dict=False)[0]
                 video = self.video_processor.postprocess_video(video, output_type=output_type)
 
+        logger.info(f"total latent shape : {latents.shape}")
+
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            return (video,)
+        # Prepare return values
+        if return_latents:
+            # Return both generated video and latents for next shot
+            if reference_latents is not None or reference_num_latents > 0:
+                # Unpack to standard latent format [B, C, F, H, W]
+                unpacked_latents = self._unpack_latents(
+                    latents,
+                    latent_num_frames,
+                    latent_height,
+                    latent_width,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+                logger.info(f"unpacked latents shape : {unpacked_latents.shape}")
+                logger.info(f"latnets mean shape : {self.vae.latents_mean.shape}")
+                logger.info(f"latnets std shape : {self.vae.latents_std.shape}")
 
-        return LTXPipelineOutput(frames=video)
+                # Denormalize latents for reuse
+                unpacked_latents = self._denormalize_latents(
+                    unpacked_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+                )
+            else:
+                # No reference case - return all latents
+                if is_conditioning_image_or_video:
+                    output_latents = latents[:, extra_conditioning_num_latents:]
+                else:
+                    output_latents = latents
+
+                # Unpack to standard latent format [B, C, F, H, W]
+                unpacked_latents = self._unpack_latents(
+                    output_latents,
+                    latent_num_frames,
+                    latent_height,
+                    latent_width,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+
+                # Denormalize latents for reuse
+                unpacked_latents = self._denormalize_latents(
+                    unpacked_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+                )
+
+            if not return_dict:
+                return (video, unpacked_latents)
+            # Use dict to include latents since LTXPipelineOutput may not support latents attribute
+            return {"frames": video, "latents": unpacked_latents}
+        else:
+            if not return_dict:
+                return (video,)
+            return LTXPipelineOutput(frames=video)
     # """
     # Encode video to latent space for use as prev_latent conditioning.
     
