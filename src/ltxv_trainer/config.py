@@ -289,9 +289,14 @@ class ValidationConfig(ConfigBaseModel):
     )
     
     sos_latent_dim: int = Field(
-        default=128, 
+        default=128,
         description="Dimension of SOS token latents for multi-shot generation",
         gt=0,
+    )
+
+    starts_with: Literal["sos", "batch"] = Field(
+        default="sos",
+        description="Multi-shot validation starting mode: 'sos' uses generated SOS latents, 'batch' uses current training batch's prev condition",
     )
 
     @field_validator("images")

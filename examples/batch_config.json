@@ -1,0 +1,62 @@
+{
+  "default_config": {
+    "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+    "height": 448,
+    "width": 704,
+    "num_frames": 121,
+    "num_inference_steps": 40,
+    "guidance_scale": 3.0,
+    "save_individual_shots": true
+  },
+  "sequences": [
+    {
+      "name": "mountain_lake_sequence",
+      "seed": 42,
+      "prompts": [
+        "A serene mountain landscape with a crystal clear lake reflecting snow-capped peaks, morning mist rising from the water.",
+        "The same lake scene as camera slowly pans across the water, revealing a small wooden dock with a red kayak.",
+        "Close-up of the red kayak gently rocking in the calm water, with mountains visible in the background.",
+        "A person in outdoor gear walks onto the dock and begins preparing the kayak for a morning adventure."
+      ]
+    },
+    {
+      "name": "urban_night_sequence",
+      "seed": 123,
+      "config": {
+        "guidance_scale": 4.0,
+        "num_inference_steps": 50
+      },
+      "prompts": [
+        "A bustling city street at night with neon signs reflecting on wet pavement after rain.",
+        "Camera moves through the crowd of people walking along the sidewalk, umbrellas still in hand.",
+        "Focus shifts to a small cafe with warm yellow light spilling out onto the street, people visible inside.",
+        "Inside the cafe, steam rises from coffee cups as friends chat at a window table overlooking the street."
+      ]
+    },
+    {
+      "name": "forest_morning_sequence",
+      "seed": 456,
+      "prompts": [
+        "Dense forest with tall pine trees, early morning sunlight filtering through the canopy creating God rays.",
+        "Camera moves deeper into the forest along a winding dirt path covered with fallen leaves.",
+        "A small clearing opens up with wildflowers and a babbling brook running through moss-covered rocks.",
+        "Close-up of the crystal clear water flowing over smooth stones, with reflections of the forest canopy above."
+      ]
+    },
+    {
+      "name": "desert_sunset_sequence",
+      "seed": 789,
+      "config": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 81
+      },
+      "prompts": [
+        "Vast desert landscape with rolling sand dunes stretching to the horizon, golden hour lighting.",
+        "Camera pans across the dunes as the sun begins to set, casting long shadows and warm orange light.",
+        "A lone cactus stands silhouetted against the colorful sunset sky with purple and pink clouds.",
+        "The sun finally disappears behind the dunes as stars begin to appear in the darkening desert sky."
+      ]
+    }
+  ]
+}

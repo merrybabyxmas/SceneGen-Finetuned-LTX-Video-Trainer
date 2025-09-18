@@ -7,8 +7,8 @@ model:
   # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # Resume from checkpoint
 
 lora:
-  rank: 64  
-  alpha: 64  
+  rank: 128  
+  alpha: 128  
   dropout: 0.1  
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
@@ -19,18 +19,18 @@ conditioning:
 
 optimization:
   learning_rate: 2e-4  
-  steps: 2000
+  steps: 1000
   batch_size: 1
-  gradient_accumulation_steps: 4  
-  max_grad_norm: 0.1  
+  gradient_accumulation_steps: 1  
+  max_grad_norm: 1  
   optimizer_type: "adamw"
   scheduler_type: "linear"
   scheduler_params: {}
   enable_gradient_checkpointing: true   
 
 acceleration:
-  mixed_precision_mode: "bf16" 
-  load_text_encoder_in_8bit: False
+  mixed_precision_mode: "bf16"
+  load_text_encoder_in_8bit: false
   compile_with_inductor: false
   compilation_mode: "reduce-overhead"
 
@@ -40,20 +40,21 @@ data:
   dataset_size: 1000  # Set to a number (e.g., 10) to limit dataset size for testing
 
 validation:
-  prompts: ["a guy talking in front of a wooden piece of furniture"]
-  negative_prompt: "jitter, artifacts, wobble, blur, distortion"
+  prompts: ["a professional portrait video of the earth"]
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
   images: null
   reference_videos: null
   video_dims: [768, 448, 17]
   seed: 42
-  inference_steps: 50  
-  interval: 100
+  inference_steps: 50
+  interval: 50
   videos_per_prompt: 1
-  guidance_scale: 1.5  
-  skip_initial_validation: True  
-  enable_multi_shot: True  
-  num_shots: 4
+  guidance_scale: 3.5
+  skip_initial_validation: True
+  enable_multi_shot: True
+  num_shots: 3
   sos_latent_dim: 128
+  starts_with: "batch"  # Options: "sos" (generate SOS latents) or "batch" (use current training batch's prev condition)
 
 checkpoints:
   interval: 500
@@ -75,7 +76,7 @@ wandb:
   log_validation_videos: true
 
 debug:
-  enable_debug_frames: true  
+  enable_debug_frames: true
   debug_gpu_id: 3
-  debug_interval: 200  
+  debug_interval: 50
   enable_batch_visualization: true

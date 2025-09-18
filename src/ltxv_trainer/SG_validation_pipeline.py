@@ -30,9 +30,11 @@ class MultiShotValidationPipeline:
         sos_token_generator: Optional[SOSTokenLatents] = None,
     ):
         self.pipeline = pipeline
-        self.device = device 
+        # Ensure device is a torch.device object, not a string
+        self.device = torch.device(device) if isinstance(device, str) else device
         self.accelerator = accelerator
-        self.sos_token_generator = sos_token_generator or SOSTokenLatents(d_model=128)
+        # No longer using SOS token generator - using Gaussian noise instead
+        self.sos_token_generator = None
         
     def generate_multi_shot_sequence(
         self,
@@ -99,15 +101,12 @@ class MultiShotValidationPipeline:
                 latent_height = height // 32  # VAE spatial compression ratio
                 latent_width = width // 32
 
-                sos_latents = self.sos_token_generator(
-                    batch_size=1,
-                    num_frames=latent_num_frames,
-                    height=latent_height,
-                    width=latent_width,
-                    device=self.device
-                )
+                # Generate Gaussian noise SOS latents
+                seq_len = latent_num_frames * latent_height * latent_width
+                d_model = 128  # Standard latent dimension
+                sos_latents = torch.randn(1, seq_len, d_model, device=self.device, dtype=torch.float32)
                 pipeline_inputs["reference_latents"] = sos_latents
-                logger.info("Using SOS token conditioning for first shot")
+                logger.info(f"Using Gaussian noise SOS conditioning for first shot (shape: {sos_latents.shape})")
             else:
                 # Subsequent shots: use previous shot latents as conditioning
                 pipeline_inputs["reference_latents"] = prev_latent
@@ -119,8 +118,23 @@ class MultiShotValidationPipeline:
                     logger.info("Pipeline generation starting...")
                     result = self.pipeline(**pipeline_inputs)
                     logger.info("Pipeline generation completed")
-                    videos = result.frames
-                    logger.info(f"Generated videos count: {len(videos) if videos else 0}")
+
+                    # Handle both dict and object results
+                    if isinstance(result, dict):
+                        logger.info(f"Result keys: {list(result.keys())}")
+                        videos = result.get('frames') or result.get('videos') or result.get('video')
+                        if videos is None:
+                            # Try to get the first available video-like value
+                            for key in result.keys():
+                                if 'video' in key.lower() or 'frame' in key.lower():
+                                    videos = result[key]
+                                    logger.info(f"Using key '{key}' for videos")
+                                    break
+                    else:
+                        videos = result.frames if hasattr(result, 'frames') else result
+
+                    logger.info(f"Generated videos count: {len(videos) if videos and hasattr(videos, '__len__') else 'unknown'}")
+                    logger.info(f"Videos type: {type(videos)}")
                     
                     # Save intermediate steps if available
                     if hasattr(result, 'intermediate_steps') and result.intermediate_steps:
@@ -358,8 +372,8 @@ def create_multi_shot_validation_pipeline(
 ) -> MultiShotValidationPipeline:
     """Create a multi-shot validation pipeline."""
     
-    # Create SOS token generator and move to device
-    sos_generator = SOSTokenLatents(d_model=d_model).to(device)
+    # No longer need SOS token generator - using Gaussian noise instead
+    sos_generator = None
     
     # Models are already unwrapped from trainer.py, use them directly
     # No need to unwrap again since trainer already calls accelerator.unwrap_model()
@@ -432,10 +446,10 @@ def create_multi_shot_validation_pipeline(
         multishot_pipeline = SGMultiShotPipeline(
             scheduler=scheduler_copy,
             vae=unwrapped_vae,
-            text_encoder=unwrapped_text_encoder, 
+            text_encoder=unwrapped_text_encoder,
             tokenizer=tokenizer,
             transformer=unwrapped_transformer,
-            sos_token_generator=sos_generator
+            sos_token_generator=None
         )
     
     # Ensure pipeline components are on the correct device

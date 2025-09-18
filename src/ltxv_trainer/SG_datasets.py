@@ -54,7 +54,7 @@ class SOSTokenLatents(nn.Module):
         else:
             # Truncated normal initialization (better for multi-view generation)
             base_token = torch.empty(1, d_model)
-            _trunc_normal_(base_token, std=0.02)
+            _trunc_normal_(base_token, std=0.2)  # Increased from 0.02 to 0.2 for meaningful initialization
         self.register_buffer('base', base_token)  # Non-learnable, fixed initialization
         
         # Increased alpha value for better positional encoding influence
@@ -458,43 +458,35 @@ class PrecomputedDataset(Dataset):
 
     def _make_sos_tensor_like(self, ref: torch.Tensor) -> torch.Tensor:
         """
-        Latent 형식에 맞춰 SOS token 생성
+        Latent 형식에 맞춰 Gaussian noise SOS token 생성
         지원 형식:
-        - [Seq, D]: 직접 SOS 생성
-        - [B, Seq, D]: 배치 차원 유지하여 SOS 생성
+        - [Seq, D]: 직접 noise 생성
+        - [B, Seq, D]: 배치 차원 유지하여 noise 생성
         """
-        device = ref.device if ref.is_cuda else "cpu"
+        device = ref.device
         dtype = ref.dtype
-        
+
         # print(f"ref shape : {ref.shape}")
 
         if ref.dim() == 2:
-            # [Seq, D] 형식
+            # [Seq, D] 형식 - Gaussian noise로 초기화
             seq_len, d_model = ref.shape
-            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
-            with torch.no_grad():
-                out = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
-            return out.to(dtype)
-            
+            out = torch.randn(seq_len, d_model, device=device, dtype=dtype)
+            return out
+
         elif ref.dim() == 3:
-            # [B, Seq, D] 형식
+            # [B, Seq, D] 형식 - Gaussian noise로 초기화
             batch_size, seq_len, d_model = ref.shape
-            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
-            with torch.no_grad():
-                # 각 배치에 대해 동일한 SOS 생성
-                base_sos = sos_gen(seq_len=seq_len, device=device)  # (Seq, D)
-                out = base_sos.unsqueeze(0).expand(batch_size, -1, -1)  # (B, Seq, D)
-            return out.to(dtype)
-            
+            out = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
+            return out
+
         else:
             logging.error(f"[SOS] Unsupported latent tensor shape: {ref.shape}, expected [Seq, D] or [B, Seq, D]")
-            # 폴백: 가장 간단한 형태로 SOS 생성
+            # 폴백: 가장 간단한 형태로 noise 생성
             d_model = ref.shape[-1] if ref.numel() > 0 else 128
             seq_len = ref.shape[-2] if ref.dim() >= 2 else 1
-            sos_gen = SOSTokenLatents(d_model=d_model).to(device)
-            with torch.no_grad():
-                out = sos_gen(seq_len=seq_len, device=device)
-            return out.to(dtype)
+            out = torch.randn(seq_len, d_model, device=device, dtype=dtype)
+            return out
 
 
 

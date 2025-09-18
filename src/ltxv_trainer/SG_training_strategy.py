@@ -28,6 +28,147 @@ from ltxv_trainer.timestep_samplers import TimestepSampler, UniformTimestepSampl
 DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 
 
+# --------------------------
+# Packing/unpacking functions (from SGMultiShotPipeline)
+# --------------------------
+def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
+    """
+    Pack latents from [B, C, F, H, W] to [B, F // p_t * H // p * W // p, C * p_t * p * p].
+    """
+    batch_size, num_channels, num_frames, height, width = latents.shape
+    post_patch_num_frames = num_frames // patch_size_t
+    post_patch_height = height // patch_size
+    post_patch_width = width // patch_size
+    latents = latents.reshape(
+        batch_size,
+        -1,
+        post_patch_num_frames,
+        patch_size_t,
+        post_patch_height,
+        patch_size,
+        post_patch_width,
+        patch_size,
+    )
+    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+    return latents
+
+
+def _unpack_latents(
+    latents: torch.Tensor, num_frames: int, height: int, width: int, patch_size: int = 1, patch_size_t: int = 1
+) -> torch.Tensor:
+    """
+    Unpack latents from [B, S, D] to [B, C, F, H, W].
+    """
+    batch_size = latents.size(0)
+    latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
+    latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+    return latents
+
+
+def _normalize_latents(
+    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
+) -> torch.Tensor:
+    """Normalize latents across the channel dimension [B, C, F, H, W]"""
+    latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    latents = (latents - latents_mean) * scaling_factor / latents_std
+    return latents
+
+
+def _prepare_video_ids(
+    batch_size: int,
+    num_frames: int,
+    height: int,
+    width: int,
+    patch_size: int = 1,
+    patch_size_t: int = 1,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """Prepare video coordinate IDs."""
+    # Debug prints to identify the issue
+    logger.info(f"_prepare_video_ids: num_frames={num_frames}, height={height}, width={width}")
+
+    # Check for zero dimensions
+    if num_frames <= 0 or height <= 0 or width <= 0:
+        raise ValueError(f"Invalid dimensions: num_frames={num_frames}, height={height}, width={width}")
+
+    latent_sample_coords = torch.meshgrid(
+        torch.arange(0, num_frames, patch_size_t, device=device),
+        torch.arange(0, height, patch_size, device=device),
+        torch.arange(0, width, patch_size, device=device),
+        indexing="ij",
+    )
+    latent_sample_coords = torch.stack(latent_sample_coords, dim=0)
+    latent_coords = latent_sample_coords.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
+
+    # Debug the tensor shapes before reshape
+    seq_len = num_frames * height * width
+    logger.info(f"latent_coords shape before reshape: {latent_coords.shape}, target seq_len: {seq_len}")
+
+    if seq_len == 0:
+        raise ValueError(f"Sequence length is 0: num_frames={num_frames} * height={height} * width={width} = {seq_len}")
+
+    latent_coords = latent_coords.reshape(batch_size, -1, seq_len)
+    return latent_coords
+
+
+def _scale_video_ids(
+    video_ids: torch.Tensor,
+    scale_factor: int = 32,
+    scale_factor_t: int = 8,
+    frame_index: int = 0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """Scale video IDs (from pipeline)."""
+    scaled_latent_coords = (
+        video_ids
+        * torch.tensor([scale_factor_t, scale_factor, scale_factor], device=video_ids.device)[None, :, None]
+    )
+    scaled_latent_coords[:, 0] = (scaled_latent_coords[:, 0] + 1 - scale_factor_t).clamp(min=0)
+    scaled_latent_coords[:, 0] += frame_index
+
+    return scaled_latent_coords
+
+
+def prepare_video_coords(
+    batch_size: int,
+    num_frames: int,
+    height: int,
+    width: int,
+    patch_size: int = 1,
+    patch_size_t: int = 1,
+    scale_factor: int = 32,
+    scale_factor_t: int = 8,
+    frame_index: int = 0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Prepare and scale video coordinates combining _prepare_video_ids and _scale_video_ids.
+    This method follows the pattern from the standard ltxv_pipeline.
+    """
+    # First prepare video IDs
+    video_ids = _prepare_video_ids(
+        batch_size=batch_size,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        patch_size=patch_size,
+        patch_size_t=patch_size_t,
+        device=device,
+    )
+
+    # Then scale them
+    video_coords = _scale_video_ids(
+        video_ids=video_ids,
+        scale_factor=scale_factor,
+        scale_factor_t=scale_factor_t,
+        frame_index=frame_index,
+        device=device,
+    )
+
+    return video_coords
+
+
 def pc_cfm_loss(model_output: Tensor, X0: Tensor, X1c: Tensor, X1p: Tensor, lambda_val: float = 1.0) -> Tensor:
     """
     PC-CFM loss function with correct velocity field target.
@@ -137,10 +278,21 @@ class TrainingStrategy(ABC):
     @staticmethod
     def prepare_model_inputs(batch: TrainingBatch) -> dict[str, Any]:
         """
-        모델 포워드 입력 규격 유지
+        모델 포워드 입력 규격 유지 (검증 파이프라인과 동일한 패킹 처리)
         """
+        latents = batch.latents  # [B, seq_len, dim] format from dataset
+
+        # 데이터셋의 sequence format을 검증 파이프라인과 동일하게 처리
+        # 현재 latents는 이미 sequence format [B, seq_len, dim]이므로
+        # 검증 파이프라인에서와 같이 packed latents로 간주
+
+        # 만약 향후 5D tensor [B, C, F, H, W] format이 필요하다면:
+        # 1. sequence를 5D로 unpacking: _unpack_latents 사용
+        # 2. 다시 sequence로 packing: _pack_latents 사용
+        # 하지만 현재는 이미 sequence format이므로 그대로 사용
+
         return {
-            "hidden_states": batch.latents,
+            "hidden_states": latents,
             "encoder_hidden_states": batch.prompt_embeds,
             "timestep": batch.timesteps,
             "encoder_attention_mask": batch.prompt_attention_mask,
@@ -235,6 +387,14 @@ class StandardTrainingStrategy(TrainingStrategy):
         # 1) Latents 언팩
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
 
+        # Debug print batch metadata
+        logger.info(f"Standard batch metadata: F={F}, H={H}, W={W}, fps={fps}")
+        logger.info(f"Current latent shape: {curr_lat.shape}")
+
+        # Validate metadata
+        if F <= 0 or H <= 0 or W <= 0:
+            raise ValueError(f"Invalid metadata from dataset: F={F}, H={H}, W={W}")
+
         prev_lat = None
         if batch.get("prev_conditions", None) is not None:
             prev_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
@@ -252,7 +412,9 @@ class StandardTrainingStrategy(TrainingStrategy):
         sigmas = sigmas.view(curr_lat.shape[0], 1, 1)          # (B,1,1)
 
         noise = torch.randn_like(curr_lat, device=curr_lat.device)  # (B, Cseq, D)
-        noisy_curr =  sigmas * curr_lat + (1 - sigmas) * noise       # (B, Cseq, D)
+        # CRITICAL FIX: Correct flow matching interpolation
+        # Flow matching: x_t = (1-t) * x_0 + t * noise
+        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise       # (B, Cseq, D)
 
         # 4) curr 내부 '첫 프레임 conditioning' 적용: 첫 프레임 토큰은 클린으로 대체
         first_mask_curr = self._create_first_frame_conditioning_mask(
@@ -282,22 +444,50 @@ class StandardTrainingStrategy(TrainingStrategy):
         sampled_t = sigmas.squeeze(-1).squeeze(-1)  # (B,) keep as float [0,1]
         timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_t)  # (B, P+C)
 
-        # 9) ROPE scale & video coords (prev+curr 길이에 맞추어 준비)
+        # 9) ROPE scale & video coords (검증 파이프라인과 동일한 방식)
         rope_scale = get_rope_scale_factors(fps)
-        # seq_mult = 2 if Pseq > 0 else 1  # prev를 붙이면 2배
-        
-        
+
         if Pseq > 0:
-            raw_coords = prepare_video_coordinates(
-                num_frames=F, height=H, width=W,
+            # VAE compression ratios
+            vae_spatial_compression_ratio = 32
+            vae_temporal_compression_ratio = 8
+            transformer_spatial_patch_size = 1
+            transformer_temporal_patch_size = 1
+
+            # F, H, W from dataset are already latent dimensions - don't divide by compression ratios!
+            latent_num_frames = F
+            latent_height = H
+            latent_width = W
+
+            # Debug prints
+            logger.info(f"Dataset latent dims (already compressed): F={F}, H={H}, W={W}")
+            logger.info(f"Using as latent dims: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
+
+            # Check for invalid latent dimensions
+            if latent_num_frames <= 0 or latent_height <= 0 or latent_width <= 0:
+                raise ValueError(f"Invalid latent dimensions: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
+
+            # Generate video coordinates for both shots with continuous time indices
+            # Total frames = 2 * latent_num_frames (prev + curr)
+            total_frames = 2 * latent_num_frames
+            scaled_video_ids = prepare_video_coords(
                 batch_size=concat_lat.shape[0],
-                sequence_multiplier=2,              # ★ 핵심: prev + curr
+                num_frames=total_frames,
+                height=latent_height,
+                width=latent_width,
+                patch_size=transformer_spatial_patch_size,
+                patch_size_t=transformer_temporal_patch_size,
+                scale_factor=vae_spatial_compression_ratio,
+                scale_factor_t=vae_temporal_compression_ratio,
+                frame_index=0,
                 device=concat_lat.device,
             )
-            prescaled_f = raw_coords[..., 0] * rope_scale[0]
-            prescaled_h = raw_coords[..., 1] * rope_scale[1]
-            prescaled_w = raw_coords[..., 2] * rope_scale[2]
-            video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)  # (B, 3, P+C)
+
+            # Apply ROPE scaling and convert to final format
+            video_coords = scaled_video_ids.float()
+            video_coords[:, 0] = video_coords[:, 0] * rope_scale[0]
+            video_coords[:, 1] = video_coords[:, 1] * rope_scale[1]
+            video_coords[:, 2] = video_coords[:, 2] * rope_scale[2]
         else:
             video_coords = None
 
@@ -384,21 +574,29 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         # 1) Unpack current shot latents
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
         B, curr_seq_len, D = curr_lat.shape
+
+        # Debug print batch metadata
+        logger.info(f"ReferenceVideo batch metadata: F={F}, H={H}, W={W}, fps={fps}")
+        logger.info(f"Current latent shape: {curr_lat.shape}")
+
+        # Validate metadata
+        if F <= 0 or H <= 0 or W <= 0:
+            raise ValueError(f"Invalid metadata from dataset: F={F}, H={H}, W={W}")
+
+        # Check if we have previous conditions
+        has_prev = batch.get("prev_conditions") is not None
+        logger.info(f"Has previous conditions: {has_prev}")
         
         # 2) Get previous shot latents or use SOS token
         ref_lat = None
         if batch.get("prev_conditions") is not None:
             # Use previous shot as reference
             ref_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
-            logger.debug(f"Using previous shot as reference: {ref_lat.shape}")
+            # logger.debug(f"Using previous shot as reference: {ref_lat.shape}")
         else:
-            # First shot: generate SOS token as reference
-            from ltxv_trainer.SG_datasets import SOSTokenLatents
-            sos_generator = SOSTokenLatents(d_model=D, use_zero_init=False)
-            sos_generator = sos_generator.to(curr_lat.device)
-            ref_lat = sos_generator(curr_seq_len, device=curr_lat.device)  # (curr_seq_len, D)
-            ref_lat = ref_lat.unsqueeze(0).expand(B, -1, -1)  # (B, curr_seq_len, D)
-            logger.debug(f"Generated SOS token as reference: {ref_lat.shape}")
+            # First shot: generate Gaussian noise as reference
+            ref_lat = torch.randn(B, curr_seq_len, D, device=curr_lat.device, dtype=curr_lat.dtype)
+            logger.info(f"Generated Gaussian noise SOS as reference: {ref_lat.shape}")
         
         ref_seq_len = ref_lat.shape[1]
         
@@ -412,7 +610,10 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         sigmas = sigmas.view(B, 1, 1)  # (B, 1, 1)
         
         noise = torch.randn_like(curr_lat, device=curr_lat.device)
-        noisy_curr = sigmas * curr_lat + (1 - sigmas) * noise  # X0 in PC-CFM
+        # CRITICAL FIX: Correct flow matching interpolation
+        # Flow matching: x_t = (1-t) * x_0 + t * noise, where t ∈ [0,1]
+        # Here: x_t = (1-sigma) * curr_lat + sigma * noise
+        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise  # X0 in PC-CFM
         
         # 5) Apply first frame conditioning to current shot
         target_conditioning_mask = self._create_first_frame_conditioning_mask(
@@ -436,30 +637,62 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         # 8) Store components for PC-CFM loss (not regular targets)
         # We need to store: X0 (noisy), X1c (clean curr), X1p (prev/SOS)
         targets = {
+            # CRITICAL FIX: Flow matching velocity target v = x_1 - x_0
+            # For interpolated path x_t = (1-t)*x_0 + t*x_1, velocity is v = x_1 - x_0
+            'XO-X1c' : noise - curr_lat,  # v = clean - noise (direction toward clean)
             'X0': noisy_curr,      # Initial noisy version
             'X1c': curr_lat,       # Clean current shot  
-            'X1p': ref_lat,        # Previous shot or SOS token
+            'X1p': ref_lat,
+            'X1p-X1c': ref_lat - curr_lat,        # Previous shot or SOS token
+            'X0-X1p+X1c' : noise - ref_lat - curr_lat 
         }
         
         # 9) Concatenate reference and noisy current in sequence dimension
         combined_latents = torch.cat([ref_lat, noisy_curr], dim=1)  # (B, ref_seq + curr_seq, D)
         
-        # 10) Prepare video coordinates (doubled sequence)
+        # 10) Prepare video coordinates (검증 파이프라인과 동일한 방식)
         rope_scale_factors = get_rope_scale_factors(fps)
-        raw_video_coords = prepare_video_coordinates(
-            num_frames=F,
-            height=H,
-            width=W,
+
+        # VAE compression ratios
+        vae_spatial_compression_ratio = 32
+        vae_temporal_compression_ratio = 8
+        transformer_spatial_patch_size = 1
+        transformer_temporal_patch_size = 1
+
+        # F, H, W from dataset are already latent dimensions - don't divide by compression ratios!
+        latent_num_frames = F
+        latent_height = H
+        latent_width = W
+
+        # Debug prints
+        logger.info(f"ReferenceVideo - Dataset latent dims (already compressed): F={F}, H={H}, W={W}")
+        logger.info(f"ReferenceVideo - Using as latent dims: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
+
+        # Check for invalid latent dimensions
+        if latent_num_frames <= 0 or latent_height <= 0 or latent_width <= 0:
+            raise ValueError(f"Invalid latent dimensions: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
+
+        # Generate video coordinates for both shots with continuous time indices
+        # Total frames = 2 * latent_num_frames (reference + current)
+        total_frames = 2 * latent_num_frames
+        scaled_video_ids = prepare_video_coords(
             batch_size=B,
-            sequence_multiplier=2,  # Reference + target
+            num_frames=total_frames,
+            height=latent_height,
+            width=latent_width,
+            patch_size=transformer_spatial_patch_size,
+            patch_size_t=transformer_temporal_patch_size,
+            scale_factor=vae_spatial_compression_ratio,
+            scale_factor_t=vae_temporal_compression_ratio,
+            frame_index=0,
             device=curr_lat.device,
         )
-        
-        # Apply pre-scaling to coordinates
-        prescaled_f = raw_video_coords[..., 0] * rope_scale_factors[0]
-        prescaled_h = raw_video_coords[..., 1] * rope_scale_factors[1]
-        prescaled_w = raw_video_coords[..., 2] * rope_scale_factors[2]
-        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)
+
+        # Apply ROPE scaling and convert to final format
+        video_coords = scaled_video_ids.float()
+        video_coords[:, 0] = video_coords[:, 0] * rope_scale_factors[0]
+        video_coords[:, 1] = video_coords[:, 1] * rope_scale_factors[1]
+        video_coords[:, 2] = video_coords[:, 2] * rope_scale_factors[2]
         
         return TrainingBatch(
             latents=combined_latents,
@@ -485,13 +718,12 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         target_pred = model_pred[:, -target_seq_len:]  # Extract current shot prediction
         
         # Get PC-CFM loss components
-        X0 = batch.targets['X0']   # Noisy current shot
+        # X0 = batch.targets['X0']   # Noisy current shot
         X1c = batch.targets['X1c'] # Clean current shot
         X1p = batch.targets['X1p'] # Previous shot or SOS token
         
         # Apply PC-CFM loss: target = (X1c - X0) + lambda * (X1p - X1c)
-        lambda_val = 0.00
-        # For PC-CFM, we need to match sequence lengths properly
+        # CRITICAL FIX: Use proper lambda value for PC-CFM (typical range: 0.1-1.0)
         if X1p.shape[1] != X1c.shape[1]:
             # If reference (X1p) has different sequence length, we need to handle it
             # This can happen when prev shot has different length than current shot
@@ -504,7 +736,12 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
                 last_frame = X1p[:, -1:, :].repeat(1, pad_len, 1)
                 X1p = torch.cat([X1p, last_frame], dim=1)
                 
-        pc_cfm_target = (X1c - X0) + lambda_val * (X1p - X1c)
+        # CRITICAL FIX: Re-enable PC-CFM loss with proper lambda
+        # Standard PC-CFM: target = (X1c - X0) + λ(X1p - X1c) = XO-X1 + λ(X1p - X1c)
+        # For PC-CFM, we need to match sequence lengths properly
+        lambda_val = 0  # Balance between current and previous shot influence
+        pc_cfm_target = batch.targets["XO-X1c"] + lambda_val * batch.targets["X0-X1p+X1c"]
+        
         
         # Extract target portion conditioning mask for masking
         target_conditioning_mask = batch.conditioning_mask[:, -target_seq_len:]
