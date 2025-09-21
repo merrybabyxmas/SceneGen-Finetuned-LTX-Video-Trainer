@@ -73,6 +73,7 @@ class ScenarioDebugger:
 
         self.loaded_components = {}
         self.results = {}
+        self.prompt_info = {}  # Store prompt information for JSON export
 
     def load_base_components(self):
         """Load base model components with memory optimizations."""
@@ -229,7 +230,7 @@ class ScenarioDebugger:
             use_zero_init=False
         ).to(self.device)
 
-        # First create the base SGMultiShotPipeline
+        # First create the base SGMultiShotPipeline with token support
         sg_pipeline = SGMultiShotPipeline(
             vae=self.loaded_components["vae"],
             text_encoder=self.loaded_components["text_encoder"],
@@ -237,6 +238,8 @@ class ScenarioDebugger:
             scheduler=self.loaded_components["scheduler"],
             transformer=transformer,
             sos_token_generator=sos_token_generator,
+            use_tokens=True,  # Enable token processing for debugging
+            hidden_dim=3072   # Standard hidden dimension for tokens
         )
 
         # Enable memory optimizations for base pipeline
@@ -261,33 +264,65 @@ class ScenarioDebugger:
         logger.info("✅ Multishot Validation Pipeline created")
         return pipeline
 
-    def generate_video(self, pipeline, prompt: str, scenario_name: str, use_multishot: bool = False):
+    def generate_video(self, pipeline, prompt: str, scenario_name: str, use_multishot: bool = False, scenario: str = None):
         """Generate video using the given pipeline."""
         logger.info(f"Generating video for scenario: {scenario_name}")
 
         set_seed(42)  # For reproducible results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # Create scenario subfolder
+        scenario_dir = self.output_dir / "scenario"
+        scenario_dir.mkdir(exist_ok=True)
+
+        # Collect prompt information for JSON export
+        prompt_data = {
+            "scenario_name": scenario_name,
+            "prompt": prompt,
+            "timestamp": timestamp,
+            "use_multishot": use_multishot,
+            "scenario_tokens": scenario,
+            "generation_params": self.generation_params.copy()
+        }
+
         try:
             if use_multishot and hasattr(pipeline, 'generate_multi_shot_sequence'):
                 # Use multi-shot generation
-                video_paths = pipeline.generate_multi_shot_sequence(
-                    prompt=prompt,
-                    output_dir=self.output_dir,
-                    global_step=0,  # Not used for naming
-                    video_dims=(self.generation_params["width"],
-                               self.generation_params["height"],
-                               self.generation_params["num_frames"]),
-                    num_shots=1,
-                    inference_steps=self.generation_params["num_inference_steps"],
-                    guidance_scale=self.generation_params["guidance_scale"],
-                    seed=42,
-                )
+                multishot_params = {
+                    "prompt": prompt,
+                    "output_dir": self.output_dir,
+                    "global_step": 0,  # Not used for naming
+                    "video_dims": (self.generation_params["width"],
+                                  self.generation_params["height"],
+                                  self.generation_params["num_frames"]),
+                    "num_shots": 1,
+                    "inference_steps": self.generation_params["num_inference_steps"],
+                    "guidance_scale": self.generation_params["guidance_scale"],
+                    "seed": 42,
+                }
 
-                # Rename generated videos to include scenario name
+                # Add scenario if provided
+                if scenario is not None:
+                    multishot_params["scenario"] = scenario
+                    logger.info(f"Using scenario for token processing: '{scenario}'")
+
+                video_paths = pipeline.generate_multi_shot_sequence(**multishot_params)
+
+                # Rename generated videos to follow new naming convention
                 renamed_paths = []
                 for i, original_path in enumerate(video_paths):
-                    new_path = self.output_dir / f"{scenario_name}_shot_{i+1}_{timestamp}.mp4"
+                    # Format: t2v_shot1_transition_shot2.mp4 or v2v_shot1_transition_shot2.mp4
+                    if "lora" in scenario_name:
+                        prefix = "v2v"  # video to video (with LoRA)
+                    else:
+                        prefix = "t2v"  # text to video (base model)
+
+                    if i == 0:
+                        filename = f"{prefix}_shot{i+1}_{timestamp}.mp4"
+                    else:
+                        filename = f"{prefix}_shot{i}_transition_shot{i+1}_{timestamp}.mp4"
+
+                    new_path = scenario_dir / filename
                     if Path(original_path).exists():
                         Path(original_path).rename(new_path)
                         renamed_paths.append(str(new_path))
@@ -296,23 +331,50 @@ class ScenarioDebugger:
                 # Return the first shot path as primary result, but log all
                 primary_video_path = renamed_paths[0] if renamed_paths else None
                 logger.info(f"✅ Multi-shot generation completed: {len(renamed_paths)} shots saved")
+
+                # Store prompt information with video paths
+                prompt_data["video_paths"] = renamed_paths
+                prompt_data["generation_type"] = "multishot"
+                self.prompt_info[f"{scenario_name}_{timestamp}"] = prompt_data
+
                 return primary_video_path, True, None
 
             else:
                 # Use standard single-shot generation
                 generator = torch.Generator(device=self.device).manual_seed(42)
-                result = pipeline(
-                    prompt=prompt,
-                    generator=generator,
+
+                # Prepare generation parameters
+                generation_params = {
+                    "prompt": prompt,
+                    "generator": generator,
                     **self.generation_params
-                )
+                }
+
+                # Add scenario if provided and pipeline supports it
+                if scenario is not None and hasattr(pipeline, 'transformer') and hasattr(pipeline, 'use_tokens'):
+                    generation_params["scenario"] = scenario
+                    logger.info(f"Using scenario for standard pipeline: '{scenario}'")
+
+                result = pipeline(**generation_params)
                 frames = result.frames[0] if hasattr(result, 'frames') else result
 
-                # Save video
-                video_path = self.output_dir / f"{scenario_name}_{timestamp}.mp4"
+                # Save video with new naming convention
+                if "lora" in scenario_name:
+                    prefix = "v2v"  # video to video (with LoRA)
+                else:
+                    prefix = "t2v"  # text to video (base model)
+
+                filename = f"{prefix}_single_shot_{timestamp}.mp4"
+                video_path = scenario_dir / filename
                 export_to_video(frames, str(video_path), fps=8)
 
                 logger.info(f"✅ Single-shot video saved: {video_path}")
+
+                # Store prompt information with video path
+                prompt_data["video_paths"] = [str(video_path)]
+                prompt_data["generation_type"] = "single_shot"
+                self.prompt_info[f"{scenario_name}_{timestamp}"] = prompt_data
+
                 return str(video_path), True, None
 
         except Exception as e:
@@ -346,7 +408,7 @@ class ScenarioDebugger:
             "error": error
         }
 
-    def run_scenario_2(self, prompt: str):
+    def run_scenario_2(self, prompt: str, scenario: str = None):
         """Scenario 2: LoRA X & multi shot generation (Base model + multishot pipeline, 1 shot)"""
         logger.info("🔬 Running Scenario 2: Base Model + Multishot Pipeline (1 shot)")
 
@@ -354,7 +416,7 @@ class ScenarioDebugger:
         try:
             pipeline = self.create_multishot_pipeline(use_lora=False)
             video_path, success, error = self.generate_video(
-                pipeline, prompt, "scenario_2_base_multishot", use_multishot=True
+                pipeline, prompt, "scenario_2_base_multishot", use_multishot=True, scenario=scenario
             )
         except Exception as e:
             video_path, success, error = None, False, str(e)
@@ -368,7 +430,8 @@ class ScenarioDebugger:
             "multishot": True,
             "video_path": video_path,
             "success": success,
-            "error": error
+            "error": error,
+            "scenario": scenario
         }
 
     def run_scenario_3(self, prompt: str):
@@ -396,7 +459,7 @@ class ScenarioDebugger:
             "error": error
         }
 
-    def run_scenario_4(self, prompt: str):
+    def run_scenario_4(self, prompt: str, scenario: str = None):
         """Scenario 4: LoRA O & multi shot generation (LoRA + multishot pipeline, 1 shot)"""
         logger.info("🔬 Running Scenario 4: LoRA Model + Multishot Pipeline (1 shot)")
 
@@ -404,7 +467,7 @@ class ScenarioDebugger:
         try:
             pipeline = self.create_multishot_pipeline(use_lora=True)
             video_path, success, error = self.generate_video(
-                pipeline, prompt, "scenario_4_lora_multishot", use_multishot=True
+                pipeline, prompt, "scenario_4_lora_multishot", use_multishot=True, scenario=scenario
             )
         except Exception as e:
             video_path, success, error = None, False, str(e)
@@ -418,10 +481,11 @@ class ScenarioDebugger:
             "multishot": True,
             "video_path": video_path,
             "success": success,
-            "error": error
+            "error": error,
+            "scenario": scenario
         }
 
-    def run_all_scenarios(self, prompt: str):
+    def run_all_scenarios(self, prompt: str, scenario: str = None):
         """Run all four scenarios."""
         logger.info("🚀 Starting 4-Scenario Debug Session")
         logger.info("="*60)
@@ -430,6 +494,8 @@ class ScenarioDebugger:
         logger.info(f"LoRA Path: {self.lora_path}")
         logger.info(f"Device: {self.device}")
         logger.info(f"Output Directory: {self.output_dir}")
+        if scenario:
+            logger.info(f"Token Scenario: {scenario}")
         logger.info("="*60)
 
         # Load base components once
@@ -437,10 +503,10 @@ class ScenarioDebugger:
 
         # Run all scenarios
         scenarios = [
-            ("Scenario 1", self.run_scenario_1),
-            ("Scenario 2", self.run_scenario_2),
-            ("Scenario 3", self.run_scenario_3),
-            ("Scenario 4", self.run_scenario_4),
+            ("Scenario 1", lambda p: self.run_scenario_1(p)),
+            ("Scenario 2", lambda p: self.run_scenario_2(p, scenario)),
+            ("Scenario 3", lambda p: self.run_scenario_3(p)),
+            ("Scenario 4", lambda p: self.run_scenario_4(p, scenario)),
         ]
 
         for scenario_name, scenario_func in scenarios:
@@ -499,6 +565,15 @@ class ScenarioDebugger:
             json.dump(self.results, f, indent=2)
         logger.info(f"📄 Detailed report saved: {report_path}")
 
+        # Save prompt information to JSON file
+        if self.prompt_info:
+            prompt_info_path = self.output_dir / "scenario" / "prompt_info.json"
+            with open(prompt_info_path, 'w', encoding='utf-8') as f:
+                json.dump(self.prompt_info, f, indent=2, ensure_ascii=False)
+            logger.info(f"📝 Prompt information saved: {prompt_info_path}")
+        else:
+            logger.warning("⚠️  No prompt information to save")
+
 
 def main():
     parser = argparse.ArgumentParser(description="4-Scenario LTXV Video Generation Debugger")
@@ -540,6 +615,12 @@ def main():
         choices=["float32", "float16", "bfloat16"],
         help="Model dtype"
     )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default=None,
+        help="Token scenario string for testing (e.g., 'shot1,stable,shot2,transition,shot3')"
+    )
 
     args = parser.parse_args()
     timestamp = time.strftime("%Y%m%d_%H%M%S")  # 예: 20250915_003012
@@ -576,7 +657,7 @@ def main():
         output_dir=args.output_dir
     )
 
-    debugger.run_all_scenarios(args.prompt)
+    debugger.run_all_scenarios(args.prompt, args.scenario)
 
 
 if __name__ == "__main__":

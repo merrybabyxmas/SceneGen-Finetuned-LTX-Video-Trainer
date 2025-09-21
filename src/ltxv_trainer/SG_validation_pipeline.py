@@ -13,6 +13,8 @@ import torch
 from torch.amp import autocast
 from diffusers.utils import export_to_video
 from copy import deepcopy
+import json
+from datetime import datetime
 
 from ltxv_trainer import logger
 from ltxv_trainer.SG_multishot_pipeline import SGMultiShotPipeline
@@ -35,6 +37,8 @@ class MultiShotValidationPipeline:
         self.accelerator = accelerator
         # No longer using SOS token generator - using Gaussian noise instead
         self.sos_token_generator = None
+        # Store validation prompt information for JSON export
+        self.validation_info = {}
         
     def generate_multi_shot_sequence(
         self,
@@ -47,10 +51,12 @@ class MultiShotValidationPipeline:
         guidance_scale: float = 7.5,
         negative_prompt: Optional[str] = None,
         seed: int = 42,
+        scenario: Optional[str] = None,
+        validation_type: Optional[str] = None,
     ) -> List[Path]:
         """
         Generate a multi-shot video sequence using a single prompt.
-        
+
         Args:
             prompt: Single text prompt for the entire multi-shot sequence
             num_shots: Number of shots to generate
@@ -61,15 +67,39 @@ class MultiShotValidationPipeline:
             guidance_scale: CFG guidance scale
             negative_prompt: Negative prompt for all shots
             seed: Random seed
-            
+            scenario: Optional scenario string for token-based preprocessing
+            validation_type: Type of validation ("t2v_validation" or "v2v_validation")
+
         Returns:
             List of paths to generated video files
         """
 
-        
+
         output_dir.mkdir(exist_ok=True, parents=True)
+
+        # Create scenario subfolder for organized storage
+        scenario_dir = output_dir / "scenario"
+        scenario_dir.mkdir(exist_ok=True, parents=True)
+
         video_paths = []
         width, height, frames = video_dims
+
+        # Collect validation information for JSON export
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        validation_data = {
+            "prompt": prompt,
+            "timestamp": timestamp,
+            "global_step": global_step,
+            "video_dims": video_dims,
+            "num_shots": num_shots,
+            "inference_steps": inference_steps,
+            "guidance_scale": guidance_scale,
+            "negative_prompt": negative_prompt,
+            "seed": seed,
+            "scenario_tokens": scenario,
+            "validation_type": validation_type,
+            "generation_type": "multishot_validation"
+        }
         
         # Storage for previous shot conditioning
         prev_latent = None
@@ -92,7 +122,15 @@ class MultiShotValidationPipeline:
                 "generator": generator,
                 "output_reference_comparison": True,
                 "return_latents": True,  # Return latents for next shot conditioning
+                "save_full_sequence": True,  # Save full transformer output including reference tokens
+                "validation_type": validation_type,  # Pass validation type for proper filename generation
+                "step": global_step,  # Pass step number for filename
             }
+
+            # Add scenario to pipeline inputs if provided
+            if scenario is not None:
+                pipeline_inputs["scenario"] = scenario
+                logger.info(f"Using scenario for shot {shot_idx + 1}: '{scenario}'")
 
             # Handle conditioning for multi-shot generation
             if shot_idx == 0:
@@ -162,7 +200,14 @@ class MultiShotValidationPipeline:
                                     prev_frames_to_save = prev_frames_to_save[0]  # Take the first (and likely only) list
                                     logger.info(f"Flattened prev frames length: {len(prev_frames_to_save)}")
                             
-                            prev_video_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}_prev.mp4"
+                            # Use the same prefix logic for prev frames
+                            if validation_type == "t2v_validation":
+                                prefix_prev = "t2v"
+                            elif validation_type == "v2v_validation":
+                                prefix_prev = "v2v"
+                            else:
+                                prefix_prev = "v2v" if scenario else "t2v"
+                            prev_video_path = scenario_dir / f"{prefix_prev}_shot{shot_idx + 1}_prev_step_{global_step:06d}.mp4"
                             export_to_video(prev_frames_to_save, str(prev_video_path), fps=24)
                             logger.info(f"Saved prev frames to {prev_video_path.name}")
                         except Exception as prev_save_error:
@@ -174,7 +219,14 @@ class MultiShotValidationPipeline:
                                     logger.info("Trying alternative save approach...")
                                     # Try to access the first video if it's a batch
                                     alt_prev_frames = result.prev_frames[0] if isinstance(result.prev_frames[0], list) else result.prev_frames
-                                    prev_video_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}_prev.mp4"
+                                    # Use the same prefix logic for prev frames
+                                    if validation_type == "t2v_validation":
+                                        prefix_prev = "t2v"
+                                    elif validation_type == "v2v_validation":
+                                        prefix_prev = "v2v"
+                                    else:
+                                        prefix_prev = "v2v" if scenario else "t2v"
+                                    prev_video_path = scenario_dir / f"{prefix_prev}_shot{shot_idx + 1}_prev_step_{global_step:06d}.mp4"
                                     export_to_video(alt_prev_frames, str(prev_video_path), fps=24)
                                     logger.info(f"Alternative save successful: {prev_video_path.name}")
                                 except Exception as alt_error:
@@ -227,11 +279,40 @@ class MultiShotValidationPipeline:
                         if isinstance(videos[0], list):
                             logger.info(f"   first video frames: {len(videos[0])}")
                 
-                video_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}.mp4"
+                # Create filename with new naming convention based on validation type
+                # Determine prefix based on validation type
+                if validation_type == "t2v_validation":
+                    prefix = "t2v"
+                elif validation_type == "v2v_validation":
+                    prefix = "v2v"
+                else:
+                    # Fallback: use v2v for scenario-based validation
+                    prefix = "v2v" if scenario else "t2v"
+
+                if shot_idx == 0:
+                    filename = f"{prefix}_shot{shot_idx + 1}_step_{global_step:06d}.mp4"
+                else:
+                    filename = f"{prefix}_shot{shot_idx}_transition_shot{shot_idx + 1}_step_{global_step:06d}.mp4"
+
+                video_path = scenario_dir / filename
                 export_to_video(videos[0] if isinstance(videos, list) else videos, str(video_path), fps=24)
                 video_paths.append(video_path)
                 logger.info(f"Saved shot {shot_idx + 1} to {video_path.name} (expected {frame_count} frames)")
-        
+
+        # Store validation information with video paths
+        validation_data["video_paths"] = [str(path) for path in video_paths]
+        validation_key = f"validation_step_{global_step:06d}_{timestamp}"
+        self.validation_info[validation_key] = validation_data
+
+        # Save validation information to JSON file
+        validation_info_path = scenario_dir / "validation_info.json"
+        try:
+            with open(validation_info_path, 'w', encoding='utf-8') as f:
+                json.dump(self.validation_info, f, indent=2, ensure_ascii=False)
+            logger.info(f"📝 Validation information saved: {validation_info_path}")
+        except Exception as e:
+            logger.error(f"Failed to save validation info: {e}")
+
         return video_paths
     
     def _save_intermediate_steps(self, intermediate_steps: List[Dict], output_dir: Path, global_step: int, shot_idx: int):
@@ -332,7 +413,15 @@ class MultiShotValidationPipeline:
                     else:
                         timestep_val = step_data['timestep']  # Use original timestep from step_data
                     
-                    intermediate_path = output_dir / f"multishot_step_{global_step:06d}_shot_{shot_idx:02d}_denoise_{step_num:02d}_t{timestep_val:.3f}.mp4"
+                    # Save intermediate steps to scenario folder with new naming
+                    scenario_dir = output_dir / "scenario"
+                    scenario_dir.mkdir(exist_ok=True, parents=True)
+
+                    # Use consistent prefix logic for intermediate steps
+                    # Note: We need to get validation_type from the calling context
+                    # For now, we'll use a default prefix until we can pass validation_type properly
+                    prefix_inter = "v2v"  # Default for intermediate steps
+                    intermediate_path = scenario_dir / f"{prefix_inter}_shot{shot_idx + 1}_denoise_{step_num:02d}_t{timestep_val:.3f}_step_{global_step:06d}.mp4"
                     
                     # Handle nested list structure like prev frames
                     video_to_save = video_frames
@@ -362,13 +451,15 @@ class MultiShotValidationPipeline:
 def create_multi_shot_validation_pipeline(
     scheduler,
     vae,
-    text_encoder, 
+    text_encoder,
     tokenizer,
     transformer,
     device: torch.device,
     accelerator,
     d_model: int = 128,
-    conditioning_mode: str = "none"
+    conditioning_mode: str = "none",
+    use_tokens: bool = True,
+    hidden_dim: int = 3072
 ) -> MultiShotValidationPipeline:
     """Create a multi-shot validation pipeline."""
     
@@ -449,7 +540,9 @@ def create_multi_shot_validation_pipeline(
             text_encoder=unwrapped_text_encoder,
             tokenizer=tokenizer,
             transformer=unwrapped_transformer,
-            sos_token_generator=None
+            sos_token_generator=None,
+            use_tokens=use_tokens,
+            hidden_dim=hidden_dim
         )
     
     # Ensure pipeline components are on the correct device

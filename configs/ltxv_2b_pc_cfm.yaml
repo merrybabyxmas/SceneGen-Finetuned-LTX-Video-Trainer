@@ -19,7 +19,7 @@ conditioning:
 
 optimization:
   learning_rate: 2e-4  
-  steps: 1000
+  steps: 2000
   batch_size: 1
   gradient_accumulation_steps: 1  
   max_grad_norm: 1  
@@ -47,7 +47,7 @@ validation:
   video_dims: [768, 448, 17]
   seed: 42
   inference_steps: 50
-  interval: 50
+  interval: 200
   videos_per_prompt: 1
   guidance_scale: 3.5
   skip_initial_validation: True
@@ -78,5 +78,5 @@ wandb:
 debug:
   enable_debug_frames: true
   debug_gpu_id: 3
-  debug_interval: 50
+  debug_interval: 200
   enable_batch_visualization: true

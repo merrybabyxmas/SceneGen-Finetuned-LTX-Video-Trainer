@@ -27,6 +27,7 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from ltxv_trainer.SG_multishot_pipeline import SGMultiShotPipeline
 from ltxv_trainer.SG_datasets import SOSTokenLatents
+from ltxv_trainer.scenario_video_saver import ScenarioVideoSaver
 from ltxv_trainer import logger
 
 
@@ -298,6 +299,7 @@ def generate_multi_shot_sequence(
     guidance_scale: float = 3.0,
     seed: Optional[int] = None,
     output_dir: str = "outputs",
+    scenario_string: Optional[str] = None,
     save_individual_shots: bool = True,
 ) -> List[str]:
     """
@@ -313,13 +315,20 @@ def generate_multi_shot_sequence(
         num_inference_steps: Denoising steps
         guidance_scale: CFG guidance scale
         seed: Random seed
-        output_dir: Output directory
+        output_dir: Base output directory
+        scenario_string: Optional scenario string for organized output directories
         save_individual_shots: Whether to save individual shots
 
     Returns:
         List of output video paths
     """
-    os.makedirs(output_dir, exist_ok=True)
+    # Initialize scenario video saver if scenario is provided
+    if scenario_string:
+        video_saver = ScenarioVideoSaver(output_dir)
+        logger.info(f"🎬 Using scenario-based saving: '{scenario_string}'")
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+        video_saver = None
 
     if seed is not None:
         generator = torch.Generator().manual_seed(seed)
@@ -351,23 +360,50 @@ def generate_multi_shot_sequence(
         frames = result["frames"][0]  # Get first (and only) batch
         all_frames.extend(frames)
 
-        # Save individual shot if requested
-        if save_individual_shots:
-            shot_path = os.path.join(output_dir, f"shot_{shot_idx + 1:02d}.mp4")
-            export_to_video(frames, shot_path, fps=24)
-            output_paths.append(shot_path)
-            logger.info(f"Saved shot {shot_idx + 1} to {shot_path}")
+        # Store shot frames for later saving
+        if shot_idx == 0:
+            shot_frames_list = []
+        shot_frames_list.append(frames)
 
         # Update previous latents for next shot
         if "latents" in result:
             previous_latents = result["latents"]
             logger.info(f"Using latents from shot {shot_idx + 1} as reference for next shot")
 
-    # Save complete sequence
-    full_sequence_path = os.path.join(output_dir, "full_sequence.mp4")
-    export_to_video(all_frames, full_sequence_path, fps=24)
-    output_paths.append(full_sequence_path)
-    logger.info(f"Saved full sequence to {full_sequence_path}")
+    # Save videos using scenario-based or traditional approach
+    if video_saver and scenario_string:
+        # Use scenario-based saving
+        saved_paths_dict = video_saver.save_inference_videos(
+            scenario_string=scenario_string,
+            shot_frames_list=shot_frames_list,
+            full_sequence_frames=all_frames,
+            fps=24,
+            save_individual_shots=save_individual_shots
+        )
+
+        output_paths = []
+        if save_individual_shots:
+            output_paths.extend([str(p) for p in saved_paths_dict['individual_shots']])
+        output_paths.extend([str(p) for p in saved_paths_dict['full_sequence']])
+
+        logger.info(f"🎬 ✅ Scenario-based saving completed: {len(output_paths)} files")
+    else:
+        # Traditional saving approach
+        output_paths = []
+
+        # Save individual shots if requested
+        if save_individual_shots:
+            for shot_idx, frames in enumerate(shot_frames_list):
+                shot_path = os.path.join(output_dir, f"shot_{shot_idx + 1:02d}.mp4")
+                export_to_video(frames, shot_path, fps=24)
+                output_paths.append(shot_path)
+                logger.info(f"Saved shot {shot_idx + 1} to {shot_path}")
+
+        # Save complete sequence
+        full_sequence_path = os.path.join(output_dir, "full_sequence.mp4")
+        export_to_video(all_frames, full_sequence_path, fps=24)
+        output_paths.append(full_sequence_path)
+        logger.info(f"Saved full sequence to {full_sequence_path}")
 
     return output_paths
 
@@ -440,7 +476,8 @@ def main():
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
 
     # Output arguments
-    parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="outputs", help="Base output directory")
+    parser.add_argument("--scenario", type=str, help="Scenario string for organizing outputs (e.g., 'shot1,stable,shot2,transition,shot3')")
     parser.add_argument("--no_individual_shots", action="store_true", help="Don't save individual shots")
 
     # System arguments
@@ -495,6 +532,9 @@ def main():
 
     # Generate sequence
     logger.info("Starting generation...")
+    if args.scenario:
+        logger.info(f"🎬 Using scenario: '{args.scenario}'")
+
     output_paths = generate_multi_shot_sequence(
         pipeline=pipeline,
         prompts=prompts,
@@ -506,6 +546,7 @@ def main():
         guidance_scale=args.guidance_scale,
         seed=args.seed,
         output_dir=args.output_dir,
+        scenario_string=args.scenario,
         save_individual_shots=not args.no_individual_shots,
     )
 

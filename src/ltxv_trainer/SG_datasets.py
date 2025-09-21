@@ -415,6 +415,14 @@ class PrecomputedDataset(Dataset):
                 curr_data = result[latents_output_key]
                 result["prev_conditions"] = self._make_sos_like(curr_data)
                     
+        # Add scenario metadata for token processing
+        if prev_shot_idx is not None:
+            # Multi-shot scenario: prev_shot -> stable -> transition -> curr_shot -> stable
+            result["scenario"] = "ref_shot,transition,curr_shot"
+        else:
+            # Single shot scenario: just curr_shot (첫 번째 샷)
+            result["scenario"] = "ref_shot,transition,curr_shot"
+
         result["idx"] = index
         return result
     # ---------- helpers ----------

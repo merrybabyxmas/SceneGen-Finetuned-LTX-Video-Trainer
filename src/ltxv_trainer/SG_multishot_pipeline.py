@@ -15,8 +15,11 @@
 # limitations under the License.
 
 import inspect
+import os
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 import PIL.Image
 import torch
@@ -28,7 +31,7 @@ from diffusers.models.transformers import LTXVideoTransformer3DModel
 from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
+from diffusers.utils import export_to_video, is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import T5EncoderModel, T5TokenizerFast
@@ -231,6 +234,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline, LTXVideoCondition
 from ltxv_trainer.SG_datasets import SOSTokenLatents
 from ltxv_trainer import logger
+from ltxv_trainer.token_utils import (
+    VideoTokenEmbeddings,
+    preprocess_multishot_with_tokens,
+    create_token_aware_conditioning_mask,
+    extract_token_positions
+)
 
 
 class SGMultiShotPipeline(LTXConditionPipeline):
@@ -248,6 +257,8 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         tokenizer,
         transformer,
         sos_token_generator: Optional[SOSTokenLatents] = None,
+        use_tokens: bool = True,
+        hidden_dim: int = 128,
     ):
         super().__init__(
             scheduler=scheduler,
@@ -261,6 +272,15 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         object.__setattr__(self, '_debug_hooks_enabled', False)
         object.__setattr__(self, '_debug_latents', {})
 
+        # Initialize token embeddings for multi-shot video generation
+        self.use_tokens = use_tokens
+        if self.use_tokens:
+            self.token_embeddings = VideoTokenEmbeddings(hidden_dim=hidden_dim)
+            logger.info(f"SGMultiShotPipeline: Initialized video token embeddings with hidden_dim={hidden_dim}")
+        else:
+            self.token_embeddings = None
+            logger.info("SGMultiShotPipeline: Token embeddings disabled")
+
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -268,6 +288,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             transformer=transformer,
             scheduler=scheduler,
         )
+
+        # Initialize prompt info storage for JSON export
+        self.prompt_info = {}
 
         self.vae_spatial_compression_ratio = (
             self.vae.spatial_compression_ratio if getattr(self, "vae", None) is not None else 32
@@ -343,7 +366,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         negative_prompt_embeds=None,
         prompt_attention_mask=None,
         negative_prompt_attention_mask=None,
-        reference_latents=None,  # Add support for reference_latents
+        scenario=None,  # Add support for scenario
         **kwargs,
     ):
         """
@@ -379,20 +402,20 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         if negative_prompt_attention_mask is not None:
             parent_kwargs['negative_prompt_attention_mask'] = negative_prompt_attention_mask
 
-        # Add other kwargs (excluding reference_latents)
+        # Add other kwargs (excluding scenario)
         for k, v in kwargs.items():
-            if k != 'reference_latents':
+            if k not in ['scenario']:
                 parent_kwargs[k] = v
 
         # Call parent class check_inputs
         super().check_inputs(**parent_kwargs)
 
-        # Additional validation for reference_latents if needed
-        if reference_latents is not None:
-            if not isinstance(reference_latents, torch.Tensor):
-                raise TypeError("reference_latents must be a torch.Tensor")
-            if reference_latents.dim() != 5:
-                raise ValueError("reference_latents must be a 5D tensor [B, C, F, H, W]")
+        # Additional validation for scenario if needed
+        if scenario is not None:
+            if not isinstance(scenario, str):
+                raise TypeError("scenario must be a string")
+            if not scenario.strip():
+                raise ValueError("scenario cannot be empty")
 
     def _get_t5_prompt_embeds(
         self,
@@ -463,7 +486,13 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         if prompt is not None:
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            if isinstance(prompt_embeds, dict):
+                batch_size = prompt_embeds["prompt_embeds"].shape[0]
+                prompt_attention_mask = prompt_embeds.get("prompt_attention_mask", prompt_attention_mask)
+                prompt_embeds = prompt_embeds["prompt_embeds"]
+            elif isinstance(prompt_embeds, torch.Tensor):
+                batch_size = prompt_embeds.shape[0]
+
 
         if prompt_embeds is None:
             prompt_embeds, prompt_attention_mask = self._get_t5_prompt_embeds(
@@ -643,65 +672,6 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         latents = torch.where(need_to_noise, noised_latents, latents)
         return latents
 
-    def _encode_reference_video_to_latents(
-        self,
-        reference_video: List,
-        height: int,
-        width: int,
-        num_frames: int,
-        device: torch.device
-    ) -> torch.Tensor:
-        """Encode reference video to latents for conditioning."""
-        try:
-            import torch.nn.functional as F
-            from torchvision import transforms
-            import numpy as np
-
-            # Load and preprocess video frames
-            frames = []
-            for frame in reference_video:
-                if hasattr(frame, 'convert'):  # PIL Image
-                    frame = frame.convert('RGB')
-                    frame = transforms.ToTensor()(frame)
-                elif isinstance(frame, np.ndarray):
-                    frame = torch.from_numpy(frame).float() / 255.0
-                    if frame.dim() == 3 and frame.shape[2] == 3:  # (H, W, C) -> (C, H, W)
-                        frame = frame.permute(2, 0, 1)
-
-                # Resize to target dimensions
-                frame = F.interpolate(frame.unsqueeze(0), size=(height, width), mode='bilinear', align_corners=False)
-                frames.append(frame.squeeze(0))
-
-            # Stack frames and normalize to [-1, 1]
-            video_tensor = torch.stack(frames[:num_frames])  # (F, C, H, W)
-            video_tensor = video_tensor * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-
-            # Rearrange to (C, F, H, W) format expected by VAE
-            video_tensor = video_tensor.permute(1, 0, 2, 3)  # (C, F, H, W)
-
-            # Add batch dimension
-            video_tensor = video_tensor.unsqueeze(0).to(device)  # (1, C, F, H, W)
-
-            with torch.no_grad():
-                # Move VAE to same device and correct dtype
-                vae_device = next(self.vae.parameters()).device
-                vae_dtype = next(self.vae.parameters()).dtype
-
-                # Ensure video tensor is on correct device and dtype
-                video_tensor = video_tensor.to(device=vae_device, dtype=vae_dtype)
-
-                # Encode video to latents
-                latents = self.vae.encode(video_tensor).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-
-                # Move back to target device
-                latents = latents.to(device)
-
-            return latents
-
-        except Exception as e:
-            logger.warning(f"Failed to encode reference video: {e}")
-            return None
 
     def prepare_latents(
         self,
@@ -829,6 +799,195 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
         return latents, conditioning_mask, video_ids, extra_conditioning_num_latents
 
+    def prepare_latents_with_scenario(
+        self,
+        scenario: Optional[str] = None,
+        shot_latents: Optional[Dict[str, torch.Tensor]] = None,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 704,
+        num_frames: int = 161,
+        generator: Optional[torch.Generator] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Prepare latents with scenario-based reference handling similar to training strategy.
+        This method integrates reference latent preparation into the scenario processing logic.
+
+        Args:
+            scenario: Scenario string for multi-shot video generation
+            shot_latents: Dictionary containing reference shot latents
+            batch_size: Batch size
+            num_channels_latents: Number of latent channels
+            height: Video height
+            width: Video width
+            num_frames: Number of frames
+            generator: Random generator
+            device: Device
+            dtype: Data type
+
+        Returns:
+            Tuple of (latents, conditioning_mask, video_coords, extra_conditioning_num_latents)
+        """
+        # Calculate latent dimensions
+        num_latent_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        latent_height = height // self.vae_spatial_compression_ratio
+        latent_width = width // self.vae_spatial_compression_ratio
+
+        # Generate initial latents (current shot)
+        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        current_latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        # If no scenario provided, return standard latents
+        if scenario is None or not self.use_tokens:
+            # Pack latents and return standard format
+            packed_latents = self._pack_latents(
+                current_latents,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size
+            )
+
+            # No conditioning mask
+            conditioning_mask = torch.zeros(
+                batch_size, packed_latents.shape[1], dtype=torch.bool, device=device
+            )
+
+            # Prepare video coordinates
+            video_coords = self._prepare_video_ids(
+                batch_size, num_latent_frames, latent_height, latent_width,
+                self.transformer_spatial_patch_size, self.transformer_temporal_patch_size, device
+            )
+            video_coords = self._scale_video_ids(
+                video_coords, self.vae_spatial_compression_ratio,
+                self.vae_temporal_compression_ratio, 0, device
+            )
+
+            return packed_latents, conditioning_mask, video_coords, 0
+
+        # Scenario-based processing with reference handling
+        logger.info(f"🎭 Preparing latents with scenario: '{scenario}'")
+
+        # Prepare shot latents dictionary
+        scenario_shot_latents = {}
+
+        # Convert current latents to shot format [F, H, W, C]
+        current_shot = current_latents[0].permute(1, 2, 3, 0)  # [C, F, H, W] -> [F, H, W, C]
+
+        # Determine shot names based on available shot_latents
+        if shot_latents:
+            # Use provided shot latents - copy all available shots
+            scenario_shot_latents.update(shot_latents)
+            logger.info(f"🎭 Using provided shot latents: {list(shot_latents.keys())}")
+
+            # Add current shot as the last shot in sequence
+            shot_names = sorted([name for name in shot_latents.keys() if name.startswith('shot')])
+            if shot_names:
+                # Extract shot numbers and find the next one
+                shot_numbers = [int(name.replace('shot', '')) for name in shot_names if name.replace('shot', '').isdigit()]
+                if shot_numbers:
+                    current_shot_name = f"shot{shot_numbers[-1]}"
+                else:
+                    current_shot_name = "shot2"  # Default if parsing fails
+            else:
+                current_shot_name = "shot2"  # Default
+        else:
+            # No reference provided - generate two-shot sequence with SOS
+            logger.info(f"🎭 Generating SOS token as reference for shot1")
+            sos_reference = torch.randn_like(current_shot)
+            scenario_shot_latents["shot1"] = sos_reference
+            current_shot_name = "shot2"
+
+        scenario_shot_latents[current_shot_name] = current_shot
+        logger.info(f"🎭 Current shot assigned as: {current_shot_name}")
+
+        # Apply scenario preprocessing
+        try:
+            from ltxv_trainer.token_utils import preprocess_with_scenario, create_scenario_conditioning_mask
+
+            tokenized_sequence, scenario_metadata = preprocess_with_scenario(
+                shot_latents=scenario_shot_latents,
+                scenario=scenario,
+                token_embeddings=self.token_embeddings,
+                device=device
+            )
+
+            # Convert tokenized sequence to packed format
+            total_frames = tokenized_sequence.shape[0]
+            seq_len = total_frames * latent_height * latent_width
+            tokenized_flat = tokenized_sequence.view(total_frames, -1)  # (Total_F, H*W*C)
+            tokenized_flat = tokenized_flat.view(seq_len, -1)  # (Total_F*H*W, C)
+            packed_latents = tokenized_flat.unsqueeze(0).expand(batch_size, -1, -1)  # (B, Total_F*H*W, C)
+
+            # Create scenario conditioning mask
+            bool_mask, strength_mask = create_scenario_conditioning_mask(
+                metadata=scenario_metadata,
+                conditioning_strength=1.0,
+                stable_token_strength=0.5,
+                transition_token_strength=0.8,
+                target_shot=current_shot_name,  # Use dynamic current shot name
+                device=device
+            )
+
+            # Expand conditioning mask for spatial dimensions
+            conditioning_mask = bool_mask.repeat_interleave(latent_height * latent_width)
+            conditioning_mask = conditioning_mask.unsqueeze(0).expand(batch_size, -1)
+
+            # Prepare video coordinates for the full tokenized sequence
+            video_coords = self._prepare_video_ids(
+                batch_size, total_frames, latent_height, latent_width,
+                self.transformer_spatial_patch_size, self.transformer_temporal_patch_size, device
+            )
+            video_coords = self._scale_video_ids(
+                video_coords, self.vae_spatial_compression_ratio,
+                self.vae_temporal_compression_ratio, 0, device
+            )
+
+            # Calculate how many latents are from conditioning (reference) part
+            if hasattr(scenario_metadata, 'shot_ranges'):
+                prev_shot_range = scenario_metadata['shot_ranges'].get('prev_shot', (0, 0))
+                extra_conditioning_num_latents = prev_shot_range[1] * latent_height * latent_width
+            else:
+                extra_conditioning_num_latents = num_latent_frames * latent_height * latent_width
+
+            logger.info(f"🎭 Scenario latent preparation completed:")
+            logger.info(f"🎭   Packed latents shape: {packed_latents.shape}")
+            logger.info(f"🎭   Conditioning mask shape: {conditioning_mask.shape}")
+            logger.info(f"🎭   Video coords shape: {video_coords.shape}")
+            logger.info(f"🎭   Extra conditioning latents: {extra_conditioning_num_latents}")
+
+            return packed_latents, conditioning_mask, video_coords, extra_conditioning_num_latents
+
+        except Exception as e:
+            logger.warning(f"🎭 Failed scenario latent preparation: {e}")
+            logger.warning(f"🎭 Falling back to standard latent preparation")
+            import traceback
+            logger.warning(f"🎭 Scenario Debug: Traceback: {traceback.format_exc()}")
+
+
+            # Fallback to standard processing
+            packed_latents = self._pack_latents(
+                current_latents,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size
+            )
+
+            conditioning_mask = torch.zeros(
+                batch_size, packed_latents.shape[1], dtype=torch.bool, device=device
+            )
+
+            video_coords = self._prepare_video_ids(
+                batch_size, num_latent_frames, latent_height, latent_width,
+                self.transformer_spatial_patch_size, self.transformer_temporal_patch_size, device
+            )
+            video_coords = self._scale_video_ids(
+                video_coords, self.vae_spatial_compression_ratio,
+                self.vae_temporal_compression_ratio, 0, device
+            )
+
+            return packed_latents, conditioning_mask, video_coords, 0
+
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -894,8 +1053,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
-        reference_latents: Optional[torch.Tensor] = None,
-        reference_video: Optional[List] = None,
+        scenario: Optional[str] = None,
         output_reference_comparison: bool = False,
         return_latents: bool = False,
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -910,13 +1068,22 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 256,
+        shot_latents: Dict[str, torch.Tensor] = None,
+        save_video: bool = True,
+        output_dir: Optional[str] = None,
+        video_filename: Optional[str] = None,
+        fps: int = 24,
+        validation_type: Optional[str] = None,
+        step: Optional[int] = None,
+        save_full_sequence: bool = False
     ):
         """
-        Generate video using the SGMultiShotPipeline with SOS token and reference video support.
-        
+        Generate video using the SGMultiShotPipeline with scenario-based reference handling.
+
         Args:
             prompt: Text prompt for video generation
-            reference_latents: Optional reference latents tensor for multi-shot generation
+            scenario: Optional scenario string for token-based preprocessing (e.g., "shot1,stable,shot2,transition,shot3")
+            shot_latents: Optional dictionary containing reference shot latents
             height: Video height
             width: Video width
             num_frames: Number of frames to generate
@@ -925,12 +1092,37 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             generator: Random generator for reproducible results
             output_type: Output format ("pil" or "tensor")
             return_dict: Whether to return a dictionary
-        
+            save_video: Whether to save the generated video as MP4
+            output_dir: Directory to save the video (defaults to current directory)
+            video_filename: Filename for the saved video (auto-generated if not provided)
+            fps: Frames per second for the saved video
+            validation_type: Type of validation ("t2v_validation" or "v2v_validation")
+            step: Training step number (included in filename if provided)
+            save_full_sequence: Whether to save the full transformer output sequence (including reference tokens)
+
         Returns:
             Generated video frames
-        
+
         Examples:
-        
+            # Basic generation
+            video = pipeline("A cat playing in the garden", num_frames=161)
+
+            # Multi-shot generation with scenario
+            video = pipeline(
+                prompt="A cat playing in the garden",
+                scenario="shot1,stable,shot2,transition,shot3",
+                shot_latents={"shot1": reference_latents}
+            )
+
+            # Generate and save video as MP4
+            video = pipeline(
+                prompt="A cat playing in the garden",
+                num_frames=161,
+                save_video=True,
+                output_dir="./outputs",
+                video_filename="cat_garden.mp4",
+                fps=24
+            )
         """
        
 
@@ -954,21 +1146,31 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
-            reference_latents=reference_latents,
+            scenario=scenario,
         )
 
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
         self._current_timestep = None
+        
+        # logger.info(f"prompt embeds : {prompt_embeds}")
 
+
+        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        latent_height = height // self.vae_spatial_compression_ratio
+        latent_width = width // self.vae_spatial_compression_ratio
+        
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            if isinstance(prompt_embeds, dict):
+                batch_size = prompt_embeds["prompt_embeds"].shape[0]
+            elif isinstance(prompt_embeds, torch.Tensor):
+                batch_size = prompt_embeds.shape[0]
 
         if conditions is not None:
             if not isinstance(conditions, list):
@@ -1015,7 +1217,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             max_sequence_length=max_sequence_length,
             device=device,
         )
+        
         if self.do_classifier_free_guidance:
+            logger.info(f"text prompt embeds : {prompt_embeds, negative_prompt_embeds}")
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
@@ -1051,168 +1255,44 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     )
                 conditioning_tensors.append(condition_tensor)
 
-        # 4. Prepare latent variables
+        # 4. Prepare latent variables with scenario support
         num_channels_latents = self.transformer.config.in_channels
-        latents, conditioning_mask, video_coords, extra_conditioning_num_latents = self.prepare_latents(
-            conditioning_tensors,
-            strength,
-            frame_index,
-            batch_size=batch_size * num_videos_per_prompt,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            generator=generator,
-            device=device,
-            dtype=torch.float32,
-        )
 
-        # 4.5. Process reference video/latents conditioning
-        reference_num_latents = 0
-
-        # Handle reference_video by converting to latents
-        if reference_video is not None and reference_latents is None:
-            logger.info("🎥 Processing reference_video to latents")
-            reference_latents = self._encode_reference_video_to_latents(
-                reference_video, height, width, num_frames, device
-            )
-
-        # Calculate latent dimensions early for use in reference processing
-        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = height // self.vae_spatial_compression_ratio
-        latent_width = width // self.vae_spatial_compression_ratio
-
-        if reference_latents is not None:
-            logger.info(f"  reference latents : {reference_latents.shape}")
-            # Use provided reference latents directly (already encoded and normalized)
-            reference_latents = reference_latents.to(device, dtype=torch.float32)
-
-            # Expand for batch and num_videos_per_prompt if needed
-            if reference_latents.size(0) != batch_size * num_videos_per_prompt:
-                reference_latents = reference_latents.repeat(batch_size * num_videos_per_prompt, 1, 1, 1, 1)
-
-            # Use reference_latents directly without normalization since we receive them directly
-            reference_latents = reference_latents.to(device, dtype = torch.float32)
-
-            # Ensure normalized latents format (if needed)
-            # Assume reference_latents are already properly normalized from trainer
-
-            # Create "clean" coordinates for reference video (as if no frame conditioning applied)
-            ref_latent_frames = reference_latents.size(2)
-            ref_latent_height = reference_latents.size(3)
-            ref_latent_width = reference_latents.size(4)
-
-            reference_coords = self._prepare_video_ids(
-                batch_size * num_videos_per_prompt,
-                ref_latent_frames,
-                ref_latent_height,
-                ref_latent_width,
-                patch_size_t=self.transformer_temporal_patch_size,
-                patch_size=self.transformer_spatial_patch_size,
+        # Use unified latent preparation method that handles scenarios
+        if scenario is not None and self.use_tokens and self.token_embeddings is not None:
+            # Use new scenario-based latent preparation
+            latents, conditioning_mask, video_coords, extra_conditioning_num_latents = self.prepare_latents_with_scenario(
+                scenario=scenario,
+                shot_latents=shot_latents,  # Will be passed from caller if available
+                batch_size=batch_size * num_videos_per_prompt,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                generator=generator,
                 device=device,
+                dtype=torch.float32,
             )
-            reference_coords = self._scale_video_ids(
-                reference_coords,
-                scale_factor=self.vae_spatial_compression_ratio,
-                scale_factor_t=self.vae_temporal_compression_ratio,
-                frame_index=0,  # Reference latents start at frame 0
+        else:
+            # Fall back to standard latent preparation with image/video conditioning
+            latents, conditioning_mask, video_coords, extra_conditioning_num_latents = self.prepare_latents(
+                conditioning_tensors,
+                strength,
+                frame_index,
+                batch_size=batch_size * num_videos_per_prompt,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                generator=generator,
                 device=device,
+                dtype=torch.float32,
             )
 
-            # Pack reference latents
-            logger.info(f"Before pack - reference_latents shape: {reference_latents.shape}")
-            reference_latents = self._pack_latents(
-                reference_latents,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            )
+        # Initialize latents for conditioning if needed
+        init_latents = latents.clone() if is_conditioning_image_or_video else None
 
-            # Handle dimension mismatch: if reference latents have expanded channels (due to patching),
-            # we need to reduce them to match the original VAE latent dimensions
-            original_channels = self.vae.config.latent_channels  # Should be 128 for LTX
-            if reference_latents.size(2) != original_channels:
-                if reference_latents.size(2) % original_channels == 0:
-                    # Reduce expanded channels back to original dimensions by averaging
-                    repeat_factor = reference_latents.size(2) // original_channels
-                    reference_latents = reference_latents.view(
-                        reference_latents.size(0),
-                        reference_latents.size(1),
-                        original_channels,
-                        repeat_factor
-                    ).mean(dim=-1)
-                    logger.info(f"Reduced reference latents channels from {reference_latents.size(2) * repeat_factor} to {original_channels}")
-
-            reference_num_latents = reference_latents.size(1)
-            logger.info(f"After pack - reference_latents shape: {reference_latents.shape}, num_latents: {reference_num_latents}")
-            logger.info(f"Target latents shape: {latents.shape}")
-
-            # Concatenate reference latents at the beginning: [reference_latents, frame_conditions, target_latents]
-            latents = torch.cat([reference_latents, latents], dim=1)
-
-            # Generate continuous video coordinates for both reference and current shots
-            reference_coords = reference_coords.float()
-
-            # Instead of concatenating separate coordinates, create continuous coordinates
-            # Total sequence length = reference_num_latents + current_sequence_length
-            total_sequence_length = reference_num_latents + video_coords.size(2)
-
-            # Create a single coordinate tensor with continuous time indices
-            # Reference shot: frames 0 to latent_num_frames-1
-            # Current shot: frames latent_num_frames to 2*latent_num_frames-1
-            batch_size = video_coords.size(0)
-            total_frames = 2 * latent_num_frames  # Reference + current
-
-            # Generate coordinates for the entire sequence at once
-            combined_coords = self._prepare_video_ids(
-                batch_size,
-                total_frames,
-                video_coords.size(3) if len(video_coords.shape) > 3 else ref_latent_height,
-                video_coords.size(4) if len(video_coords.shape) > 4 else ref_latent_width,
-                patch_size_t=self.transformer_temporal_patch_size,
-                patch_size=self.transformer_spatial_patch_size,
-                device=device,
-            )
-            combined_coords = self._scale_video_ids(
-                combined_coords,
-                scale_factor=self.vae_spatial_compression_ratio,
-                scale_factor_t=self.vae_temporal_compression_ratio,
-                frame_index=0,
-                device=device,
-            )
-            video_coords = combined_coords
-            video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
-
-            # Update conditioning mask to include reference (frozen = strength 1.0)
-            if conditioning_mask is not None:
-                reference_conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                conditioning_mask = torch.cat([reference_conditioning_mask, conditioning_mask], dim=1)
-            else:
-                # If no frame conditioning, still create mask for reference
-                conditioning_mask = torch.ones(
-                    (batch_size * num_videos_per_prompt, reference_num_latents), device=device, dtype=torch.float32
-                )
-                # Add zeros for target latents
-                # Ensure reference_num_latents is not None
-                if reference_num_latents is None:
-                    reference_num_latents = 0
-                target_conditioning_mask = torch.zeros(
-                    (batch_size * num_videos_per_prompt, latents.size(1) - reference_num_latents),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
-
-
-            logger.info(f"  conditioning mask input : {conditioning_mask.shape} = B : {batch_size * num_videos_per_prompt}, reference_num_latents : {reference_num_latents}")
-
-        video_coords = video_coords.float()
-        if reference_latents is None:
-            video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
-
-        init_latents = latents.clone() if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0 else None
-
+        # Update video coordinates for classifier-free guidance
         if self.do_classifier_free_guidance:
             video_coords = torch.cat([video_coords, video_coords], dim=0)
 
@@ -1231,6 +1311,9 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         if hasattr(self, '_debug_capture_enabled') and self._debug_capture_enabled:
             logger.info(f"inference input shape : {latents.shape}")
             self._debug_valid_input_latents = latents.detach().clone()
+        else:
+            logger.info(f"training inference input shape : {latents.shape}")
+
 
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1257,7 +1340,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 # Capture input latents for debugging (first timestep only)
                 if i == 0:
                     self._capture_debug_latents("input", latents)
-                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video:
                     if conditioning_mask is not None:
                         conditioning_mask_model_input = (
                             torch.cat([conditioning_mask, conditioning_mask])
@@ -1270,7 +1353,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0]).unsqueeze(-1).float()
-                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video:
                     if conditioning_mask_model_input is not None:
                         timestep = torch.min(timestep, (1 - conditioning_mask_model_input) * 1000.0)
 
@@ -1295,7 +1378,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 denoised_latents = self.scheduler.step(
                     -noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
                 )[0]
-                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video:
                     if conditioning_mask is not None:
                         tokens_to_denoise_mask = (t / 1000 - 1e-6 < (1.0 - conditioning_mask)).unsqueeze(-1)
                         latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
@@ -1303,7 +1386,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                         latents = denoised_latents
 
                 # Update latents
-                if is_conditioning_image_or_video or reference_latents is not None or reference_num_latents > 0:
+                if is_conditioning_image_or_video:
                     pass  # latents already updated above
                 else:
                     latents = denoised_latents
@@ -1332,190 +1415,466 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-        # Handle reference latents output processing
-        if reference_latents is not None and output_reference_comparison:
-            # Split latents: [reference_latents, frame_conditions, target_latents]
-            reference_latents_out = latents[:, :reference_num_latents]
-            remaining_latents = latents[:, reference_num_latents:]
-
-            # Remove frame conditioning from remaining latents if needed
-            if is_conditioning_image_or_video:
-                target_latents_out = remaining_latents[:, extra_conditioning_num_latents:]
-            else:
-                target_latents_out = remaining_latents
-
-            # Process both reference and target latents
-            videos = []
-            for curr_latents in [reference_latents_out, target_latents_out]:
-                if output_type == "latent":
-                    curr_video = curr_latents
-                else:
-                    curr_latents = self._unpack_latents(
-                        curr_latents,
-                        latent_num_frames,
-                        latent_height,
-                        latent_width,
-                        self.transformer_spatial_patch_size,
-                        self.transformer_temporal_patch_size,
-                    )
-                    curr_latents = self._denormalize_latents(
-                        curr_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
-                    )
-                    curr_latents = curr_latents.to(prompt_embeds.dtype)
-
-                    if not self.vae.config.timestep_conditioning:
-                        timestep = None
-                    else:
-                        noise = torch.randn(
-                            curr_latents.shape, generator=generator, device=device, dtype=curr_latents.dtype
-                        )
-                        if not isinstance(decode_timestep, list):
-                            decode_timestep = [decode_timestep] * batch_size
-                        if decode_noise_scale is None:
-                            decode_noise_scale = decode_timestep
-                        elif not isinstance(decode_noise_scale, list):
-                            decode_noise_scale = [decode_noise_scale] * batch_size
-
-                        timestep = torch.tensor(decode_timestep, device=device, dtype=curr_latents.dtype)
-                        decode_noise_scale = torch.tensor(decode_noise_scale, device=device, dtype=curr_latents.dtype)[
-                            :, None, None, None, None
-                        ]
-                        curr_latents = (1 - decode_noise_scale) * curr_latents + decode_noise_scale * noise
-
-                    curr_video = self.vae.decode(curr_latents, timestep, return_dict=False)[0]
-                    curr_video = self.video_processor.postprocess_video(curr_video, output_type=output_type)
-                videos.append(curr_video)
-
-            # Concatenate videos side-by-side (along width dimension for visual output)
-            if output_type == "latent":
-                video = torch.cat(videos, dim=0)
-            # For video tensors, shape is [B, C, F, H, W] or list of PIL images
-            elif isinstance(videos[0], list):
-                # Handle PIL images case - concatenate each frame side by side
-                video = []
-                for batch_idx in range(len(videos[0])):
-                    combined_video = []
-                    for frame_idx in range(len(videos[0][batch_idx])):
-                        ref_frame = videos[0][batch_idx][frame_idx]
-                        gen_frame = videos[1][batch_idx][frame_idx]
-                        # Create side-by-side comparison
-                        import PIL.Image
-
-                        if isinstance(ref_frame, PIL.Image.Image) and isinstance(gen_frame, PIL.Image.Image):
-                            combined_width = ref_frame.width + gen_frame.width
-                            combined_height = max(ref_frame.height, gen_frame.height)
-                            combined_frame = PIL.Image.new("RGB", (combined_width, combined_height))
-                            combined_frame.paste(ref_frame, (0, 0))
-                            combined_frame.paste(gen_frame, (ref_frame.width, 0))
-                            combined_video.append(combined_frame)
-                        else:
-                            combined_video.append(gen_frame)  # Fallback to generated only
-                    video.append(combined_video)
-            else:
-                # Handle tensor case - concatenate along width dimension (dim=4)
-                video = torch.cat(videos, dim=4)
-        else:
-            # Regular processing - just remove conditioning parts and output generated video
-            if reference_latents is not None or reference_num_latents > 0:
-                # Remove reference latents
-                latents = latents[:, reference_num_latents:]
-
-            if is_conditioning_image_or_video:
-                latents = latents[:, extra_conditioning_num_latents:]
-
-            latents = self._unpack_latents(
-                latents,
-                latent_num_frames,
-                latent_height,
-                latent_width,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            )
-
-            if output_type == "latent":
-                video = latents
-            else:
-                latents = self._denormalize_latents(
-                    latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
-                )
-                latents = latents.to(prompt_embeds.dtype)
-
-                if not self.vae.config.timestep_conditioning:
-                    timestep = None
-                else:
-                    noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-                    if not isinstance(decode_timestep, list):
-                        decode_timestep = [decode_timestep] * batch_size
-                    if decode_noise_scale is None:
-                        decode_noise_scale = decode_timestep
-                    elif not isinstance(decode_noise_scale, list):
-                        decode_noise_scale = [decode_noise_scale] * batch_size
-
-                    timestep = torch.tensor(decode_timestep, device=device, dtype=latents.dtype)
-                    decode_noise_scale = torch.tensor(decode_noise_scale, device=device, dtype=latents.dtype)[
-                        :, None, None, None, None
-                    ]
-                    latents = (1 - decode_noise_scale) * latents + decode_noise_scale * noise
-
-                video = self.vae.decode(latents, timestep, return_dict=False)[0]
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
 
         logger.info(f"total latent shape : {latents.shape}")
 
         # Offload all models
         self.maybe_free_model_hooks()
 
+        # Decode latents to video if needed for return
+        if not return_latents or output_type != "latent":
+            # Decode final video for return
+            if is_conditioning_image_or_video:
+                logger.info(f"modified conditioning latents: {extra_conditioning_num_latents}")
+                decode_latents = latents[:, extra_conditioning_num_latents:]
+            else:
+                decode_latents = latents
+
+            # Unpack for decoding
+            # Calculate actual number of frames from sequence length
+            sequence_length = decode_latents.shape[1]  # [B, Seq, D]
+            actual_num_frames = sequence_length // (latent_height * latent_width)
+            logger.info(f"🔍 Decode latents: seq_len={sequence_length}, calculated_frames={actual_num_frames}, latent_h={latent_height}, latent_w={latent_width}")
+
+            decode_latents_unpacked = self._unpack_latents(
+                decode_latents,
+                actual_num_frames,
+                latent_height,
+                latent_width,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            )
+
+            # Denormalize and decode
+            decode_latents_unpacked = self._denormalize_latents(
+                decode_latents_unpacked, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+            )
+
+            with torch.no_grad():
+                # Prepare latents for decoding (based on original LTX pipeline logic)
+                curr_latents = decode_latents_unpacked / self.vae.config.scaling_factor
+                curr_latents = curr_latents.to(prompt_embeds.dtype)
+
+                # Handle timestep conditioning based on VAE configuration
+                if not self.vae.config.timestep_conditioning:
+                    timestep = None
+                else:
+                    # Use decode_timestep parameter if available, otherwise default to 0.0
+                    if 'decode_timestep' in locals() and decode_timestep is not None:
+                        current_decode_timestep = decode_timestep
+                        current_decode_noise_scale = decode_noise_scale
+                    else:
+                        # Default values for clean decoding
+                        current_decode_timestep = 0.0
+                        current_decode_noise_scale = None
+
+                    noise = torch.randn(
+                        curr_latents.shape, generator=generator, device=device, dtype=curr_latents.dtype
+                    )
+
+                    if not isinstance(current_decode_timestep, list):
+                        current_decode_timestep = [current_decode_timestep] * curr_latents.shape[0]
+                    if current_decode_noise_scale is None:
+                        current_decode_noise_scale = current_decode_timestep
+                    elif not isinstance(current_decode_noise_scale, list):
+                        current_decode_noise_scale = [current_decode_noise_scale] * curr_latents.shape[0]
+
+                    timestep = torch.tensor(current_decode_timestep, device=device, dtype=curr_latents.dtype)
+                    decode_noise_scale_tensor = torch.tensor(current_decode_noise_scale, device=device, dtype=curr_latents.dtype)[
+                        :, None, None, None, None
+                    ]
+                    curr_latents = (1 - decode_noise_scale_tensor) * curr_latents + decode_noise_scale_tensor * noise
+
+                video = self.vae.decode(curr_latents, timestep, return_dict=False)[0]
+
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+
+            # Save video as MP4 if requested
+            saved_video_path = None
+            logger.info(f"save_video : {save_video} video : {video}")
+            if save_video and video is not None:
+                saved_video_path = self._save_video_as_mp4(video, output_dir, video_filename, fps, prompt, scenario, validation_type, step)
+
+            # Save full sequence video if requested
+            full_sequence_video_path = None
+            if save_full_sequence and latents is not None:
+                logger.info("🎬 [FULL_SEQ] Generating full sequence video (including reference tokens)...")
+                full_sequence_video_path = self._save_full_sequence_video(
+                    latents=latents,
+                    output_dir=output_dir,
+                    fps=fps,
+                    prompt=prompt,
+                    scenario=scenario,
+                    validation_type=validation_type,
+                    step=step,
+                    prompt_embeds=prompt_embeds,
+                    latent_height=latent_height,
+                    latent_width=latent_width
+                )
+        else:
+            video = None
+            saved_video_path = None
+
+    def _save_full_sequence_video(
+        self,
+        latents: torch.Tensor,
+        output_dir: Optional[str] = None,
+        fps: int = 24,
+        prompt: Optional[str] = None,
+        scenario: Optional[str] = None,
+        validation_type: Optional[str] = None,
+        step: Optional[int] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        latent_height: int = None,
+        latent_width: int = None
+    ) -> str:
+        """
+        Save the full transformer output sequence as a video, including reference tokens.
+        """
+        try:
+            # Determine output directory
+            if output_dir is None:
+                output_dir = os.getcwd()
+
+            scenario_dir = os.path.join(output_dir, "scenario")
+            os.makedirs(scenario_dir, exist_ok=True)
+
+            # Create filename for full sequence using similar logic to _save_video_as_mp4
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Determine prefix based on validation type
+            if validation_type == "t2v_validation":
+                prefix = "full_sequence_t2v"
+            elif validation_type == "v2v_validation":
+                prefix = "full_sequence_v2v"
+            else:
+                # Fallback logic based on scenario presence
+                if scenario:
+                    prefix = "full_sequence_v2v"  # Has scenario = video-to-video
+                else:
+                    prefix = "full_sequence_t2v"  # No scenario = text-to-video
+
+            # Create step suffix if step is provided
+            step_suffix = f"_step_{step:06d}" if step is not None else ""
+
+            # Use new naming convention based on scenario
+            if scenario:
+                # Try to extract shot information from scenario
+                scenario_parts = scenario.split(",")
+                shot_info = [part.strip() for part in scenario_parts if part.strip().startswith("shot")]
+
+                if len(shot_info) >= 2:
+                    # Multi-shot with transitions: full_sequence_prefix_shot1_transition_shot2_step_000123.mp4
+                    video_filename = f"{prefix}_shot1_transition_shot2{step_suffix}_{timestamp}.mp4"
+                elif len(shot_info) == 1:
+                    # Single shot: full_sequence_prefix_shot1_step_000123.mp4
+                    video_filename = f"{prefix}_shot1{step_suffix}_{timestamp}.mp4"
+                else:
+                    # Fallback with scenario info: full_sequence_prefix_scenario_info_step_000123.mp4
+                    scenario_clean = scenario.replace(",", "_").replace(" ", "_")
+                    video_filename = f"{prefix}_{scenario_clean}{step_suffix}_{timestamp}.mp4"
+            else:
+                # No scenario: full_sequence_prefix_step_000123.mp4
+                video_filename = f"{prefix}{step_suffix}_{timestamp}.mp4"
+            video_path = os.path.join(scenario_dir, video_filename)
+
+            # Use the entire latents tensor without slicing
+            logger.info(f"🎬 [FULL_SEQ] Decoding full sequence latents: {latents.shape}")
+
+            # Denormalize and decode the full latents
+            latents_mean = self.vae.config.latents_mean
+            latents_std = self.vae.config.latents_std
+            scaling_factor = self.vae.config.scaling_factor
+
+            # Unpack and denormalize the latents
+            unpacked_latents = self._unpack_latents(
+                latents,
+                num_frames=latents.shape[1] // (latent_height * latent_width),  # Calculate frames from sequence length
+                height=latent_height,
+                width=latent_width
+            )
+
+            denormalized_latents = self._denormalize_latents(
+                unpacked_latents, latents_mean, latents_std, scaling_factor
+            )
+
+            # Decode with VAE
+            logger.info(f"🎬 [FULL_SEQ] VAE decoding latents shape: {denormalized_latents.shape}")
+            with torch.no_grad():
+                video_tensor = self.vae.decode(denormalized_latents.to(self.vae.dtype)).sample
+
+            # Convert to video format expected by export_to_video
+            video_tensor = (video_tensor / 2 + 0.5).clamp(0, 1)
+            video_frames = video_tensor.squeeze(0).permute(1, 2, 3, 0).cpu()  # [F, H, W, C]
+
+            # Convert to PIL Images
+            video_pil = []
+            for frame_idx in range(video_frames.shape[0]):
+                frame = video_frames[frame_idx]
+                frame_pil = Image.fromarray((frame.numpy() * 255).astype(np.uint8))
+                video_pil.append(frame_pil)
+
+            # Save using export_to_video
+            export_to_video(video_pil, video_path, fps=fps)
+
+            logger.info(f"🎬 [FULL_SEQ] Full sequence video saved: {video_path}")
+            return video_path
+
+        except Exception as e:
+            logger.error(f"🎬 [FULL_SEQ] Error saving full sequence video: {str(e)}")
+            import traceback
+            logger.error(f"🎬 [FULL_SEQ] Traceback: {traceback.format_exc()}")
+            return None
+
         # Prepare return values
         if return_latents:
             # Return both generated video and latents for next shot
-            if reference_latents is not None or reference_num_latents > 0:
-                # Unpack to standard latent format [B, C, F, H, W]
-                unpacked_latents = self._unpack_latents(
-                    latents,
-                    latent_num_frames,
-                    latent_height,
-                    latent_width,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                )
-                logger.info(f"unpacked latents shape : {unpacked_latents.shape}")
-                logger.info(f"latnets mean shape : {self.vae.latents_mean.shape}")
-                logger.info(f"latnets std shape : {self.vae.latents_std.shape}")
-
-                # Denormalize latents for reuse
-                unpacked_latents = self._denormalize_latents(
-                    unpacked_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
-                )
+            # Extract output latents (skip conditioning part if present)
+            if is_conditioning_image_or_video:
+                output_latents = latents[:, extra_conditioning_num_latents:]
             else:
-                # No reference case - return all latents
-                if is_conditioning_image_or_video:
-                    output_latents = latents[:, extra_conditioning_num_latents:]
-                else:
-                    output_latents = latents
+                output_latents = latents
+            
+            # Unpack to standard latent format [B, C, F, H, W]
+            # Calculate actual number of frames from sequence length
+            output_sequence_length = output_latents.shape[1]  # [B, Seq, D]
+            actual_output_frames = output_sequence_length // (latent_height * latent_width)
+            logger.info(f"🔍 Return latents: seq_len={output_sequence_length}, calculated_frames={actual_output_frames}, latent_h={latent_height}, latent_w={latent_width}")
 
-                # Unpack to standard latent format [B, C, F, H, W]
-                unpacked_latents = self._unpack_latents(
-                    output_latents,
-                    latent_num_frames,
-                    latent_height,
-                    latent_width,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                )
+            unpacked_latents = self._unpack_latents(
+                output_latents,
+                actual_output_frames,
+                latent_height,
+                latent_width,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            )
 
-                # Denormalize latents for reuse
-                unpacked_latents = self._denormalize_latents(
-                    unpacked_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
-                )
+            # Denormalize latents for reuse
+            unpacked_latents = self._denormalize_latents(
+                unpacked_latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+            )
 
             if not return_dict:
-                return (video, unpacked_latents)
+                if saved_video_path:
+                    return (video, unpacked_latents, saved_video_path)
+                else:
+                    return (video, unpacked_latents)
             # Use dict to include latents since LTXPipelineOutput may not support latents attribute
-            return {"frames": video, "latents": unpacked_latents}
+            result = {"frames": video, "latents": unpacked_latents}
+            if saved_video_path:
+                result["saved_video_path"] = saved_video_path
+            return result
         else:
             if not return_dict:
-                return (video,)
-            return LTXPipelineOutput(frames=video)
+                if saved_video_path:
+                    return (video, saved_video_path)
+                else:
+                    return (video,)
+            result = LTXPipelineOutput(frames=video)
+            if saved_video_path:
+                # Since LTXPipelineOutput might not support extra attributes,
+                # return dict instead when video is saved
+                return {"frames": video, "saved_video_path": saved_video_path}
+            return result
+
+    def _save_video_as_mp4(
+        self,
+        video: List[PIL.Image.Image],
+        output_dir: Optional[str] = None,
+        video_filename: Optional[str] = None,
+        fps: int = 24,
+        prompt: Optional[str] = None,
+        scenario: Optional[str] = None,
+        validation_type: Optional[str] = None,
+        step: Optional[int] = None
+    ) -> str:
+        """
+        Save generated video frames as MP4 file using export_to_video.
+
+        Args:
+            video: List of PIL Images representing video frames
+            output_dir: Directory to save the video (defaults to current directory)
+            video_filename: Filename for the saved video (auto-generated if not provided)
+            fps: Frames per second for the saved video
+            prompt: Text prompt used for generation (used in auto-generated filename)
+            scenario: Scenario string used (used in auto-generated filename)
+            validation_type: Type of validation ("t2v_validation" or "v2v_validation")
+            step: Training step number (included in auto-generated filename)
+
+        Returns:
+            str: Path to the saved video file
+        """
+        from datetime import datetime
+
+        # Validate input
+        if not video or len(video) == 0:
+            logger.warning("No video frames to save")
+            return None
+
+        # Flatten nested list if needed
+        if len(video) > 0 and isinstance(video[0], list):
+            video = video[0]
+
+        # Set default output directory
+        if output_dir is None:
+            output_dir = "."
+
+        # Create scenario subfolder
+        scenario_dir = os.path.join(output_dir, "scenario")
+        os.makedirs(scenario_dir, exist_ok=True)
+
+        # Generate filename if not provided
+        if video_filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Determine prefix based on validation type
+            if validation_type == "t2v_validation":
+                prefix = "t2v"
+            elif validation_type == "v2v_validation":
+                prefix = "v2v"
+            else:
+                # Fallback logic based on scenario presence
+                if scenario:
+                    prefix = "v2v"  # Has scenario = video-to-video
+                else:
+                    prefix = "t2v"  # No scenario = text-to-video
+
+            # Create step suffix if step is provided
+            step_suffix = f"_step_{step:06d}" if step is not None else ""
+
+            # Use new naming convention based on scenario
+            if scenario:
+                # Try to extract shot information from scenario
+                scenario_parts = scenario.split(",")
+                shot_info = [part.strip() for part in scenario_parts if part.strip().startswith("shot")]
+
+                if len(shot_info) >= 2:
+                    # Multi-shot with transitions: prefix_shot1_transition_shot2_step_000123.mp4
+                    video_filename = f"{prefix}_shot1_transition_shot2{step_suffix}_{timestamp}.mp4"
+                elif len(shot_info) == 1:
+                    # Single shot: prefix_shot1_step_000123.mp4
+                    video_filename = f"{prefix}_shot1{step_suffix}_{timestamp}.mp4"
+                else:
+                    # Fallback with scenario info: prefix_scenario_info_step_000123.mp4
+                    scenario_clean = scenario.replace(",", "_").replace(" ", "_")
+                    video_filename = f"{prefix}_scenario_{scenario_clean}{step_suffix}_{timestamp}.mp4"
+            else:
+                # No scenario - single shot: prefix_single_shot_step_000123.mp4
+                video_filename = f"{prefix}_single_shot{step_suffix}_{timestamp}.mp4"
+
+        # Full path for the output file (save in scenario subfolder)
+        output_path = os.path.join(scenario_dir, video_filename)
+
+        try:
+            # Use diffusers' export_to_video function for consistent video saving
+            export_to_video(video, output_path, fps=fps)
+
+            # Get video information for logging and metadata
+            frame_count = len(video)
+            if hasattr(video[0], 'size'):
+                width, height = video[0].size
+            else:
+                # Fallback for non-PIL images
+                width, height = 768, 448  # Default dimensions
+
+            logger.info(f"🎬 Video saved successfully: {output_path}")
+            logger.info(f"🎬 Video details: {frame_count} frames, {fps} FPS, {width}x{height}")
+
+            # Save prompt information to JSON file
+            self._save_prompt_info_to_json(
+                scenario_dir=scenario_dir,
+                video_filename=video_filename,
+                output_path=output_path,
+                prompt=prompt,
+                scenario=scenario,
+                fps=fps,
+                frame_count=frame_count,
+                resolution=(width, height)
+            )
+
+            return output_path
+
+        except Exception as e:
+            logger.error(f"🎬 ❌ Failed to save video using export_to_video: {e}")
+            logger.error(f"🎬 Video input type: {type(video)}, length: {len(video) if video else 0}")
+            if video and len(video) > 0:
+                logger.error(f"🎬 First frame type: {type(video[0])}")
+            return None
+
+    def _save_prompt_info_to_json(
+        self,
+        scenario_dir: str,
+        video_filename: str,
+        output_path: str,
+        prompt: Optional[str] = None,
+        scenario: Optional[str] = None,
+        fps: int = 24,
+        frame_count: int = 0,
+        resolution: Tuple[int, int] = (0, 0)
+    ):
+        """
+        Save prompt and generation information to JSON file.
+
+        Args:
+            scenario_dir: Directory where the scenario folder is located
+            video_filename: Name of the video file
+            output_path: Full path to the saved video
+            prompt: Text prompt used for generation
+            scenario: Scenario string used
+            fps: Frames per second
+            frame_count: Number of frames in the video
+            resolution: Video resolution (width, height)
+        """
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Create prompt info entry
+            prompt_data = {
+                "video_filename": video_filename,
+                "video_path": output_path,
+                "prompt": prompt,
+                "scenario": scenario,
+                "timestamp": timestamp,
+                "generation_params": {
+                    "fps": fps,
+                    "frame_count": frame_count,
+                    "resolution": {
+                        "width": resolution[0],
+                        "height": resolution[1]
+                    }
+                },
+                "generation_type": "SGMultiShotPipeline"
+            }
+
+            # Store in instance for potential batch operations
+            prompt_key = f"video_{timestamp}_{video_filename.replace('.mp4', '')}"
+            self.prompt_info[prompt_key] = prompt_data
+
+            # Save to JSON file
+            json_path = os.path.join(scenario_dir, "prompt_info.json")
+
+            # Load existing data if file exists
+            existing_data = {}
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Could not load existing prompt info: {e}")
+
+            # Merge with existing data
+            existing_data.update(self.prompt_info)
+
+            # Save updated data
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"📝 Prompt information saved to: {json_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save prompt information: {e}")
+
     # """
     # Encode video to latent space for use as prev_latent conditioning.
     
