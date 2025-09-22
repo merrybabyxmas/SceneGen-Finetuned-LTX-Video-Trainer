@@ -19,7 +19,7 @@ conditioning:
 
 optimization:
   learning_rate: 2e-4  
-  steps: 2000
+  steps: 5
   batch_size: 1
   gradient_accumulation_steps: 1  
   max_grad_norm: 1  
@@ -47,7 +47,7 @@ validation:
   video_dims: [768, 448, 17]
   seed: 42
   inference_steps: 50
-  interval: 200
+  interval: 2
   videos_per_prompt: 1
   guidance_scale: 3.5
   skip_initial_validation: True
@@ -55,6 +55,7 @@ validation:
   num_shots: 3
   sos_latent_dim: 128
   starts_with: "batch"  # Options: "sos" (generate SOS latents) or "batch" (use current training batch's prev condition)
+  save_full_sequence: true  # Save full denoising sequence from noise to final result
 
 checkpoints:
   interval: 500
@@ -77,6 +78,6 @@ wandb:
 
 debug:
   enable_debug_frames: true
-  debug_gpu_id: 3
-  debug_interval: 200
+  debug_gpu_id: 1  # Physical GPU 3 maps to PyTorch GPU 2 when using CUDA_VISIBLE_DEVICES=1,2,3
+  debug_interval: 2
   enable_batch_visualization: true

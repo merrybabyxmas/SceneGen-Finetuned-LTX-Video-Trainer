@@ -253,7 +253,7 @@ class TrainingStrategy(ABC):
         """
 
     @abstractmethod
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
         ...
 
     def _create_timesteps_from_conditioning_mask(
@@ -348,6 +348,7 @@ class TrainingStrategy(ABC):
             "encoder_hidden_states": batch.prompt_embeds,
             "timestep": batch.timesteps,
             "encoder_attention_mask": batch.prompt_attention_mask,
+            # "attention_mask": batch.conditioning_mask.float(),  # Add conditioning mask for latent sequence attention
             "num_frames": batch.num_frames,
             "height": batch.height,
             "width": batch.width,
@@ -447,7 +448,7 @@ class StandardTrainingStrategy(TrainingStrategy):
         참고: prev_conditions는 데이터셋에서 자동으로 추가됨
         """
         return {"latents": "latent_conditions", "conditions": "text_conditions"}
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
         # 1) Latents 언팩
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
 
@@ -776,10 +777,36 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             # Note: prev_conditions will be automatically added by dataset
         }
 
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
         """Prepare batch for modified reference training with prev latents and text conditions."""
         # 1) Unpack current shot latents
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
+        B, curr_seq_len, D = curr_lat.shape
+
+        # 1.1) Apply VAE normalization if available
+        if vae is not None:
+            # Convert sequence format to 5D for normalization
+            curr_lat_5d = _unpack_latents(curr_lat, F, H, W)
+
+            # Get VAE normalization parameters
+            latents_mean = getattr(vae.config, 'latents_mean', None)
+            latents_std = getattr(vae.config, 'latents_std', None)
+            scaling_factor = getattr(vae.config, 'scaling_factor', 1.0)
+
+            if latents_mean is not None and latents_std is not None:
+                # Convert to tensors if needed
+                if not isinstance(latents_mean, torch.Tensor):
+                    latents_mean = torch.tensor(latents_mean, device=curr_lat.device, dtype=curr_lat.dtype)
+                if not isinstance(latents_std, torch.Tensor):
+                    latents_std = torch.tensor(latents_std, device=curr_lat.device, dtype=curr_lat.dtype)
+
+                # Apply normalization
+                curr_lat_5d = _normalize_latents(curr_lat_5d, latents_mean, latents_std, scaling_factor)
+                logger.info(f"🔧 Applied VAE normalization to current latents")
+
+            # Convert back to sequence format
+            curr_lat = _pack_latents(curr_lat_5d)
+
         B, curr_seq_len, D = curr_lat.shape
 
         # Debug print batch metadata
@@ -799,6 +826,31 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         if batch.get("prev_conditions") is not None:
             # Use previous shot as reference
             ref_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
+
+            # 2.1) Apply VAE normalization to reference latents too
+            if vae is not None:
+                # Convert sequence format to 5D for normalization
+                ref_lat_5d = _unpack_latents(ref_lat, F, H, W)
+
+                # Get VAE normalization parameters (same as above)
+                latents_mean = getattr(vae.config, 'latents_mean', None)
+                latents_std = getattr(vae.config, 'latents_std', None)
+                scaling_factor = getattr(vae.config, 'scaling_factor', 1.0)
+
+                if latents_mean is not None and latents_std is not None:
+                    # Convert to tensors if needed
+                    if not isinstance(latents_mean, torch.Tensor):
+                        latents_mean = torch.tensor(latents_mean, device=ref_lat.device, dtype=ref_lat.dtype)
+                    if not isinstance(latents_std, torch.Tensor):
+                        latents_std = torch.tensor(latents_std, device=ref_lat.device, dtype=ref_lat.dtype)
+
+                    # Apply normalization
+                    ref_lat_5d = _normalize_latents(ref_lat_5d, latents_mean, latents_std, scaling_factor)
+                    logger.info(f"🔧 Applied VAE normalization to reference latents")
+
+                # Convert back to sequence format
+                ref_lat = _pack_latents(ref_lat_5d)
+
             # logger.debug(f"Using previous shot as reference: {ref_lat.shape}")
         else:
             # First shot: generate Gaussian noise as reference
@@ -1045,7 +1097,7 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         # CRITICAL FIX: Re-enable PC-CFM loss with proper lambda
         # Standard PC-CFM: target = (X1c - X0) + λ(X1p - X1c) = XO-X1 + λ(X1p - X1c)
         
-        lambda_val = 0  # Balance between current and previous shot influence
+        lambda_val = 0.3  # Balance between current and previous shot influence - non-zero for temporal coherence
         pc_cfm_target = batch.targets["XO-X1c"] + lambda_val * batch.targets["X0-X1p+X1c"]
         
         

@@ -299,6 +299,11 @@ class ValidationConfig(ConfigBaseModel):
         description="Multi-shot validation starting mode: 'sos' uses generated SOS latents, 'batch' uses current training batch's prev condition",
     )
 
+    save_full_sequence: bool = Field(
+        default=False,
+        description="Save full denoising sequence from noise to final result. For t2v: starts from noise, for v2v: starts from actual batch frame",
+    )
+
     @field_validator("images")
     @classmethod
     def validate_num_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:

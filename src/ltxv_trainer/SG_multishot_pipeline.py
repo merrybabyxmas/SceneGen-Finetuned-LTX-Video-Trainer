@@ -22,7 +22,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
 import PIL.Image
+import numpy as np
 import torch
+from ltxv_trainer.ltxv_utils import decode_video
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin, LTXVideoLoraLoaderMixin
@@ -875,39 +877,40 @@ class SGMultiShotPipeline(LTXConditionPipeline):
         # Convert current latents to shot format [F, H, W, C]
         current_shot = current_latents[0].permute(1, 2, 3, 0)  # [C, F, H, W] -> [F, H, W, C]
 
-        # Determine shot names based on available shot_latents
-        if shot_latents:
-            # Use provided shot latents - copy all available shots
-            scenario_shot_latents.update(shot_latents)
-            logger.info(f"🎭 Using provided shot latents: {list(shot_latents.keys())}")
+        # # Determine shot names based on available shot_latents
+        # if shot_latents:
+        #     # Use provided shot latents - copy all available shots
+        #     scenario_shot_latents.update(shot_latents)
+        #     logger.info(f"🎭 Using provided shot latents: {list(shot_latents.keys())}")
 
-            # Add current shot as the last shot in sequence
-            shot_names = sorted([name for name in shot_latents.keys() if name.startswith('shot')])
-            if shot_names:
-                # Extract shot numbers and find the next one
-                shot_numbers = [int(name.replace('shot', '')) for name in shot_names if name.replace('shot', '').isdigit()]
-                if shot_numbers:
-                    current_shot_name = f"shot{shot_numbers[-1]}"
-                else:
-                    current_shot_name = "shot2"  # Default if parsing fails
-            else:
-                current_shot_name = "shot2"  # Default
-        else:
-            # No reference provided - generate two-shot sequence with SOS
-            logger.info(f"🎭 Generating SOS token as reference for shot1")
-            sos_reference = torch.randn_like(current_shot)
-            scenario_shot_latents["shot1"] = sos_reference
-            current_shot_name = "shot2"
+        #     # Add current shot as the last shot in sequence
+        #     shot_names = sorted([name for name in shot_latents.keys() if name.startswith('shot')])
+        #     if shot_names:
+        #         # Extract shot numbers and find the next one
+        #         shot_numbers = [int(name.replace('shot', '')) for name in shot_names if name.replace('shot', '').isdigit()]
+        #         if shot_numbers:
+        #             current_shot_name = f"shot{shot_numbers[-1]}"
+        #         else:
+        #             current_shot_name = "shot2"  # Default if parsing fails
+        #     else:
+        #         current_shot_name = "shot2"  # Default
+        # else:
+        #     # No reference provided - generate two-shot sequence with SOS
+        #     logger.info(f"🎭 Generating SOS token as reference for shot1")
+        #     sos_reference = torch.randn_like(current_shot)
+        #     scenario_shot_latents["shot1"] = sos_reference
+        #     current_shot_name = "shot2"
 
-        scenario_shot_latents[current_shot_name] = current_shot
-        logger.info(f"🎭 Current shot assigned as: {current_shot_name}")
+        # scenario_shot_latents[current_shot_name] = current_shot
+        # logger.info(f"🎭 Current shot assigned as: {current_shot_name}")
+        # logger.info(f"🎭 total scenario : {[(k, v.shape) for k, v in scenario_shot_latents.items()]}")
 
         # Apply scenario preprocessing
         try:
             from ltxv_trainer.token_utils import preprocess_with_scenario, create_scenario_conditioning_mask
 
             tokenized_sequence, scenario_metadata = preprocess_with_scenario(
-                shot_latents=scenario_shot_latents,
+                shot_latents=shot_latents,
                 scenario=scenario,
                 token_embeddings=self.token_embeddings,
                 device=device
@@ -926,7 +929,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 conditioning_strength=1.0,
                 stable_token_strength=0.5,
                 transition_token_strength=0.8,
-                target_shot=current_shot_name,  # Use dynamic current shot name
+                target_shot="shot2",  # Use dynamic current shot name
                 device=device
             )
 
@@ -1485,13 +1488,29 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                     ]
                     curr_latents = (1 - decode_noise_scale_tensor) * curr_latents + decode_noise_scale_tensor * noise
 
-                video = self.vae.decode(curr_latents, timestep, return_dict=False)[0]
+                # Ensure VAE and latents are on the same device
+                self.vae = self.vae.to(curr_latents.device)
+                curr_latents = curr_latents.to(self.vae.dtype)
+
+                # Decode using ltxv_utils.decode_video
+                B, C, F, H, W = curr_latents.shape
+                latents_seq = curr_latents.flatten(2).transpose(1, 2)
+                video = decode_video(
+                    vae=self.vae,
+                    latents=latents_seq[0],
+                    num_frames=F,
+                    height=H,
+                    width=W,
+                    device=curr_latents.device,
+                    dtype=curr_latents.dtype,
+                    decode_timestep=timestep.item() if timestep is not None else 0.0
+                )
 
             video = self.video_processor.postprocess_video(video, output_type=output_type)
 
             # Save video as MP4 if requested
             saved_video_path = None
-            logger.info(f"save_video : {save_video} video : {video}")
+            # logger.info(f"save_video : {save_video} video : {video}")
             if save_video and video is not None:
                 saved_video_path = self._save_video_as_mp4(video, output_dir, video_filename, fps, prompt, scenario, validation_type, step)
 
@@ -1582,9 +1601,10 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             logger.info(f"🎬 [FULL_SEQ] Decoding full sequence latents: {latents.shape}")
 
             # Denormalize and decode the full latents
-            latents_mean = self.vae.config.latents_mean
-            latents_std = self.vae.config.latents_std
-            scaling_factor = self.vae.config.scaling_factor
+            # Handle potential missing attributes in VAE config
+            latents_mean = getattr(self.vae.config, 'latents_mean', None)
+            latents_std = getattr(self.vae.config, 'latents_std', None)
+            scaling_factor = getattr(self.vae.config, 'scaling_factor', 1.0)
 
             # Unpack and denormalize the latents
             unpacked_latents = self._unpack_latents(
@@ -1594,14 +1614,36 @@ class SGMultiShotPipeline(LTXConditionPipeline):
                 width=latent_width
             )
 
-            denormalized_latents = self._denormalize_latents(
-                unpacked_latents, latents_mean, latents_std, scaling_factor
-            )
+            # Denormalize only if config values are available
+            if latents_mean is not None and latents_std is not None:
+                denormalized_latents = self._denormalize_latents(
+                    unpacked_latents, latents_mean, latents_std, scaling_factor
+                )
+            else:
+                # Use unpacked latents directly if normalization params are not available
+                logger.warning("🎬 [FULL_SEQ] VAE config missing latents_mean/latents_std, using unpacked latents directly")
+                denormalized_latents = unpacked_latents
 
             # Decode with VAE
             logger.info(f"🎬 [FULL_SEQ] VAE decoding latents shape: {denormalized_latents.shape}")
             with torch.no_grad():
-                video_tensor = self.vae.decode(denormalized_latents.to(self.vae.dtype)).sample
+                # Move VAE to same device and dtype
+                self.vae = self.vae.to(denormalized_latents.device)
+                denormalized_latents = denormalized_latents.to(self.vae.dtype)
+                
+                # Decode using ltxv_utils.decode_video
+                B, C, F, H, W = denormalized_latents.shape
+                latents_seq = denormalized_latents.flatten(2).transpose(1, 2)
+                video_tensor = decode_video(
+                    vae=self.vae,
+                    latents=latents_seq[0],
+                    num_frames=F,
+                    height=H,
+                    width=W,
+                    device=denormalized_latents.device,
+                    dtype=denormalized_latents.dtype,
+                    decode_timestep=0.0
+                )
 
             # Convert to video format expected by export_to_video
             video_tensor = (video_tensor / 2 + 0.5).clamp(0, 1)
@@ -1611,7 +1653,7 @@ class SGMultiShotPipeline(LTXConditionPipeline):
             video_pil = []
             for frame_idx in range(video_frames.shape[0]):
                 frame = video_frames[frame_idx]
-                frame_pil = Image.fromarray((frame.numpy() * 255).astype(np.uint8))
+                frame_pil = PIL.Image.fromarray((frame.to(torch.float32).cpu().numpy() * 255).astype(np.uint8))
                 video_pil.append(frame_pil)
 
             # Save using export_to_video

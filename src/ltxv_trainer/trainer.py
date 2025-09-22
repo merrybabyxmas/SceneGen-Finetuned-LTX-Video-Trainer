@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from unittest.mock import MagicMock
 
-import numpy as np 
+import numpy as np
 from PIL import Image
 import traceback
 
@@ -425,14 +425,52 @@ class LtxvTrainer:
         
 
         # Use strategy to prepare the training batch
-        training_batch = self._training_strategy.prepare_batch(batch, self._timestep_sampler)
+        training_batch = self._training_strategy.prepare_batch(batch, self._timestep_sampler, self._vae)
 
 
         # Use strategy to prepare model inputs
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
+        # Save transformer input/output videos at configured intervals
+        # Only save on the debug GPU to avoid OOM on training GPUs
+        debug_gpu_id = getattr(self._config.debug, 'debug_gpu_id', None)
+        current_gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+        # Map physical GPU ID to PyTorch GPU ID if using CUDA_VISIBLE_DEVICES
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if debug_gpu_id is not None and cuda_visible_devices:
+            visible_gpus = [int(x) for x in cuda_visible_devices.split(',') if x.strip().isdigit()]
+            if debug_gpu_id in visible_gpus:
+                debug_gpu_id = visible_gpus.index(debug_gpu_id)  # Map to PyTorch index
+                logger.debug(f"🎬 [DEBUG] Mapped physical GPU {getattr(self._config.debug, 'debug_gpu_id')} to PyTorch GPU {debug_gpu_id}")
+            else:
+                logger.warning(f"🎬 [DEBUG] Debug GPU {debug_gpu_id} not in CUDA_VISIBLE_DEVICES={cuda_visible_devices}")
+                debug_gpu_id = None
+
+        should_save_debug_videos = (
+            hasattr(self._config.debug, 'debug_interval') and
+            self._config.debug.debug_interval > 0 and
+            self._global_step % self._config.debug.debug_interval == 0 and
+            self._global_step > 0 and  # Skip first step
+            debug_gpu_id is not None and
+            current_gpu_id == debug_gpu_id  # Only run on debug GPU
+        )
+
+        # if should_save_debug_videos:
+        #     logger.info(f"🎬 [DEBUG] GPU {current_gpu_id} - Saving transformer debug videos at step {self._global_step}")
+        #     # self._save_transformer_debug_videos(training_batch, model_inputs, before_forward=True)
+        # elif debug_gpu_id is not None and current_gpu_id != debug_gpu_id:
+        #     logger.debug(f"🎬 [DEBUG] GPU {current_gpu_id} - Skipping debug videos (only running on debug GPU {debug_gpu_id})")
+        # else:
+        #     logger.debug(f"🎬 [DEBUG] GPU {current_gpu_id} - Skipping debug videos - step {self._global_step}, interval {getattr(self._config.debug, 'debug_interval', 'not set')}")
+
         # Run transformer forward pass
         model_pred = self._transformer(**model_inputs)[0]
+
+        # # Save transformer output video if debug logging is enabled
+        # if should_save_debug_videos:
+        #     logger.info(f"🎬 [DEBUG] GPU {current_gpu_id} - Saving transformer output video at step {self._global_step}")
+        #     self._save_transformer_debug_videos(training_batch, model_inputs, model_pred, before_forward=False)
         
 
 
@@ -897,18 +935,24 @@ class LtxvTrainer:
                 logger.info(f"ref video shape : {ref_video.shape}")
                 pipeline_inputs["reference_video"] = ref_video
 
-            with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
+            with autocast(debug_device_type, dtype=torch.bfloat16):
                 result = pipeline(**pipeline_inputs)
                 videos = result.frames
                 
                 # Save intermediate steps if available
                 if hasattr(result, 'intermediate_latents') and result.intermediate_latents:
-                    self._save_intermediate_validation_steps(result.intermediate_latents, prompt, j)
+                    if self._config.validation.save_full_sequence:
+                        self._save_full_sequence_video(result.intermediate_latents, prompt, j, output_dir)
+                    else:
+                        self._save_intermediate_validation_steps(result.intermediate_latents, prompt, j)
 
             for video in videos:
                 video_path = output_dir / f"step_{self._global_step:06d}_{i}.mp4"
                 export_to_video(video, str(video_path), fps=24)
                 video_paths.append(video_path)
+
+                # Save input video/image alongside output
+                self._save_validation_input(pipeline_inputs, output_dir, j, i)
                 i += 1
             if hasattr(progress, 'update'):
                 progress.update(task, advance=1)
@@ -986,6 +1030,7 @@ class LtxvTrainer:
                         "generator": generator,
                         "output_type": "pil",
                         "return_latents": True,  # Return latents for next shot conditioning
+                        "save_full_sequence": self._config.validation.save_full_sequence,  # Save full denoising sequence
                     }
 
                     # Add reference latents based on shot index and starts_with config
@@ -1086,7 +1131,7 @@ class LtxvTrainer:
                             pipeline_inputs["reference_latents"] = previous_shot_latents
                     
                     # Generate current shot
-                    with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
+                    with autocast(debug_device_type, dtype=torch.bfloat16):
                         result = multi_shot_pipeline(**pipeline_inputs)
 
                         # Handle different result formats (dict or object)
@@ -1105,6 +1150,9 @@ class LtxvTrainer:
                     shot_path = output_dir / f"step_{self._global_step:06d}_prompt_{i}_shot_{shot_idx}.mp4"
                     export_to_video(current_video, str(shot_path), fps=24)
                     sequence_videos.append(shot_path)
+
+                    # Save input for this shot
+                    self._save_multishot_input(pipeline_inputs, output_dir, i, shot_idx)
 
                     # Save concatenated prev+curr video for shots after the first
                     if shot_idx > 0 and previous_shot_video is not None:
@@ -1274,6 +1322,701 @@ class LtxvTrainer:
         if self._wandb_run is not None:
             self._wandb_run.log(metrics)
     
+    def _save_unified_validation_input(
+        self,
+        pipeline_inputs: dict,
+        output_dir: Path,
+        validation_type: str,
+        step: int,
+        reference_latents: torch.Tensor = None
+    ) -> None:
+        """Save unified validation input (T2V noise or V2V reference video)."""
+        try:
+            # Create input directory
+            input_dir = output_dir / "inputs"
+            input_dir.mkdir(exist_ok=True, parents=True)
+
+            # For V2V, extract clean prev latents from training batch if not provided
+            if validation_type == "v2v" and reference_latents is None:
+                if hasattr(self, '_current_training_batch') and self._current_training_batch is not None:
+                    batch = self._current_training_batch
+                    if batch.get("prev_conditions") is not None:
+                        try:
+                            from ltxv_trainer.SG_training_strategy import _unpack_latent_entry, _unpack_latents
+                            clean_prev_raw, F, H, W, fps = _unpack_latent_entry(batch["prev_conditions"])
+                            # Convert to 5D format for decoding
+                            reference_latents = _unpack_latents(clean_prev_raw, F, H, W)
+                            logger.info(f"💾 [V2V INPUT] Extracted clean prev latents from training batch: {reference_latents.shape}")
+                        except Exception as e:
+                            logger.warning(f"💾 [V2V INPUT] Could not extract clean prev latents: {e}")
+                            reference_latents = None
+
+            # ------------------------------------------------
+            # T2V: Save noise input visualization
+            # ------------------------------------------------
+            if validation_type == "t2v":
+                width = pipeline_inputs["width"]
+                height = pipeline_inputs["height"]
+                frames = pipeline_inputs["num_frames"]
+                generator = pipeline_inputs.get("generator")
+
+                latent_height = height // 32
+                latent_width = width // 32
+                latent_frames = (frames - 1) // 8 + 1
+
+                if generator is not None:
+                    cpu_generator = torch.Generator(device="cpu")
+                    cpu_generator.manual_seed(generator.initial_seed())
+                    noise = torch.randn(
+                        1, 32, latent_frames, latent_height, latent_width,
+                        generator=cpu_generator,
+                        device="cpu",
+                        dtype=torch.float32
+                    )
+                else:
+                    noise = torch.randn(1, 32, latent_frames, latent_height, latent_width)
+
+                noise_frames = []
+                # noise_vis = noise[0].mean(dim=0)  # (F, H, W)
+                # noise_vis = (noise_vis - noise_vis.min()) / (noise_vis.max() - noise_vis.min() + 1e-6)
+
+                for f in range(noise.shape[0]):
+                    frame = noise[f].numpy()
+                    frame_resized = torch.nn.functional.interpolate(
+                        torch.from_numpy(frame).unsqueeze(0).unsqueeze(0),
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze().numpy()
+
+                    frame_uint8 = (frame_resized * 255).astype('uint8')
+                    frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
+                    noise_frames.append(PIL.Image.fromarray(frame_rgb))
+
+                input_path = input_dir / f"step_{step:06d}_t2v_input_noise.mp4"
+                export_to_video(noise_frames, str(input_path), fps=24)
+                logger.info(f"💾 Saved T2V noise input: {input_path.name}")
+
+            # ------------------------------------------------
+            # V2V: Save reference latents as video
+            # ------------------------------------------------
+            elif validation_type == "v2v" and reference_latents is not None:
+                try:
+                    logger.info(f"💾 V2V reference latents shape: {reference_latents.shape}")
+
+                    # Expected format: [B, C, F, H, W]
+                    if reference_latents.shape[-1] == 128 and reference_latents.shape[1] != 128:
+                        reference_latents = reference_latents.permute(0, 4, 1, 2, 3)
+                        logger.info(f"💾 Permuted V2V reference latents to shape: {reference_latents.shape}")
+
+                    if reference_latents.shape[1] != 128:
+                        logger.warning(f"💾 Reference latents have {reference_latents.shape[1]} channels, expected 128. Using visualization only.")
+                        ref_vis = reference_latents[0].mean(dim=0).cpu()
+                        if ref_vis.dim() == 4:
+                            ref_vis = ref_vis.mean(dim=0)
+
+                        ref_vis = (ref_vis - ref_vis.min()) / (ref_vis.max() - ref_vis.min() + 1e-6)
+
+                        frames = []
+                        for f in range(ref_vis.shape[0]):
+                            frame = ref_vis[f].numpy()
+                            frame_resized = torch.nn.functional.interpolate(
+                                torch.from_numpy(frame).unsqueeze(0).unsqueeze(0),
+                                size=(pipeline_inputs.get("height", 448), pipeline_inputs.get("width", 768)),
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze().numpy()
+
+                            frame_uint8 = (frame_resized * 255).astype('uint8')
+                            frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
+                            frames.append(PIL.Image.fromarray(frame_rgb))
+
+                        input_path = input_dir / f"step_{step:06d}_v2v_input_reference_vis.mp4"
+                        export_to_video(frames, str(input_path), fps=24)
+                        logger.info(f"💾 Saved V2V reference visualization: {input_path.name}")
+
+                    else:
+                        # Move VAE to device temporarily for decoding
+                        self._vae.to(self._accelerator.device)
+                        ref_latents = reference_latents.to(self._accelerator.device, dtype=torch.bfloat16)
+
+                        # ✅ 디바이스 타입 정의
+                        debug_device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+                        with autocast(debug_device_type, dtype=torch.bfloat16):
+                            B, C, F, H, W = ref_latents.shape
+                            latents_seq = ref_latents.flatten(2).transpose(1, 2)
+
+                            decoded = decode_video(
+                                vae=self._vae,
+                                latents=latents_seq[0],
+                                num_frames=F,
+                                height=H,
+                                width=W,
+                                device=self._accelerator.device,
+                                dtype=torch.bfloat16,
+                                decode_timestep=0.0
+                            )
+
+                            decoded = decoded.permute(0, 2, 3, 4, 1).cpu()  # [B, F, H, W, C]
+
+                            frames = []
+                            for b in range(decoded.shape[0]):
+                                for f in range(decoded.shape[1]):
+                                    frame = decoded[b, f].to(torch.float32).cpu().numpy()
+                                    frame = (frame * 255).astype('uint8')
+                                    frames.append(PIL.Image.fromarray(frame))
+
+                            input_path = input_dir / f"step_{step:06d}_v2v_input_reference.mp4"
+                            export_to_video(frames, str(input_path), fps=24)
+                            logger.info(f"💾 Saved V2V reference input: {input_path.name}")
+
+                        self._vae.to("cpu")
+
+                except Exception as e:
+                    logger.warning(f"Failed to decode reference latents for V2V input: {e}")
+                    logger.error(f" Traceback: {traceback.format_exc()}")
+                    try:
+                        self._vae.to("cpu")
+                    except:
+                        pass
+
+        except Exception as e:
+            logger.warning(f"Failed to save unified validation input: {e}")
+
+    def _save_multishot_input(self, pipeline_inputs: dict, output_dir: Path, prompt_idx: int, shot_idx: int) -> None:
+        """Save multi-shot validation input (reference latents for v2v or noise for t2v)."""
+        try:
+            # Create input directory
+            input_dir = output_dir / "inputs"
+            input_dir.mkdir(exist_ok=True, parents=True)
+
+            # Check if this shot has reference latents (v2v) or is pure t2v
+            if "reference_latents" in pipeline_inputs and pipeline_inputs["reference_latents"] is not None:
+                # V2V: Save reference latents as video (decode them first)
+                ref_latents = pipeline_inputs["reference_latents"]
+                if isinstance(ref_latents, torch.Tensor):
+                    try:
+                        # Move VAE to device temporarily for decoding
+                        self._vae.to(self._accelerator.device)
+                        ref_latents = ref_latents.to(self._accelerator.device)
+
+                        # Decode reference latents to video using decode_video
+                        with autocast(debug_device_type, dtype=torch.bfloat16):
+                            # Use decode_video from ltxv_utils
+                            B, C, F, H, W = ref_latents.shape
+                            latents_seq = ref_latents.flatten(2).transpose(1, 2)  # [B, F*H*W, C]
+
+                            decoded = decode_video(
+                                vae=self._vae,
+                                latents=latents_seq[0],  # Remove batch dimension
+                                num_frames=F,
+                                height=H,
+                                width=W,
+                                device=debug_device,
+                                dtype=torch.bfloat16,
+                                decode_timestep=0.0
+                            )
+
+                            # Convert to expected format: [B, F, H, W, C]
+                            decoded = decoded.unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                            # Convert to PIL images
+                            frames = []
+                            for b in range(decoded.shape[0]):
+                                for f in range(decoded.shape[1]):
+                                    frame = decoded[b, f].numpy()
+                                    frame = (frame * 255).astype('uint8')
+                                    frames.append(PIL.Image.fromarray(frame))
+
+                            # Save as video
+                            input_path = input_dir / f"step_{self._global_step:06d}_prompt_{prompt_idx}_shot_{shot_idx}_input_v2v.mp4"
+                            export_to_video(frames, str(input_path), fps=24)
+                            logger.info(f"💾 Saved multi-shot V2V input: {input_path.name}")
+
+                        # Move VAE back to CPU
+                        self._vae.to("cpu")
+
+                    except Exception as e:
+                        logger.warning(f"Failed to decode reference latents for shot {shot_idx}: {e}")
+                        try:
+                            self._vae.to("cpu")
+                        except:
+                            pass
+            else:
+                # T2V: Create noise visualization (similar to single validation)
+                width = pipeline_inputs["width"]
+                height = pipeline_inputs["height"]
+                frames = pipeline_inputs["num_frames"]
+                generator = pipeline_inputs.get("generator")
+
+                # Generate noise similar to what the pipeline would use
+                latent_height = height // 32
+                latent_width = width // 32
+                latent_frames = (frames - 1) // 8 + 1
+
+                if generator is not None:
+                    # Create a new generator with the same seed for reproducibility
+                    noise_gen = torch.Generator(device="cpu")
+                    noise_gen.manual_seed(generator.initial_seed() + shot_idx)  # Different seed per shot
+                    noise = torch.randn(
+                        1, 32, latent_frames, latent_height, latent_width,
+                        generator=noise_gen,
+                        device="cpu",
+                        dtype=torch.float32
+                    )
+                else:
+                    noise = torch.randn(1, 32, latent_frames, latent_height, latent_width)
+
+                # Visualize noise as grayscale frames
+                noise_frames = []
+                # noise_vis = noise[0].mean(dim=0)  # (F, H, W)
+                # noise_vis = (noise_vis - noise_vis.min()) / (noise_vis.max() - noise_vis.min())
+
+                for f in range(noise.shape[0]):
+                    frame = noise[f].numpy()
+                    frame_resized = torch.nn.functional.interpolate(
+                        torch.from_numpy(frame).unsqueeze(0).unsqueeze(0),
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze().numpy()
+
+                    frame_uint8 = (frame_resized * 255).astype('uint8')
+                    frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
+                    noise_frames.append(PIL.Image.fromarray(frame_rgb))
+
+                # Save noise visualization
+                input_path = input_dir / f"step_{self._global_step:06d}_prompt_{prompt_idx}_shot_{shot_idx}_input_t2v_noise.mp4"
+                export_to_video(noise_frames, str(input_path), fps=24)
+                logger.info(f"💾 Saved multi-shot T2V noise input: {input_path.name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to save multi-shot validation input: {e}")
+
+    def _save_validation_input(self, pipeline_inputs: dict, output_dir: Path, prompt_idx: int, video_idx: int) -> None:
+        """Save validation input (reference video for v2v or noise visualization for t2v)."""
+        try:
+            # Create input directory
+            input_dir = output_dir / "inputs"
+            input_dir.mkdir(exist_ok=True, parents=True)
+
+            # Check if this is v2v (has reference video) or t2v
+            if "reference_video" in pipeline_inputs and pipeline_inputs["reference_video"] is not None:
+                # V2V: Save reference video input
+                ref_video = pipeline_inputs["reference_video"]
+                if isinstance(ref_video, torch.Tensor):
+                    # Convert tensor to PIL images
+                    ref_video = ref_video.cpu()
+                    # Assuming ref_video is in format (frames, height, width, channels) or (frames, channels, height, width)
+                    if ref_video.dim() == 4 and ref_video.shape[1] == 3:  # (F, C, H, W)
+                        ref_video = ref_video.permute(0, 2, 3, 1)  # (F, H, W, C)
+
+                    # Normalize to [0, 1] if needed
+                    if ref_video.max() > 1.0:
+                        ref_video = ref_video / 255.0
+                    elif ref_video.min() < 0:  # If in [-1, 1] range
+                        ref_video = (ref_video + 1) / 2
+
+                    # Convert to PIL images
+                    frames = []
+                    for frame in ref_video:
+                        frame_np = (frame.numpy() * 255).astype('uint8')
+                        frames.append(PIL.Image.fromarray(frame_np))
+
+                    # Save as video
+                    input_path = input_dir / f"step_{self._global_step:06d}_{video_idx}_input_v2v.mp4"
+                    export_to_video(frames, str(input_path), fps=24)
+                    logger.info(f"💾 Saved V2V input video: {input_path.name}")
+
+            elif "image" in pipeline_inputs and pipeline_inputs["image"] is not None:
+                # Image-to-video: Save input image
+                image = pipeline_inputs["image"]
+                input_path = input_dir / f"step_{self._global_step:06d}_{video_idx}_input_i2v.jpg"
+                image.save(input_path)
+                logger.info(f"💾 Saved I2V input image: {input_path.name}")
+
+            else:
+                # T2V: Create noise visualization
+                width = pipeline_inputs["width"]
+                height = pipeline_inputs["height"]
+                frames = pipeline_inputs["num_frames"]
+                generator = pipeline_inputs.get("generator")
+
+                # Generate noise similar to what the pipeline would use
+                # This is a simplified version - actual noise shape depends on VAE compression
+                latent_height = height // 32
+                latent_width = width // 32
+                latent_frames = (frames - 1) // 8 + 1
+
+                if generator is not None:
+                    # Create a CPU generator with the same seed for noise visualization
+                    cpu_generator = torch.Generator(device="cpu")
+                    cpu_generator.manual_seed(generator.initial_seed())
+                    noise = torch.randn(
+                        1, 32, latent_frames, latent_height, latent_width,
+                        generator=cpu_generator,
+                        device="cpu",
+                        dtype=torch.float32
+                    )
+                else:
+                    noise = torch.randn(1, 32, latent_frames, latent_height, latent_width)
+
+                # Visualize noise as grayscale frames
+                noise_frames = []
+                # Take mean across channels for visualization
+                # noise_vis = noise[0].mean(dim=0)  # (F, H, W)
+                # noise_vis = (noise_vis - noise_vis.min()) / (noise_vis.max() - noise_vis.min())  # Normalize to [0,1]
+
+                for f in range(noise.shape[0]):
+                    frame = noise[f].numpy()
+                    # Resize to match output resolution
+                    frame_resized = torch.nn.functional.interpolate(
+                        torch.from_numpy(frame).unsqueeze(0).unsqueeze(0),
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze().numpy()
+
+                    frame_uint8 = (frame_resized * 255).astype('uint8')
+                    # Convert grayscale to RGB
+                    frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
+                    noise_frames.append(PIL.Image.fromarray(frame_rgb))
+
+                # Save noise visualization
+                input_path = input_dir / f"step_{self._global_step:06d}_{video_idx}_input_t2v_noise.mp4"
+                export_to_video(noise_frames, str(input_path), fps=24)
+                logger.info(f"💾 Saved T2V noise input: {input_path.name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to save validation input: {e}")
+
+    def _save_full_sequence_video(self, intermediate_latents: list, prompt: str, prompt_idx: int, output_dir: Path) -> None:
+        """Save full denoising sequence as a single video."""
+        try:
+            # Create full sequence directory
+            sequence_dir = output_dir / "full_sequence"
+            sequence_dir.mkdir(exist_ok=True, parents=True)
+
+            # Move VAE to device temporarily
+            self._vae.to(self._accelerator.device)
+
+            # Get prev_seq_len from current training batch for V2V separation
+            prev_seq_len = 0
+            clean_prev_latents = None
+            if hasattr(self, '_current_training_batch') and self._current_training_batch is not None:
+                batch = self._current_training_batch
+                if batch.get("prev_conditions") is not None:
+                    # Extract clean prev latents from the original dataset
+                    try:
+                        from ltxv_trainer.SG_training_strategy import _unpack_latent_entry
+                        clean_prev_raw, F, H, W, fps = _unpack_latent_entry(batch["prev_conditions"])
+                        prev_seq_len = clean_prev_raw.shape[1]
+
+                        # Convert to 5D format for decoding
+                        from ltxv_trainer.SG_training_strategy import _unpack_latents
+                        clean_prev_latents = _unpack_latents(clean_prev_raw, F, H, W)
+                        logger.info(f"🎬 [FULL_SEQ] Extracted clean prev latents: {clean_prev_latents.shape}, prev_seq_len: {prev_seq_len}")
+                    except Exception as e:
+                        logger.warning(f"🎬 [FULL_SEQ] Could not extract clean prev latents: {e}")
+
+            all_frames = []
+
+            # Process all intermediate steps
+            for step_data in intermediate_latents:
+                step_num = step_data['step']
+                timestep = step_data['timestep']
+                latents = step_data['latents'].to(self._accelerator.device)
+
+                # For V2V: separate prev and curr portions
+                if prev_seq_len > 0 and clean_prev_latents is not None:
+                    # V2V case: use clean prev latents + decode curr portion from model output
+                    B, C, F, H, W = latents.shape
+
+                    # Split latents into prev and curr portions
+                    latents_seq = latents.flatten(2).transpose(1, 2)  # [B, seq_len, C]
+
+                    if latents_seq.shape[1] > prev_seq_len:
+                        # Extract curr portion (model output)
+                        curr_latents_seq = latents_seq[:, prev_seq_len:, :]  # [B, curr_seq_len, C]
+                        curr_seq_len = curr_latents_seq.shape[1]
+                        curr_frames = curr_seq_len // (H * W)
+
+                        # Reshape curr portion to 5D
+                        curr_latents_5d = curr_latents_seq.view(B, curr_frames, H, W, -1).permute(0, 4, 1, 2, 3)
+
+                        # Decode curr portion with model outputs
+                        with autocast(debug_device_type, dtype=torch.bfloat16):
+                            curr_decoded = decode_video(
+                                vae=self._vae,
+                                latents=curr_latents_seq[0],
+                                num_frames=curr_frames,
+                                height=H,
+                                width=W,
+                                device=debug_device,
+                                dtype=torch.bfloat16,
+                                decode_timestep=0.0
+                            )
+
+                        # Decode clean prev portion (always clean, not noisy)
+                        prev_latents_device = clean_prev_latents.to(self._accelerator.device)
+                        prev_latents_seq = prev_latents_device.flatten(2).transpose(1, 2)
+                        prev_frames = prev_latents_device.shape[2]
+
+                        with autocast(debug_device_type, dtype=torch.bfloat16):
+                            prev_decoded = decode_video(
+                                vae=self._vae,
+                                latents=prev_latents_seq[0],
+                                num_frames=prev_frames,
+                                height=H,
+                                width=W,
+                                device=debug_device,
+                                dtype=torch.bfloat16,
+                                decode_timestep=0.0
+                            )
+
+                        # Concatenate prev (clean) + curr (model output) videos
+                        combined_decoded = torch.cat([prev_decoded, curr_decoded], dim=1)  # [C, total_F, H, W]
+                        decoded = combined_decoded.unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()  # [B, F, H, W, C]
+
+                        logger.info(f"🎬 [FULL_SEQ] V2V: Combined {prev_frames} clean + {curr_frames} model frames")
+                    else:
+                        # Fallback: decode normally if sequence split fails
+                        with autocast(debug_device_type, dtype=torch.bfloat16):
+                            decoded = decode_video(
+                                vae=self._vae,
+                                latents=latents_seq[0],
+                                num_frames=F,
+                                height=H,
+                                width=W,
+                                device=debug_device,
+                                dtype=torch.bfloat16,
+                                decode_timestep=0.0
+                            )
+                        decoded = decoded.unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+                else:
+                    # T2V case: decode normally (all model outputs)
+                    with autocast(debug_device_type, dtype=torch.bfloat16):
+                        B, C, F, H, W = latents.shape
+                        latents_seq = latents.flatten(2).transpose(1, 2)  # [B, F*H*W, C]
+
+                        decoded = decode_video(
+                            vae=self._vae,
+                            latents=latents_seq[0],  # Remove batch dimension
+                            num_frames=F,
+                            height=H,
+                            width=W,
+                            device=debug_device,
+                            dtype=torch.bfloat16,
+                            decode_timestep=0.0
+                        )
+
+                        # Convert to expected format: [B, F, H, W, C]
+                        decoded = decoded.unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                # Convert to PIL images and add to sequence
+                for b in range(decoded.shape[0]):
+                    for f in range(decoded.shape[1]):
+                        frame = decoded[b, f].numpy()
+                        frame = (frame * 255).astype('uint8')
+                        all_frames.append(PIL.Image.fromarray(frame))
+
+            # Determine video type for filename (t2v vs v2v)
+            # This is a simple heuristic - could be improved with proper conditioning info
+            has_reference = hasattr(self, '_current_training_batch') and self._current_training_batch is not None
+            video_type = "v2v" if has_reference else "t2v"
+
+            # Save full sequence as one video
+            video_path = sequence_dir / f"step_{self._global_step:06d}_prompt_{prompt_idx}_full_sequence_{video_type}.mp4"
+            export_to_video(all_frames, str(video_path), fps=24)
+
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+
+            logger.info(f"🎬 Saved full denoising sequence ({len(all_frames)} frames): {video_path.name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to save full sequence video: {e}")
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
+    def _save_transformer_debug_videos(
+        self,
+        training_batch,
+        model_inputs: dict,
+        model_pred: torch.Tensor = None,
+        before_forward: bool = True,
+    ) -> None:
+        """Save transformer input (noisy) and output (denoised) videos for debugging."""
+        try:
+            debug_dir = Path(self._config.output_dir) / "debug_videos" / f"step_{self._global_step:06d}"
+            debug_dir.mkdir(exist_ok=True, parents=True)
+
+            # Move VAE temporarily to debug GPU
+            debug_gpu_id = getattr(self._config.debug, 'debug_gpu_id', 3)
+            debug_device = f"cuda:{debug_gpu_id}" if torch.cuda.is_available() else self._accelerator.device
+            debug_device_type = debug_device.split(':')[0]  # 'cuda' or 'cpu'
+            self._vae.to(debug_device)
+            logger.info(f"🎬 [DEBUG] Moved VAE to debug GPU: {debug_device}")
+
+            # Use debug device context for all operations
+            with torch.cuda.device(debug_device):
+                # -------------------------------
+                # Metadata & safety checks
+                # -------------------------------
+                F = getattr(training_batch, 'num_frames', 3)
+                height = getattr(training_batch, 'height', 448)
+                width = getattr(training_batch, 'width', 768)
+
+                if height <= 0 or width <= 0:
+                    logger.warning(f"🎬 [DEBUG] Invalid dimensions from training_batch: height={height}, width={width}")
+                    height, width = 448, 768  # Defaults
+
+                H_lat, W_lat = height, width
+                prev_seq_len = getattr(training_batch, "prev_seq_len", 0)
+                logger.info(f"🎬 [DEBUG] Metadata: F={F}, H={height}, W={width}, prev_seq_len={prev_seq_len}")
+
+                from ltxv_trainer.SG_training_strategy import _unpack_latents
+
+                # -------------------------------
+                # Transformer INPUT (before forward)
+                # -------------------------------
+                if before_forward:
+                    input_latents = model_inputs["hidden_states"]  # [B, seq_len, D]
+                    logger.info(f"🎬 [DEBUG] Saving transformer input latents: {input_latents.shape}")
+
+                    try:
+                        input_latents = input_latents.to(debug_device)
+
+                        expected_seq_len = F * H_lat * W_lat
+                        actual_seq_len = input_latents.shape[1]
+                        if actual_seq_len != expected_seq_len and H_lat * W_lat > 0:
+                            if actual_seq_len % (H_lat * W_lat) == 0:
+                                F = actual_seq_len // (H_lat * W_lat)
+                                logger.info(f"🎬 [DEBUG] Adjusted F to {F} based on seq_len")
+                            else:
+                                logger.warning("🎬 [DEBUG] Cannot fit input seq into H*W grid, skipping input save")
+                                return
+
+                        input_latents_5d = _unpack_latents(input_latents, F, H_lat, W_lat)
+
+                        # --- Case 1: V2V (has prev shot) ---
+                        if prev_seq_len > 0:
+                            prev_frames = prev_seq_len // (H_lat * W_lat)
+                            curr_frames = F - prev_frames
+
+                            # Decode prev (clean) if available
+                            decoded_prev = None
+                            if hasattr(training_batch, "prev_latents"):
+                                clean_prev = training_batch.prev_latents.to(debug_device)
+                                clean_prev_5d = _unpack_latents(clean_prev, prev_frames, H_lat, W_lat)
+                                decoded_prev = decode_video(
+                                    self._vae, clean_prev_5d[0], prev_frames, H_lat, W_lat,
+                                    device=debug_device, dtype=torch.bfloat16
+                                ).unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                            # Decode curr (noisy)
+                            curr_latents_5d = input_latents_5d[:, :, prev_frames:, :, :]
+                            curr_seq = curr_latents_5d.flatten(2).transpose(1, 2)
+                            with autocast(debug_device_type, dtype=torch.bfloat16):
+                                decoded_curr = decode_video(
+                                    self._vae, curr_seq[0], curr_frames, H_lat, W_lat,
+                                    device=debug_device, dtype=torch.bfloat16
+                                ).unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                            # Save combined prev+curr
+                            frames = []
+                            if decoded_prev is not None:
+                                frames += [PIL.Image.fromarray((decoded_prev[0, f].numpy() * 255).astype("uint8"))
+                                        for f in range(decoded_prev.shape[1])]
+                            frames += [PIL.Image.fromarray((decoded_curr[0, f].numpy() * 255).astype("uint8"))
+                                    for f in range(decoded_curr.shape[1])]
+
+                            export_to_video(frames, str(debug_dir / "transformer_input_prev_clean_curr_noisy.mp4"), fps=24)
+
+                        # --- Case 2: T2V (only SOS) ---
+                        else:
+                            latents_seq = input_latents_5d.flatten(2).transpose(1, 2)
+                            with autocast(debug_device_type, dtype=torch.bfloat16):
+                                decoded = decode_video(
+                                    self._vae, latents_seq[0], F, H_lat, W_lat,
+                                    device=debug_device, dtype=torch.bfloat16
+                                ).unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                            frames = [PIL.Image.fromarray((decoded[0, f].numpy() * 255).astype("uint8"))
+                                    for f in range(decoded.shape[1])]
+                            export_to_video(frames, str(debug_dir / "transformer_input_noisy.mp4"), fps=24)
+
+                    except Exception as e:
+                        logger.warning(f"🎬 [DEBUG] Failed to save transformer input video: {e}")
+
+                # -------------------------------
+                # Transformer OUTPUT (after forward)
+                # -------------------------------
+                else:
+                    if model_pred is not None:
+                        logger.info(f"🎬 [DEBUG] Saving transformer output prediction: {model_pred.shape}")
+                        try:
+                            model_pred = model_pred.to(debug_device)
+
+                            expected_seq_len = F * H_lat * W_lat
+                            actual_seq_len = model_pred.shape[1]
+                            if actual_seq_len != expected_seq_len and H_lat * W_lat > 0:
+                                if actual_seq_len % (H_lat * W_lat) == 0:
+                                    F = actual_seq_len // (H_lat * W_lat)
+                                    logger.info(f"🎬 [DEBUG] Adjusted F to {F} based on seq_len")
+                                else:
+                                    logger.warning("🎬 [DEBUG] Cannot fit output seq into H*W grid, skipping output save")
+                                    return
+
+                            output_latents_5d = _unpack_latents(model_pred, F, H_lat, W_lat)
+
+                            # --- Case 1: V2V ---
+                            if prev_seq_len > 0:
+                                prev_frames = prev_seq_len // (H_lat * W_lat)
+                                curr_frames = F - prev_frames
+                                curr_output_5d = output_latents_5d[:, :, prev_frames:, :, :]
+                                curr_seq = curr_output_5d.flatten(2).transpose(1, 2)
+
+                                with autocast(debug_device_type, dtype=torch.bfloat16):
+                                    decoded = decode_video(
+                                        self._vae, curr_seq[0], curr_frames, H_lat, W_lat,
+                                        device=debug_device, dtype=torch.bfloat16
+                                    ).unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                                frames = [PIL.Image.fromarray((decoded[0, f].numpy() * 255).astype("uint8"))
+                                        for f in range(decoded.shape[1])]
+                                export_to_video(frames, str(debug_dir / "transformer_output_denoised_curr.mp4"), fps=24)
+
+                            # --- Case 2: T2V ---
+                            else:
+                                latents_seq = output_latents_5d.flatten(2).transpose(1, 2)
+                                with autocast(debug_device_type, dtype=torch.bfloat16):
+                                    decoded = decode_video(
+                                        self._vae, latents_seq[0], F, H_lat, W_lat,
+                                        device=debug_device, dtype=torch.bfloat16
+                                    ).unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
+
+                                frames = [PIL.Image.fromarray((decoded[0, f].numpy() * 255).astype("uint8"))
+                                        for f in range(decoded.shape[1])]
+                                export_to_video(frames, str(debug_dir / "transformer_output_denoised.mp4"), fps=24)
+
+                        except Exception as e:
+                            logger.warning(f"🎬 [DEBUG] Failed to save transformer output video: {e}")
+
+                # Free GPU memory
+                self._vae.to("cpu")
+                logger.info("🎬 [DEBUG] Moved VAE back to CPU")
+
+        except Exception as e:
+            logger.warning(f"🎬 [DEBUG] Failed to save transformer debug videos: {e}", exc_info=True)
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
+
+   
     def _save_intermediate_validation_steps(self, intermediate_latents: list, prompt: str, prompt_idx: int) -> None:
         """Save intermediate validation steps as videos for ODE visualization."""
         try:
@@ -1291,14 +2034,25 @@ class LtxvTrainer:
                 timestep = step_data['timestep']
                 latents = step_data['latents'].to(self._accelerator.device)
                 
-                # Decode latents to video frames
-                with autocast(self._accelerator.device.type, dtype=torch.bfloat16):
-                    # Simple decode using VAE
-                    decoded = self._vae.decode(latents)[0]
-                    
+                # Decode latents to video frames using decode_video
+                with autocast(debug_device_type, dtype=torch.bfloat16):
+                    # Use decode_video from ltxv_utils
+                    B, C, F, H, W = latents.shape
+                    latents_seq = latents.flatten(2).transpose(1, 2)  # [B, F*H*W, C]
+
+                    decoded = decode_video(
+                        vae=self._vae,
+                        latents=latents_seq[0],  # Remove batch dimension
+                        num_frames=F,
+                        height=H,
+                        width=W,
+                        device=debug_device,
+                        dtype=torch.bfloat16,
+                        decode_timestep=0.0
+                    )
+
                     # Convert to video format (B, C, F, H, W) -> (B, F, H, W, C)
-                    decoded = decoded.permute(0, 2, 3, 4, 1).cpu()
-                    decoded = decoded.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+                    decoded = decoded.unsqueeze(0).permute(0, 2, 3, 4, 1).cpu()
                     
                     # Convert to list of PIL images
                     frames = []
@@ -1351,6 +2105,25 @@ class LtxvTrainer:
             scenario: Scenario string (e.g., "shot1,transition,shot2,stable,shot3")
         """
         if not self._config.validation.interval:
+            return
+
+        # Only run validation on debug GPU to avoid OOM on training GPUs
+        debug_gpu_id = getattr(self._config.debug, 'debug_gpu_id', None)
+        current_gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+        # Map physical GPU ID to PyTorch GPU ID if using CUDA_VISIBLE_DEVICES
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if debug_gpu_id is not None and cuda_visible_devices:
+            visible_gpus = [int(x) for x in cuda_visible_devices.split(',') if x.strip().isdigit()]
+            if debug_gpu_id in visible_gpus:
+                debug_gpu_id = visible_gpus.index(debug_gpu_id)  # Map to PyTorch index
+                logger.debug(f"🔥 [VALIDATION] Mapped physical GPU {getattr(self._config.debug, 'debug_gpu_id')} to PyTorch GPU {debug_gpu_id}")
+            else:
+                logger.warning(f"🔥 [VALIDATION] Debug GPU {debug_gpu_id} not in CUDA_VISIBLE_DEVICES={cuda_visible_devices}")
+                debug_gpu_id = None
+
+        if debug_gpu_id is not None and current_gpu_id != debug_gpu_id:
+            logger.debug(f"🔥 [VALIDATION] Skipping validation on GPU {current_gpu_id}, only running on debug GPU {debug_gpu_id}")
             return
 
         logger.info("🔥 " + "=" * 80)
@@ -1445,6 +2218,9 @@ class LtxvTrainer:
 
             t2v_pipeline = t2v_pipeline.to(device)
 
+            # Ensure VAE is on correct device (fix for device mismatch)
+            t2v_pipeline.vae = t2v_pipeline.vae.to(device)
+
             # Verify after move to device
             logger.info(f"🎯 [T2V] After pipeline.to(device):")
             logger.info(f"🎯 [T2V] VAE device: {next(t2v_pipeline.vae.parameters()).device}")
@@ -1483,14 +2259,35 @@ class LtxvTrainer:
                 "scenario": scenario,
                 "shot_latents": shot_latents,
                 "validation_type": "t2v_validation",
-                "step": self._global_step
+                "step": self._global_step,
+                "save_full_sequence": self._config.validation.save_full_sequence,  # Add full sequence saving
             }
+            # Save T2V input (noise visualization) before running pipeline
+            # self._save_unified_validation_input(pipeline_inputs, output_dir, "t2v", self._global_step)
+            t2v_pipeline.enable_debug_capture()
+            
+
             # First run the full scenario for overall processing (keeping original functionality)
             with autocast(device.type, dtype=torch.bfloat16):
                 result = t2v_pipeline(**pipeline_inputs)
 
             # Get debug latents
             debug_latents = t2v_pipeline.get_debug_latents()
+            
+            
+            logger.info(f"debug input latents : {debug_latents['valid_input'].shape}")
+
+            # Save input video
+            if debug_latents.get('valid_input') is not None:
+                input_path = output_dir / f"t2v_step_{self._global_step:06d}_valid_input.mp4"
+                self._save_debug_latents_as_video(debug_latents['valid_input'], input_path)
+                logger.info(f"✅ Saved input: {input_path.name}")
+
+            # Save output video
+            if debug_latents.get('valid_output') is not None:
+                output_path = output_dir / f"t2v_step_{self._global_step:06d}_valid_output.mp4"
+                self._save_debug_latents_as_video(debug_latents['valid_output'], output_path)
+                logger.info(f"✅ Saved output: {output_path.name}")
 
             # Save metadata
             metadata = {
@@ -1523,9 +2320,9 @@ class LtxvTrainer:
             # denoised_shot0_transition_noisyshot1.mp4, denoised_shot0_transition_denoisedshot1.mp4
             # denoised_shot1_stable_noisyshot2.mp4, denoised_shot1_stable_denoisedshot2.mp4
 
-            prev_latents = sos_latents_5d  # Start with batch prev latents
+            prev_latents = sos_latents[0]  # Start with batch prev latents
             prev_state = f"shot1"
-            curr_latents = curr_noise_5d
+            curr_latents = sos_latents[0]
             curr_state = f"shot2"
 
 
@@ -1554,7 +2351,8 @@ class LtxvTrainer:
                         "generator": torch.Generator(device=device).manual_seed(42 + shot_idx),
                         "scenario": f"shot{shot_idx+1}",
                         "validation_type": "t2v_validation",
-                        "step": self._global_step
+                        "step": self._global_step,
+                        "save_full_sequence": self._config.validation.save_full_sequence,  # Add full sequence saving
                     }
 
                     # Run pipeline for this shot
@@ -1594,14 +2392,69 @@ class LtxvTrainer:
                                 # Calculate expected dimensions
                                 expected_tokens = latent_num_frames * latent_height * latent_width
                                 logger.info(f"🎯 [T2V] Expected tokens: {expected_tokens}, actual: {target_latents.shape[1]}")
-                                # Use SOS latents as fallback
-                                prev_latents = sos_latents
-                                logger.warning(f"🎯 [T2V] ⚠️ Using SOS latents as fallback due to reshape error")
+
+                                # Fix mismatch by reshaping/padding/truncating instead of SOS fallback
+                                try:
+                                    if target_latents.shape[1] > expected_tokens:
+                                        # Truncate to expected size
+                                        target_latents = target_latents[:, :expected_tokens, :]
+                                        logger.info(f"🎯 [T2V] 🔧 Truncated to {target_latents.shape}")
+                                    elif target_latents.shape[1] < expected_tokens:
+                                        # Pad by repeating last token
+                                        pad_length = expected_tokens - target_latents.shape[1]
+                                        last_token = target_latents[:, -1:, :].repeat(1, pad_length, 1)
+                                        target_latents = torch.cat([target_latents, last_token], dim=1)
+                                        logger.info(f"🎯 [T2V] 🔧 Padded to {target_latents.shape}")
+
+                                    # Retry unpacking with corrected size
+                                    actual_num_frames = expected_tokens // (latent_height * latent_width)
+                                    prev_latents = t2v_pipeline._unpack_latents(
+                                        target_latents,
+                                        actual_num_frames,
+                                        latent_height,
+                                        latent_width,
+                                        t2v_pipeline.transformer_spatial_patch_size,
+                                        t2v_pipeline.transformer_temporal_patch_size,
+                                    )
+                                    logger.info(f"🎯 [T2V] ✅ Successfully unpacked after size correction")
+                                except Exception as final_error:
+                                    logger.warning(f"🎯 [T2V] ⚠️ Final reshape attempt failed: {final_error}")
+                                    # Only use SOS as last resort
+                                    prev_latents = sos_latents
+                                    logger.warning(f"🎯 [T2V] ⚠️ Using SOS latents as final fallback")
                             logger.info(f"🎯 [T2V] 🔄 Converted packed latents {packed_latents.shape} to 5D {prev_latents.shape} for next shot")
                         else:
-                            # Fallback: use original SOS latents
-                            prev_latents = sos_latents
-                            logger.warning(f"Failed to convert debug latents to 5D, using SOS latents")
+                            # Handle dimension/packing issue instead of SOS fallback
+                            logger.warning(f"🎯 [T2V] Packed latents shape issue: {packed_latents.shape}, expected tokens: {total_tokens}")
+
+                            # Try to fix packed latents shape
+                            try:
+                                if packed_latents.shape[1] != total_tokens:
+                                    if packed_latents.shape[1] > total_tokens:
+                                        # Truncate
+                                        packed_latents = packed_latents[:, :total_tokens, :]
+                                    else:
+                                        # Pad
+                                        pad_length = total_tokens - packed_latents.shape[1]
+                                        last_token = packed_latents[:, -1:, :].repeat(1, pad_length, 1)
+                                        packed_latents = torch.cat([packed_latents, last_token], dim=1)
+
+                                # Retry unpacking
+                                actual_num_frames = total_tokens // (latent_height * latent_width)
+                                prev_latents = t2v_pipeline._unpack_latents(
+                                    packed_latents,
+                                    actual_num_frames,
+                                    latent_height,
+                                    latent_width,
+                                    t2v_pipeline.transformer_spatial_patch_size,
+                                    t2v_pipeline.transformer_temporal_patch_size,
+                                )
+                                logger.info(f"🎯 [T2V] ✅ Fixed packed latents and unpacked successfully")
+                            except Exception as fix_error:
+                                logger.warning(f"🎯 [T2V] ⚠️ Could not fix packed latents: {fix_error}")
+                                # Use SOS only as final fallback
+                                prev_latents = sos_latents
+                                logger.warning(f"🎯 [T2V] ⚠️ Using SOS latents as final fallback")
 
                     # Update prev_state for next iteration
                     prev_state = f"denoised_shot{shot_idx}"
@@ -1636,6 +2489,7 @@ class LtxvTrainer:
         logger.info("=" * 80)
         logger.info(f"🎬 [V2V] Scenario: {scenario}")
         logger.info(f"🎬 [V2V] Output directory: {output_dir}")
+        logger.info(f"🎬 [V2V] Batch have keys : {training_batch.keys()}")
 
         try:
             # Import here to avoid circular import
@@ -1672,10 +2526,16 @@ class LtxvTrainer:
 
             v2v_pipeline.set_progress_bar_config(disable=True)
             v2v_pipeline = v2v_pipeline.to(device)
+
+            # Ensure VAE is on correct device (fix for device mismatch)
+            v2v_pipeline.vae = v2v_pipeline.vae.to(device)
+            logger.info(f"🎬 [V2V] VAE moved to device: {next(v2v_pipeline.vae.parameters()).device}")
+
             v2v_pipeline.enable_debug_capture()
 
             # Extract SOS from training batch prev_conditions
-            prev_conditions = training_batch.get('prev_conditions') or getattr(training_batch, 'prev_conditions', None)
+            logger.info(f"traning batch keys : {training_batch.keys()}")
+            prev_conditions = training_batch["prev_conditions"]
 
             if prev_conditions is None:
                 logger.warning("🎬 [V2V] ⚠️ No prev_conditions in training batch, skipping validation")
@@ -1764,8 +2624,12 @@ class LtxvTrainer:
                 "scenario": scenario,
                 "shot_latents": shot_latents,
                 "validation_type": "v2v_validation",
-                "step": self._global_step
+                "step": self._global_step,
+                "save_full_sequence": self._config.validation.save_full_sequence,  # Add full sequence saving
             }
+
+            # Save V2V input (clean reference video from training batch) before running pipeline
+            # self._save_unified_validation_input(pipeline_inputs, output_dir, "v2v", self._global_step)
 
             # First run the full scenario for overall processing (keeping original functionality)
             with autocast(device.type, dtype=torch.bfloat16):
@@ -1779,7 +2643,20 @@ class LtxvTrainer:
 
             # Get debug latents
             debug_latents = v2v_pipeline.get_debug_latents()
+            
+            # Save input video
+            if debug_latents.get('valid_input') is not None:
+                input_path = output_dir / f"v2v_step_{self._global_step:06d}_valid_input.mp4"
+                self._save_debug_latents_as_video(debug_latents['valid_input'], input_path)
+                logger.info(f"✅ Saved input: {input_path.name}")
+            else:
+                logger.info("no valid input found")
 
+            # Save output video
+            if debug_latents.get('valid_output') is not None:
+                output_path = output_dir / f"v2v_step_{self._global_step:06d}_valid_output.mp4"
+                self._save_debug_latents_as_video(debug_latents['valid_output'], output_path)
+                logger.info(f"✅ Saved output: {output_path.name}")
             # Get the actual prompt text for metadata (decode from embeddings if possible)
             prompt_text = "training_batch_prompt"
             if hasattr(training_batch, 'prompt') and training_batch.prompt:
@@ -1811,105 +2688,108 @@ class LtxvTrainer:
                 else:  # Odd indices are connectors
                     connectors.append(item)
 
+
+
             # Generate each shot individually to get proper noisy/denoised pairs
             # For scenario "shot1,transition,shot2,stable,shot3" we need:
             # sos_transition_noisyshot0.mp4, sos_transition_denoisedshot0.mp4
             # denoised_shot0_transition_noisyshot1.mp4, denoised_shot0_transition_denoisedshot1.mp4
             # denoised_shot1_stable_noisyshot2.mp4, denoised_shot1_stable_denoisedshot2.mp4
 
-            prev_latents = sos_latents_5d  # Start with batch prev latents
-            prev_state = f"shot1"
-            curr_latents = curr_noise_5d
-            curr_state = f"shot2"
+            # prev_latents = sos_latents_5d  # Start with batch prev latents
+            # prev_state = f"shot1"
+            # curr_latents = curr_noise_5d
+            # curr_state = f"shot2"
 
-            for shot_idx, shot_name in enumerate(shot_names):
-                # Determine connector for this shot
-                connector = connectors[shot_idx] if shot_idx < len(connectors) else "stable"
+            # for shot_idx, shot_name in enumerate(shot_names):
+            #     # Determine connector for this shot
+            #     connector = connectors[shot_idx] if shot_idx < len(connectors) else "stable"
 
-                # Generate filenames with 0-indexed shot numbers (V2V)
-                noisy_filename = f"v2v_{prev_state}_{connector}_noisyshot{shot_idx+2}.mp4"
-                denoised_filename = f"v2v_{prev_state}_{connector}_denoisedshot{shot_idx+2}.mp4"
+            #     # Generate filenames with 0-indexed shot numbers (V2V)
+            #     noisy_filename = f"v2v_{prev_state}_{connector}_noisyshot{shot_idx+2}.mp4"
+            #     denoised_filename = f"v2v_{prev_state}_{connector}_denoisedshot{shot_idx+2}.mp4"
 
-                # Set shot_latents on the pipeline directly for individual shot
-                if f"shot{shot_idx+2}" in shot_names:
-                    shot_latents_iter = {f"shot{shot_idx+1}": prev_latents[0],
-                                         f"shot{shot_idx+2}": curr_latents[0]}
+            #     # Set shot_latents on the pipeline directly for individual shot
+            #     if f"shot{shot_idx+2}" in shot_names:
+            #         shot_latents_iter = {f"shot{shot_idx+1}": prev_latents[0],
+            #                              f"shot{shot_idx+2}": curr_latents[0]}
                     
-                    # Create individual shot pipeline inputs
-                    shot_pipeline_inputs = {
-                        "prompt_embeds": prompt_embeds,
-                        "prompt_attention_mask": prompt_attention_mask,
-                        "negative_prompt_embeds": None,
-                        "height": height,
-                        "width": width,
-                        "num_frames": frames,
-                        "num_videos_per_prompt": 1,
-                        "num_inference_steps": self._config.validation.inference_steps,
-                        "guidance_scale": self._config.validation.guidance_scale,
-                        "generator": torch.Generator(device=device).manual_seed(42 + shot_idx),
-                        "return_latents": True,
-                        "return_dict": True,
-                        "scenario": f"shot{shot_idx+1},{connector},shot{shot_idx+2}",
-                        "shot_latents": shot_latents_iter,
-                        "validation_type": "v2v_validation",
-                        "step": self._global_step
-                    }
+            #         # Create individual shot pipeline inputs
+            #         shot_pipeline_inputs = {
+            #             "prompt_embeds": prompt_embeds,
+            #             "prompt_attention_mask": prompt_attention_mask,
+            #             "negative_prompt_embeds": None,
+            #             "height": height,
+            #             "width": width,
+            #             "num_frames": frames,
+            #             "num_videos_per_prompt": 1,
+            #             "num_inference_steps": self._config.validation.inference_steps,
+            #             "guidance_scale": self._config.validation.guidance_scale,
+            #             "generator": torch.Generator(device=device).manual_seed(42 + shot_idx),
+            #             "return_latents": True,
+            #             "return_dict": True,
+            #             "scenario": f"shot{shot_idx+1},{connector},shot{shot_idx+2}",
+            #             "shot_latents": shot_latents_iter,
+            #             "validation_type": "v2v_validation",
+            #             "step": self._global_step,
+            #             "save_full_sequence": self._config.validation.save_full_sequence,  # Add full sequence saving
+            #         }
 
-                    # Run pipeline for this shot
-                    with autocast(device.type, dtype=torch.bfloat16):
-                        # Temporarily bypass check_inputs validation for prompt_embeds
-                        original_check_inputs = v2v_pipeline.check_inputs
-                        v2v_pipeline.check_inputs = lambda *args, **kwargs: None
-                        try:
-                            shot_result = v2v_pipeline(**shot_pipeline_inputs)
+            #         # Run pipeline for this shot
+            #         with autocast(device.type, dtype=torch.bfloat16):
+            #             # Temporarily bypass check_inputs validation for prompt_embeds
+            #             original_check_inputs = v2v_pipeline.check_inputs
+            #             v2v_pipeline.check_inputs = lambda *args, **kwargs: None
+            #             try:
+            #                 shot_result = v2v_pipeline(**shot_pipeline_inputs)
                             
-                        finally:
-                            v2v_pipeline.check_inputs = original_check_inputs
+            #             finally:
+            #                 v2v_pipeline.check_inputs = original_check_inputs
                             
                         
 
-                    # Get debug latents for this shot
-                    shot_debug_latents = v2v_pipeline.get_debug_latents()
+            #         # Get debug latents for this shot
+            #         shot_debug_latents = v2v_pipeline.get_debug_latents()
 
-                    # Get denoised output for next shot (no video saving)
-                    if shot_debug_latents.get('valid_output') is not None:
-                        logger.info(f"✅ V2V shot {shot_idx+2} denoised output ready")
+            #         # Get denoised output for next shot (no video saving)
+            #         if shot_debug_latents.get('valid_output') is not None:
+            #             logger.info(f"✅ V2V shot {shot_idx+2} denoised output ready")
 
-                        # Convert packed latents back to 5D format for next shot
-                        packed_latents = shot_debug_latents['valid_output']
-                        if packed_latents.dim() == 3 and packed_latents.shape[1] >= total_tokens:
-                            # Extract only the target video portion (remove reference part if present)
-                            if packed_latents.shape[1] > total_tokens:
-                                # Remove reference latents from the beginning
-                                target_latents = packed_latents[:, -total_tokens:, :]
-                            else:
-                                target_latents = packed_latents
-                            sequence_length = target_latents.shape[1]  # [B, Seq, D]
-                            actual_num_frames = sequence_length // (latent_height * latent_width)
-                            # Unpack to 5D format
-                            prev_latents = v2v_pipeline._unpack_latents(
-                                target_latents,
-                                actual_num_frames,
-                                latent_height,
-                                latent_width,
-                                v2v_pipeline.transformer_spatial_patch_size,
-                                v2v_pipeline.transformer_temporal_patch_size,
-                            )
-                            logger.info(f"🔄 V2V: Converted packed latents {packed_latents.shape} to 5D {prev_latents.shape} for next shot")
-                        else:
-                            # Fallback: use original SOS latents
-                            prev_latents = sos_latents_5d
-                            logger.warning(f"V2V: Failed to convert debug latents to 5D, using SOS latents")
+            #             # Convert packed latents back to 5D format for next shot
+            #             packed_latents = shot_debug_latents['valid_output']
+            #             if packed_latents.dim() == 3 and packed_latents.shape[1] >= total_tokens:
+            #                 # Extract only the target video portion (remove reference part if present)
+            #                 if packed_latents.shape[1] > total_tokens:
+            #                     # Remove reference latents from the beginning
+            #                     target_latents = packed_latents[:, -total_tokens:, :]
+            #                 else:
+            #                     target_latents = packed_latents
+            #                 sequence_length = target_latents.shape[1]  # [B, Seq, D]
+            #                 actual_num_frames = sequence_length // (latent_height * latent_width)
+            #                 # Unpack to 5D format
+            #                 prev_latents = v2v_pipeline._unpack_latents(
+            #                     target_latents,
+            #                     actual_num_frames,
+            #                     latent_height,
+            #                     latent_width,
+            #                     v2v_pipeline.transformer_spatial_patch_size,
+            #                     v2v_pipeline.transformer_temporal_patch_size,
+            #                 )
+            #                 logger.info(f"🔄 V2V: Converted packed latents {packed_latents.shape} to 5D {prev_latents.shape} for next shot")
+            #             else:
+            #                 # Fallback: use original SOS latents
+            #                 prev_latents = sos_latents_5d
+            #                 logger.warning(f"V2V: Failed to convert debug latents to 5D, using SOS latents")
 
-                    # Update prev_state for next iteration
-                    prev_state = f"denoised_shot{shot_idx}"
+            #         # Update prev_state for next iteration
+            #         prev_state = f"denoised_shot{shot_idx}"
 
-                logger.info("🎬 [V2V] ✅ VALIDATION COMPLETED")
+            #     logger.info("🎬 [V2V] ✅ VALIDATION COMPLETED")
 
-                # Return denoised result
-                if debug_latents.get('valid_output') is not None:
-                    return debug_latents['valid_output']
-                else:
+            #     # Return denoised result
+            #     if debug_latents.get('valid_output') is not None:
+            #         return debug_latents['valid_output']
+            #     else:
                     return None
 
         except Exception as e:
@@ -1921,3 +2801,73 @@ class LtxvTrainer:
         finally:
             logger.info("🎬 [V2V] " + "=" * 50)
 
+
+    def _save_debug_latents_as_video(self, latents: torch.Tensor, output_path: Path):
+        """Save debug latents as MP4 video."""
+        try:
+            # Use debug GPU
+            debug_device = torch.device(f"cuda:{self._config.debug.debug_gpu_id}")
+
+            # Move VAE to debug device
+            self._vae.to(debug_device)
+            latents = latents.to(debug_device)
+            logger.info(f"[save] latents : {latents.shape}")
+
+            # Decode latents to video
+            with autocast(debug_device.type, dtype=torch.bfloat16):
+                # Take first batch item and decode
+                video_latents = latents[0:1]  # [1, seq_len, 128]
+                # Use actual training batch dimensions
+                if hasattr(self, '_current_training_batch') and self._current_training_batch is not None:
+                    # logger.info(f"  training batch : {self._current_training_batch}")
+                    num_frames = self._current_training_batch["latent_conditions"]["num_frames"] * 4 - 1
+                    height = self._current_training_batch["latent_conditions"]["height"]
+                    width = self._current_training_batch["latent_conditions"]["width"]
+                else:
+                    # Fallback dimensions
+                    num_frames = 6
+                    height = 14  # 448 // 8
+                    width = 24   # 768 // 8
+
+                from .ltxv_utils import decode_video
+                logger.info(f"video latents : {video_latents.shape}")
+                logger.info(f"frames : {num_frames}, H : {height}, W : {width}")
+                video_latents = video_latents.squeeze(0)
+                decoded = decode_video(
+                    vae=self._vae,
+                    latents=video_latents,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                    device=debug_device,
+                    dtype=torch.bfloat16
+                )
+            logger.info(f"decoded shape:{decoded.shape}")
+            decoded = decoded.squeeze(0)
+
+            # Convert to video format and save
+            video_tensor = decoded.permute(1, 2, 3, 0)  # (F, H, W, 3)
+            video_tensor = video_tensor.clamp(-1, 1).add(1).div(2)  # [-1,1] -> [0,1]
+            logger.info(f"[save] video tensor : { video_tensor.shape}")
+
+            # Convert to numpy and scale to [0, 255]f
+            video_np = video_tensor.cpu().float().numpy()
+            video_np = (video_np * 255).astype(np.uint8)
+
+            # Convert to list of PIL Images for video export
+            from PIL import Image
+            video_frames = [Image.fromarray(frame) for frame in video_np]
+
+            # Save as MP4 video
+            from diffusers.utils import export_to_video
+            export_to_video(video_frames, str(output_path), fps=24)
+
+            # Move VAE back to CPU
+            self._vae.to("cpu")
+
+        except Exception as e:
+            logger.warning(f"Failed to save debug video {output_path}: {e}")
+            try:
+                self._vae.to("cpu")
+            except:
+                pass
