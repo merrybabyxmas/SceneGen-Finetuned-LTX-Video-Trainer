@@ -44,7 +44,7 @@ acceleration:
 
 # Data configuration
 data:
-  preprocessed_data_root: "datasets/Cakeify-Dataset"
+  preprocessed_data_root: "/home/jeongseon39/MLLAB/video_gen/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 2
 
 # Validation configuration
@@ -74,13 +74,13 @@ flow_matching:
 # HuggingFace Hub configuration
 hub:
   push_to_hub: false # Whether to push the model weights to the Hugging Face Hub
-  hub_model_id: null # Hugging Face Hub repository ID (e.g., 'username/repo-name'). Must be provided if `push_to_hub` is set to True
+  hub_model_id: "urjeongseon/ltxv_finetuned" # Hugging Face Hub repository ID (e.g., 'username/repo-name'). Must be provided if `push_to_hub` is set to True
 
 # W&B configuration
 wandb:
   enabled: false  # Set to true to enable W&B logging
-  project: "ltxv-trainer"
-  entity: null  # Your W&B username or team
+  project: "ltxv-scenegen-training"
+  entity: "jeongseon-sogang-university"  # Your W&B username or team
   tags: []
   log_validation_videos: true
 

@@ -107,6 +107,21 @@ class ConditioningConfig(ConfigBaseModel):
         description="Enable memory efficient attention for cross attention mode",
     )
 
+    # PC-CFM specific settings
+    lambda_val: float = Field(
+        default=0.01,
+        description="Lambda value for PC-CFM loss - controls strength of previous shot influence on current shot",
+        ge=0.0,
+        le=1.0,
+    )
+
+    reference_noise_level: float = Field(
+        default=0.0,
+        description="Noise level added to reference latents to reduce inter-shot dependency (0.0 = no noise, 0.1 = 10% noise)",
+        ge=0.0,
+        le=0.5,
+    )
+
 
 class OptimizationConfig(ConfigBaseModel):
     """Configuration for optimization parameters"""
@@ -424,6 +439,25 @@ class DebugConfig(ConfigBaseModel):
     )
 
 
+class LoggingConfig(ConfigBaseModel):
+    """Configuration for logging output"""
+
+    save_logs: bool = Field(
+        default=False,
+        description="Enable saving logs to file",
+    )
+
+    log_dir: str = Field(
+        default="outputs/logs",
+        description="Directory to save log files",
+    )
+
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level (DEBUG, INFO, WARNING, ERROR)",
+    )
+
+
 class LtxvTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
@@ -440,6 +474,7 @@ class LtxvTrainerConfig(ConfigBaseModel):
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # General configuration
     seed: int = Field(

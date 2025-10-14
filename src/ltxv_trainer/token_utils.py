@@ -20,21 +20,27 @@ class VideoTokenEmbeddings(nn.Module):
     Learnable embeddings for stable and transition tokens in multi-shot video generation.
     """
 
-    def __init__(self, hidden_dim: int = 128):
+    def __init__(self, hidden_dim: int = 128, spatial_height: int = 24, spatial_width: int = 14):
         """
         Initialize video token embeddings.
 
         Args:
             hidden_dim: Dimension of the latent space (should match transformer hidden size)
+            spatial_height: Height dimension of the latent space
+            spatial_width: Width dimension of the latent space
         """
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.spatial_height = spatial_height
+        self.spatial_width = spatial_width
+        self.token_dim = spatial_height * spatial_width * hidden_dim
 
-        logger.info(f"🎭 Initializing VideoTokenEmbeddings with hidden_dim={hidden_dim}")
+        logger.info(f"🎭 Initializing VideoTokenEmbeddings with hidden_dim={hidden_dim}, spatial={spatial_height}x{spatial_width}")
+        logger.info(f"🎭 Token dimension: H*W*D = {spatial_height}*{spatial_width}*{hidden_dim} = {self.token_dim}")
 
-        # Learnable token embeddings
-        self.stable_token = nn.Parameter(torch.randn(hidden_dim))
-        self.transition_token = nn.Parameter(torch.randn(hidden_dim))
+        # Learnable token embeddings with H*W*D dimensions
+        self.stable_token = nn.Parameter(torch.randn(self.token_dim))
+        self.transition_token = nn.Parameter(torch.randn(self.token_dim))
 
         # Initialize with small values for stable training
         nn.init.normal_(self.stable_token, std=0.02)
@@ -44,22 +50,31 @@ class VideoTokenEmbeddings(nn.Module):
         logger.info(f"🎭   Transition token initialized: shape={self.transition_token.shape}, std=0.02")
         logger.info(f"🎭   VideoTokenEmbeddings ready for training!")
 
-    def get_stable_token(self, device: torch.device) -> Tensor:
-        """Get stable token for intra-shot continuity."""
-        return self.stable_token.to(device)
+    def get_stable_token(self, device: torch.device, target_shape: tuple = None) -> Tensor:
+        """Get stable token for intra-shot continuity, reshaped to [H, W, D] or target_shape."""
+        token = self.stable_token.to(device)
+        if target_shape is not None:
+            H, W, D = target_shape
+            return token.reshape(H, W, D)
+        return token.reshape(self.spatial_height, self.spatial_width, self.hidden_dim)
 
-    def get_transition_token(self, device: torch.device) -> Tensor:
-        """Get transition token for inter-shot transitions."""
-        return self.transition_token.to(device)
+    def get_transition_token(self, device: torch.device, target_shape: tuple = None) -> Tensor:
+        """Get transition token for inter-shot transitions, reshaped to [H, W, D] or target_shape."""
+        token = self.transition_token.to(device)
+        if target_shape is not None:
+            H, W, D = target_shape
+            return token.reshape(H, W, D)
+        return token.reshape(self.spatial_height, self.spatial_width, self.hidden_dim)
 
 
-def insert_stable_tokens(latents: Tensor, stable_token: Tensor) -> Tensor:
+def insert_stable_tokens(latents: Tensor, stable_token_or_embeddings, device: torch.device = None) -> Tensor:
     """
     Insert stable tokens between latent frames within a shot.
 
     Args:
         latents: Shot latents [F, H, W, D] where F=frames, H=height, W=width, D=channels
-        stable_token: Stable token embedding [D]
+        stable_token_or_embeddings: Either a stable token tensor [H, W, D] or VideoTokenEmbeddings instance
+        device: Device for token embeddings (only used if stable_token_or_embeddings is VideoTokenEmbeddings)
 
     Returns:
         Tokenized latents with stable tokens inserted: [F + (F-1), H, W, D]
@@ -67,7 +82,16 @@ def insert_stable_tokens(latents: Tensor, stable_token: Tensor) -> Tensor:
     """
     logger.info(f"latents shape for stable tokens:  {latents.shape}")
     F, H, W, D = latents.shape
-    device = latents.device
+    latents_device = latents.device
+
+    # Handle both token tensor and VideoTokenEmbeddings
+    if hasattr(stable_token_or_embeddings, 'get_stable_token'):
+        # It's a VideoTokenEmbeddings instance
+        target_device = device if device is not None else latents_device
+        stable_token = stable_token_or_embeddings.get_stable_token(target_device, target_shape=(H, W, D))
+    else:
+        # It's already a token tensor
+        stable_token = stable_token_or_embeddings
 
     logger.info(f"🔧 Inserting stable tokens: input shape {latents.shape}, stable_token shape {stable_token.shape}")
 
@@ -78,10 +102,9 @@ def insert_stable_tokens(latents: Tensor, stable_token: Tensor) -> Tensor:
     logger.info(f"stable token shape : {stable_token.shape}")
     logger.info(f"latents token shape : {latents.shape}")
 
-    # Create stable token tensor matching spatial dimensions
-    stable_expanded = stable_token.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, D]
-    stable_spatial = stable_expanded.expand(1, H, W, D)  # [1, H, W, D]
-    logger.info(f"🔧 Stable token expanded to spatial dims: {stable_spatial.shape}")
+    # Stable token should match latent spatial dimensions [H, W, D], just add frame dimension
+    stable_spatial = stable_token.unsqueeze(0)  # [1, H, W, D]
+    logger.info(f"🔧 Stable token reshaped to frame format: {stable_spatial.shape}")
 
     # Insert stable tokens between frames
     result_frames = []
@@ -103,14 +126,15 @@ def insert_stable_tokens(latents: Tensor, stable_token: Tensor) -> Tensor:
 
 
 def insert_transition_token(prev_latents: Tensor, curr_latents: Tensor,
-                          transition_token: Tensor) -> Tensor:
+                          transition_token_or_embeddings, device: torch.device = None) -> Tensor:
     """
     Insert transition token between previous and current shot latents.
 
     Args:
         prev_latents: Previous shot latents (already with stable tokens) [Fp, H, W, D]
         curr_latents: Current shot latents (already with stable tokens) [Fc, H, W, D]
-        transition_token: Transition token embedding [D]
+        transition_token_or_embeddings: Either a transition token tensor [H, W, D] or VideoTokenEmbeddings instance
+        device: Device for token embeddings (only used if transition_token_or_embeddings is VideoTokenEmbeddings)
 
     Returns:
         Combined latents with transition token: [Fp + 1 + Fc, H, W, D]
@@ -118,17 +142,25 @@ def insert_transition_token(prev_latents: Tensor, curr_latents: Tensor,
     """
     Fp, H, W, D = prev_latents.shape
     Fc = curr_latents.shape[0]
-    device = prev_latents.device
+    latents_device = prev_latents.device
+
+    # Handle both token tensor and VideoTokenEmbeddings
+    if hasattr(transition_token_or_embeddings, 'get_transition_token'):
+        # It's a VideoTokenEmbeddings instance
+        target_device = device if device is not None else latents_device
+        transition_token = transition_token_or_embeddings.get_transition_token(target_device, target_shape=(H, W, D))
+    else:
+        # It's already a token tensor
+        transition_token = transition_token_or_embeddings
 
     logger.info(f"🔄 Inserting transition token:")
     logger.info(f"🔄   Prev latents shape: {prev_latents.shape}")
     logger.info(f"🔄   Curr latents shape: {curr_latents.shape}")
     logger.info(f"🔄   Transition token shape: {transition_token.shape}")
 
-    # Create transition token tensor matching spatial dimensions
-    transition_expanded = transition_token.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, D]
-    transition_spatial = transition_expanded.expand(1, H, W, D)  # [1, H, W, D]
-    logger.info(f"🔄   Transition token expanded to spatial dims: {transition_spatial.shape}")
+    # Transition token should match latent spatial dimensions [H, W, D], just add frame dimension
+    transition_spatial = transition_token.unsqueeze(0)  # [1, H, W, D]
+    logger.info(f"🔄   Transition token reshaped to frame format: {transition_spatial.shape}")
 
     # Record transition token position
     transition_position = Fp  # Position in final sequence where transition token is inserted
@@ -172,31 +204,14 @@ def preprocess_shot_adapter_with_tokens(
     logger.info(f"🎬   Prev shot: {prev_shot_latents.shape}")
     logger.info(f"🎬   Curr shot: {curr_shot_latents.shape}")
 
-    # Get token embeddings
-    stable_token = token_embeddings.get_stable_token(device)
-    transition_token = token_embeddings.get_transition_token(device)
-    logger.info(f"🎬   Tokens: stable={stable_token.shape}, transition={transition_token.shape}")
-
-    # Step 1: Insert stable tokens within each shot
+    # Step 1: Insert stable tokens within each shot (pass embeddings instance)
     logger.info(f"🎬 Step 1: Inserting stable tokens within shots...")
-    prev_with_stables = insert_stable_tokens(prev_shot_latents, stable_token)
-    curr_with_stables = insert_stable_tokens(curr_shot_latents, stable_token)
+    prev_with_stables = insert_stable_tokens(prev_shot_latents, token_embeddings, device)
+    curr_with_stables = insert_stable_tokens(curr_shot_latents, token_embeddings, device)
 
-    # Step 2: Insert transition token between shots
+    # Step 2: Insert transition token between shots (pass embeddings instance)
     logger.info(f"🎬 Step 2: Inserting transition token between shots...")
-
-    # Get dimensions from previous shot for transition token
-    F_prev, H, W, D = prev_with_stables.shape
-
-    # Create transition token with spatial dimensions
-    transition_spatial = transition_token.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, W, D)
-
-    # Combine: [prev_with_stables, transition_token, curr_with_stables]
-    tokenized_sequence = torch.cat([
-        prev_with_stables,    # [F_prev_with_stables, H, W, D]
-        transition_spatial,   # [1, H, W, D]
-        curr_with_stables     # [F_curr_with_stables, H, W, D]
-    ], dim=0)
+    tokenized_sequence = insert_transition_token(prev_with_stables, curr_with_stables, token_embeddings, device)
 
     # Create metadata
     F_prev_orig, F_curr_orig = prev_shot_latents.shape[0], curr_shot_latents.shape[0]
@@ -252,21 +267,14 @@ def preprocess_multishot_with_tokens(
     logger.info(f"🎬   Curr shot latents: {curr_shot_latents.shape}")
     logger.info(f"🎬   Device: {device}")
 
-    # Get token embeddings
-    stable_token = token_embeddings.get_stable_token(device)
-    transition_token = token_embeddings.get_transition_token(device)
-    logger.info(f"🎬   Token embeddings retrieved: stable={stable_token.shape}, transition={transition_token.shape}")
-
-    # Step 1: Insert stable tokens within each shot
+    # Step 1: Insert stable tokens within each shot (pass embeddings instance)
     logger.info(f"🎬 Step 1: Inserting stable tokens within shots...")
-    prev_with_stables = insert_stable_tokens(prev_shot_latents, stable_token)
-    curr_with_stables = insert_stable_tokens(curr_shot_latents, stable_token)
+    prev_with_stables = insert_stable_tokens(prev_shot_latents, token_embeddings, device)
+    curr_with_stables = insert_stable_tokens(curr_shot_latents, token_embeddings, device)
 
-    # Step 2: Insert transition token between shots
+    # Step 2: Insert transition token between shots (pass embeddings instance)
     logger.info(f"🎬 Step 2: Inserting transition token between shots...")
-    tokenized_sequence = insert_transition_token(
-        prev_with_stables, curr_with_stables, transition_token
-    )
+    tokenized_sequence = insert_transition_token(prev_with_stables, curr_with_stables, token_embeddings, device)
 
     # Create metadata for loss computation and analysis
     F1, F2 = prev_shot_latents.shape[0], curr_shot_latents.shape[0]
@@ -491,9 +499,7 @@ def preprocess_with_scenario(
     if len(tokens) < 1:
         raise ValueError("Scenario must contain at least one shot")
 
-    # Get token embeddings
-    stable_token = token_embeddings.get_stable_token(device)
-    transition_token = token_embeddings.get_transition_token(device)
+    # Will use token embeddings instance directly
 
     sequence_parts = []
     metadata = {
@@ -518,7 +524,7 @@ def preprocess_with_scenario(
             shot_frames = shot_latents[shot_name]
 
 
-            shot_with_stables = insert_stable_tokens(shot_frames, stable_token)
+            shot_with_stables = insert_stable_tokens(shot_frames, token_embeddings, device)
             logger.info(f"shot frames : {shot_frames.shape}")
             logger.info(f"shot w stables : {shot_with_stables.shape}")
 
@@ -540,25 +546,26 @@ def preprocess_with_scenario(
             logger.info(f"  last shot shape : {sequence_parts[-1].shape[1:]}")
 
             # Get spatial dimensions from last shot
-            F, H, W, D = sequence_parts[-1].shape
+            last_shot_shape = sequence_parts[-1].shape
+            H, W, D = last_shot_shape[1], last_shot_shape[2], last_shot_shape[3]
 
             if connector == 'stable':
                 # Insert stable token for smooth transition
-                stable_spatial = stable_token.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, W, D)
+                stable_spatial = token_embeddings.get_stable_token(device, target_shape=(H, W, D)).unsqueeze(0)
                 sequence_parts.append(stable_spatial)
                 metadata['stable_token_positions'].append(current_position)
                 logger.info(f"🔧 Added stable token at position {current_position}")
 
             elif connector == 'transition':
                 # Insert transition token for sharp transition
-                transition_spatial = transition_token.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, W, D)
+                transition_spatial = token_embeddings.get_transition_token(device, target_shape=(H, W, D)).unsqueeze(0)
                 sequence_parts.append(transition_spatial)
                 metadata['transition_token_positions'].append(current_position)
                 logger.info(f"🔄 Added transition token at position {current_position}")
 
             else:
                 logger.warning(f"Unknown connector '{connector}', treating as 'stable'")
-                stable_spatial = stable_token.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, H, W, D)
+                stable_spatial = token_embeddings.get_stable_token(device, target_shape=(H, W, D)).unsqueeze(0)
                 sequence_parts.append(stable_spatial)
                 metadata['stable_token_positions'].append(current_position)
 

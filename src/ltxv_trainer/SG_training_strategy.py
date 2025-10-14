@@ -24,12 +24,16 @@ from ltxv_trainer import logger
 from ltxv_trainer.config import ConditioningConfig
 from ltxv_trainer.ltxv_utils import get_rope_scale_factors, prepare_video_coordinates
 from ltxv_trainer.timestep_samplers import TimestepSampler, UniformTimestepSampler
-from ltxv_trainer.token_utils import (
-    VideoTokenEmbeddings,
-    preprocess_multishot_with_tokens,
-    create_token_aware_conditioning_mask,
-    extract_token_positions
-)
+from diffusers.utils.torch_utils import randn_tensor
+
+
+# [SG-PATCH:CONSISTENCY] Import consistency utilities
+try:
+    from ltxv_trainer.consistency_vit import compute_obj_bg_consistency, compute_consistency_loss
+    CONSISTENCY_AVAILABLE = True
+except ImportError:
+    CONSISTENCY_AVAILABLE = False
+    logger.warning("Consistency ViT module not available. Consistency loss will be disabled.")
 
 DEFAULT_FPS = 24  # FPS 메타가 없을 때 기본값
 
@@ -117,6 +121,15 @@ def _prepare_video_ids(
     latent_coords = latent_coords.reshape(batch_size, -1, seq_len)
     return latent_coords
 
+def cosine_weighted_diff(curr_lat: torch.Tensor, ref_lat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # cos ∈ [-1, 1]
+    # cos ∈ [-1, 1]
+    cos = F.cosine_similarity(curr_lat, ref_lat, dim=-1, eps=eps)  # [B, S]
+    cos = cos.unsqueeze(-1)                                        # [B, S, 1]
+    return cos.expand_as(curr_lat)                                       # [B, S, D]
+
+# 기존 한 줄 교체
+
 
 def _scale_video_ids(
     video_ids: torch.Tensor,
@@ -175,6 +188,91 @@ def prepare_video_coords(
     return video_coords
 
 
+def create_shot_level_causal_mask(seq_len: int, device: torch.device = None) -> torch.Tensor:
+    """
+    Create shot-level causal mask for new algorithm:
+    - latents_prev can't see (transition, curr) information
+    - latents_transition can't see latents_curr information  
+    - latents_curr can see all previous information
+    
+    Args:
+        seq_len: Sequence length for each shot (prev, transition, curr all same length)
+        device: Device to create tensor on
+        
+    Returns:
+        Causal mask tensor of shape (3*seq_len, 3*seq_len) where True means can attend
+    """
+    total_len = seq_len * 3  # prev + transition + curr
+    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    
+    # Split into three parts
+    prev_end = seq_len
+    transition_end = seq_len * 2
+    curr_end = seq_len * 3
+    
+    # prev can only see itself (and any previous context)
+    mask[:prev_end, :prev_end] = True
+    
+    # transition can see prev + itself, but NOT curr
+    mask[prev_end:transition_end, :transition_end] = True
+    
+    # curr can see everything (prev + transition + itself)
+    mask[transition_end:curr_end, :curr_end] = True
+    
+    num_curr_glimpse = seq_len // 8
+    mask[prev_end:transition_end, transition_end:transition_end+num_curr_glimpse] = True
+    mask = torch.ones((total_len, total_len), dtype=torch.bool, device=device)
+
+    return mask
+
+
+# [SG-PATCH:CONSISTENCY INPUT] Consistency encoding functions
+def encode_consistency(consistency_dict: dict, embedding_dim: int = 128) -> torch.Tensor:
+    """
+    Encode consistency scores into a vector that can be used as conditioning.
+    
+    Args:
+        consistency_dict: Dictionary with 'bg' and 'obj' scores
+        embedding_dim: Dimension of the embedding vector
+        
+    Returns:
+        Consistency embedding tensor of shape (1, embedding_dim)
+    """
+    if consistency_dict is None:
+        # Return zero vector if no consistency info
+        return torch.zeros(1, embedding_dim)
+    
+    bg_score = float(consistency_dict.get('bg', 0.5))
+    obj_score = float(consistency_dict.get('obj', 0.5))
+    
+    # Simple encoding: create sinusoidal embeddings based on scores
+    pos_bg = torch.tensor([bg_score * 100])  # Scale to reasonable range
+    pos_obj = torch.tensor([obj_score * 100])
+    
+    # Generate sinusoidal embeddings
+    half_dim = embedding_dim // 4
+    emb_bg = torch.zeros(half_dim * 2)
+    emb_obj = torch.zeros(half_dim * 2)
+    
+    div_term = torch.exp(torch.arange(0, half_dim, dtype=torch.float32) * -(torch.log(torch.tensor(10000.0)) / half_dim))
+    emb_bg[0::2] = torch.sin(pos_bg * div_term)
+    emb_bg[1::2] = torch.cos(pos_bg * div_term)
+    emb_obj[0::2] = torch.sin(pos_obj * div_term)
+    emb_obj[1::2] = torch.cos(pos_obj * div_term)
+    
+    # Concatenate bg and obj embeddings
+    consistency_emb = torch.cat([emb_bg, emb_obj], dim=0)
+    
+    # Pad or truncate to match embedding_dim
+    if consistency_emb.shape[0] < embedding_dim:
+        padding = torch.zeros(embedding_dim - consistency_emb.shape[0])
+        consistency_emb = torch.cat([consistency_emb, padding], dim=0)
+    elif consistency_emb.shape[0] > embedding_dim:
+        consistency_emb = consistency_emb[:embedding_dim]
+    
+    return consistency_emb.unsqueeze(0)  # (1, embedding_dim)
+
+
 def pc_cfm_loss(model_output: Tensor, X0: Tensor, X1c: Tensor, X1p: Tensor, lambda_val: float = 1.0) -> Tensor:
     """
     PC-CFM loss function with correct velocity field target.
@@ -199,16 +297,16 @@ def pc_cfm_loss(model_output: Tensor, X0: Tensor, X1c: Tensor, X1p: Tensor, lamb
 # Batch container (동일)
 # --------------------------
 class TrainingBatch(BaseModel):
-    latents: Tensor                # (B, Seq, D)  # ex) Seq = (prev_seq + curr_seq + tokens)
+    latents: Tensor                # (B, Seq, D)  # ex) Seq = (prev_seq + curr_seq)
     targets: Union[Tensor, dict]   # For StandardTraining: (B, curr_seq, D), For PC-CFM: dict with X0,X1c,X1p
 
     prompt_embeds: Tensor
     prompt_attention_mask: Tensor
 
-    timesteps: Tensor              # (B, Seq)     # prev=0, curr=sampled, tokens=0
+    timesteps: Tensor              # (B, Seq)     # prev=0, curr=sampled
     sigmas: Tensor                 # (B, 1, 1)    # 노이즈 스케줄(브로드캐스트 용도)
 
-    conditioning_mask: Tensor      # (B, Seq)     # True=conditioning(prev 전체 + tokens), False=curr frames
+    conditioning_mask: Tensor      # (B, Seq)     # True=conditioning(prev 전체 + curr 일부)
 
     num_frames: int
     height: int
@@ -217,13 +315,12 @@ class TrainingBatch(BaseModel):
 
     rope_interpolation_scale: list[float]
     video_coords: Tensor | None = None
-
+    
     # Additional info for extracting current part
     prev_seq_len: int = 0          # Length of previous sequence (0 if no prev)
-
-    # Token-related metadata
-    token_metadata: dict | None = None  # Metadata from token preprocessing
-    token_positions: dict | None = None # Positions of different token types
+    
+    # [SG-PATCH:CONSISTENCY] Consistency conditions 
+    consistency: dict | None = None     # {"bg": float, "obj": float} or None
 
     @computed_field
     @property
@@ -253,62 +350,20 @@ class TrainingStrategy(ABC):
         """
 
     @abstractmethod
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
         ...
 
     def _create_timesteps_from_conditioning_mask(
         self, conditioning_mask: Tensor, sampled_timestep_values: Tensor
     ) -> Tensor:
         """
-        Create timesteps from boolean conditioning mask.
+        # conditioning_mask: (B, Seq)  True=conditioning → timestep=0
+        # sampled_timestep_values: (B,) → 각 배치의 curr 구간에 복제
 
-        Args:
-            conditioning_mask: (B, Seq) Boolean mask ONLY
-                              - True=conditioning → timestep=0 (clean)
-                              - False=no conditioning → timestep=sampled_t (noisy)
-            sampled_timestep_values: (B,) → sampled timestep values for each batch
-
-        Returns:
-            timesteps: (B, Seq) tensor with timestep values (0 or sampled_t)
+        return: timesteps (B, Seq)
         """
-        if conditioning_mask.dtype != torch.bool:
-            raise ValueError(f"conditioning_mask must be boolean, got {conditioning_mask.dtype}. "
-                           "Use apply_strength_to_attention_mask() for float strength values.")
-
         expanded = sampled_timestep_values.unsqueeze(1).expand_as(conditioning_mask)  # (B, Seq)
-        # Ensure tensors are on the same device
-        expanded = expanded.to(conditioning_mask.device)
         return torch.where(conditioning_mask, 0, expanded)
-
-    @staticmethod
-    def apply_strength_to_attention_mask(
-        attention_mask: Tensor, strength_mask: Tensor
-    ) -> Tensor:
-        """
-        Apply conditioning strength to attention mask for graduated conditioning.
-
-        Args:
-            attention_mask: (B, Seq) boolean mask (True=conditioning, False=target)
-            strength_mask: (B, Seq) float values in [0,1] where 1.0=full strength, 0.0=no strength
-
-        Returns:
-            float_attention_mask: (B, Seq) float mask where:
-                - Conditioning positions: original 1.0 scaled by strength
-                - Target positions: remain 0.0
-        """
-        if attention_mask.dtype != torch.bool:
-            raise ValueError(f"attention_mask must be boolean, got {attention_mask.dtype}")
-
-        # Convert boolean mask to float
-        float_mask = attention_mask.float()  # (B, Seq) 1.0 for conditioning, 0.0 for target
-
-        # Apply strength only to conditioning positions
-        # Clamp strength to [0,1] for safety
-        strength_clamped = strength_mask.clamp(0.0, 1.0)
-
-        # For conditioning positions: multiply by strength
-        # For target positions: remain 0.0 (no conditioning)
-        return float_mask * strength_clamped
 
     def _create_first_frame_conditioning_mask(
         self, batch_size: int, sequence_length: int, height: int, width: int, device: torch.device
@@ -330,25 +385,116 @@ class TrainingStrategy(ABC):
     @staticmethod
     def prepare_model_inputs(batch: TrainingBatch) -> dict[str, Any]:
         """
-        모델 포워드 입력 규격 유지 (검증 파이프라인과 동일한 패킹 처리)
+        Prepare model inputs with shot-level causal mask for new algorithm.
         """
         latents = batch.latents  # [B, seq_len, dim] format from dataset
 
-        # 데이터셋의 sequence format을 검증 파이프라인과 동일하게 처리
-        # 현재 latents는 이미 sequence format [B, seq_len, dim]이므로
-        # 검증 파이프라인에서와 같이 packed latents로 간주
+        # [SG-PATCH:CONSISTENCY INPUT] Incorporate consistency conditioning
+        encoder_hidden_states = batch.prompt_embeds
+        encoder_attention_mask = batch.prompt_attention_mask
 
-        # 만약 향후 5D tensor [B, C, F, H, W] format이 필요하다면:
-        # 1. sequence를 5D로 unpacking: _unpack_latents 사용
-        # 2. 다시 sequence로 packing: _pack_latents 사용
-        # 하지만 현재는 이미 sequence format이므로 그대로 사용
+        # Create shot-level causal mask for new algorithm
+        # Assuming sequence is divided equally into prev, transition, curr
+        total_seq_len = latents.shape[1]
+        single_shot_seq_len = total_seq_len // 3  # Each part has same length
+
+        logger.info(f"[MASK_GEN] Creating shot-level causal mask:")
+        logger.info(f"  total_seq_len: {total_seq_len}, single_shot_seq_len: {single_shot_seq_len}")
+
+        # Create causal mask: prev can't see transition/curr, transition can't see curr
+        causal_mask = create_shot_level_causal_mask(single_shot_seq_len, device=latents.device)
+
+        # Expand for batch dimension: (B, seq_len, seq_len)
+        batch_size = latents.shape[0]
+        causal_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Log causal mask structure
+        logger.info(f"  Causal mask structure (True=can attend):")
+        logger.info(f"    prev->prev: {causal_mask[0, :single_shot_seq_len, :single_shot_seq_len].any()}")
+        logger.info(f"    prev->transition: {causal_mask[0, :single_shot_seq_len, single_shot_seq_len:2*single_shot_seq_len].any()}")
+        logger.info(f"    prev->curr: {causal_mask[0, :single_shot_seq_len, 2*single_shot_seq_len:].any()}")
+        logger.info(f"    transition->prev: {causal_mask[0, single_shot_seq_len:2*single_shot_seq_len, :single_shot_seq_len].any()}")
+        logger.info(f"    transition->transition: {causal_mask[0, single_shot_seq_len:2*single_shot_seq_len, single_shot_seq_len:2*single_shot_seq_len].any()}")
+        logger.info(f"    transition->curr: {causal_mask[0, single_shot_seq_len:2*single_shot_seq_len, 2*single_shot_seq_len:].any()}")
+        logger.info(f"    curr->all: {causal_mask[0, 2*single_shot_seq_len:, :].all()}")
+
+        # Convert to attention bias format (True means can attend, False means cannot)
+        # Invert: True->0 (can attend), False->1 (cannot attend), then multiply by -10000
+        causal_attention_bias = (~causal_mask).to(latents.dtype) * -10000.0
+
+        # Add head dimension: (B, seq_len, seq_len) -> (B, 1, seq_len, seq_len)
+        causal_attention_bias = causal_attention_bias.unsqueeze(1)
+
+        logger.info(f"  Final causal_attention_bias shape: {causal_attention_bias.shape}")
+
+        # ========================================
+        # [NEW] Create prompt masking for transition
+        # ========================================
+        # The encoder_attention_mask controls which parts of the latent sequence can attend to the prompt
+        # We need to prevent the transition part from attending to the prompt
+
+        logger.info(f"[MASK_GEN] Creating prompt masking for transition:")
+
+        # encoder_attention_mask shape: (B, prompt_seq_len)
+        # We need to expand it to (B, latent_seq_len, prompt_seq_len) format
+        # where latent_seq_len = prev_seq + transition_seq + curr_seq
+
+        prompt_seq_len = encoder_attention_mask.shape[1]
+        logger.info(f"  prompt_seq_len: {prompt_seq_len}")
+
+        # Create a mask where:
+        # - prev tokens CAN attend to prompt: (B, prev_seq, prompt_seq) = original mask
+        # - transition tokens CANNOT attend to prompt: (B, transition_seq, prompt_seq) = all False
+        # - curr tokens CAN attend to prompt: (B, curr_seq, prompt_seq) = original mask
+
+        # Start with original mask expanded for all tokens
+        expanded_prompt_mask = encoder_attention_mask.unsqueeze(1).expand(
+            batch_size, total_seq_len, prompt_seq_len
+        )  # (B, total_seq, prompt_seq)
+
+        logger.info(f"  Expanded prompt mask shape: {expanded_prompt_mask.shape}")
+        logger.info(f"  Before transition masking - mask values for first sample:")
+        logger.info(f"    prev region mean: {expanded_prompt_mask[0, :single_shot_seq_len, :].float().mean():.4f}")
+        logger.info(f"    transition region mean: {expanded_prompt_mask[0, single_shot_seq_len:2*single_shot_seq_len, :].float().mean():.4f}")
+        logger.info(f"    curr region mean: {expanded_prompt_mask[0, 2*single_shot_seq_len:, :].float().mean():.4f}")
+
+        # Mask out transition part (middle third)
+        transition_start = single_shot_seq_len
+        transition_end = single_shot_seq_len * 2
+        expanded_prompt_mask[:, transition_start:transition_end, :] = 0  # Block transition from seeing prompt
+
+        logger.info(f"  After transition masking - mask values for first sample:")
+        logger.info(f"    prev region mean: {expanded_prompt_mask[0, :single_shot_seq_len, :].float().mean():.4f} (should be ~1.0)")
+        logger.info(f"    transition region mean: {expanded_prompt_mask[0, single_shot_seq_len:2*single_shot_seq_len, :].float().mean():.4f} (should be 0.0)")
+        logger.info(f"    curr region mean: {expanded_prompt_mask[0, 2*single_shot_seq_len:, :].float().mean():.4f} (should be ~1.0)")
+
+        # Convert to attention bias format (same as transformer does)
+        # 1 - mask converts True->0 (can attend) and False->1 (cannot attend)
+        # Then multiply by -10000 to create strong negative bias
+        prompt_attention_bias = (1 - expanded_prompt_mask.to(latents.dtype)) * -10000.0
+
+        # Add head dimension for compatibility with attention processor
+        # Shape: (B, latent_seq, prompt_seq) -> (B, 1, latent_seq, prompt_seq)
+        prompt_attention_bias = prompt_attention_bias.unsqueeze(1)
+
+        logger.info(f"  Final prompt_attention_bias shape: {prompt_attention_bias.shape}")
+        logger.info(f"  Prompt bias values for first sample:")
+        logger.info(f"    prev region mean: {prompt_attention_bias[0, 0, :single_shot_seq_len, :].mean():.2f} (should be ~0)")
+        logger.info(f"    transition region mean: {prompt_attention_bias[0, 0, single_shot_seq_len:2*single_shot_seq_len, :].mean():.2f} (should be -10000)")
+        logger.info(f"    curr region mean: {prompt_attention_bias[0, 0, 2*single_shot_seq_len:, :].mean():.2f} (should be ~0)")
+
+        logger.info(f"\n[MASK_GEN] Summary:")
+        logger.info(f"  encoder_hidden_states: {encoder_hidden_states.shape}")
+        logger.info(f"  original encoder_attention_mask: {encoder_attention_mask.shape}")
+        logger.info(f"  causal_attention_bias (self-attn): {causal_attention_bias.shape}")
+        logger.info(f"  prompt_attention_bias (cross-attn): {prompt_attention_bias.shape}")
 
         return {
             "hidden_states": latents,
-            "encoder_hidden_states": batch.prompt_embeds,
+            "encoder_hidden_states": encoder_hidden_states,
             "timestep": batch.timesteps,
-            "encoder_attention_mask": batch.prompt_attention_mask,
-            # "attention_mask": batch.conditioning_mask.float(),  # Add conditioning mask for latent sequence attention
+            "encoder_attention_mask": prompt_attention_bias,  # Use expanded mask with transition blocked
+            "attention_mask": causal_attention_bias,  # Add causal mask for shot-level attention (4D format)
             "num_frames": batch.num_frames,
             "height": batch.height,
             "width": batch.width,
@@ -358,7 +504,7 @@ class TrainingStrategy(ABC):
         }
 
     @abstractmethod
-    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
+    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch, global_step: int = 0) -> Tensor:
         ...
 
 
@@ -425,20 +571,8 @@ def _concat_prev_curr(prev_lat: Tensor | None, curr_lat: Tensor) -> tuple[Tensor
 # Standard: prev-shot 지원 (새 규약에 맞게)
 # ----------------------------------------
 class StandardTrainingStrategy(TrainingStrategy):
-    def __init__(self, conditioning_config: ConditioningConfig, hidden_dim: int = 128, enable_token_processing: bool = True):
+    def __init__(self, conditioning_config: ConditioningConfig):
         super().__init__(conditioning_config)
-        self.enable_token_processing = enable_token_processing
-
-        # Initialize shot-adapter token embeddings for multi-shot video generation
-        if self.enable_token_processing:
-            from ltxv_trainer.token_utils import VideoTokenEmbeddings
-            self.token_embeddings = VideoTokenEmbeddings(hidden_dim=hidden_dim)
-            logger.info(f"🎭 Shot-adapter token processing ENABLED with hidden_dim={hidden_dim}")
-            logger.info(f"🎭   Stable tokens: enforce intra-shot temporal continuity")
-            logger.info(f"🎭   Transition tokens: model inter-shot transitions")
-        else:
-            self.token_embeddings = None
-            logger.info("⚠️  Shot-adapter token processing DISABLED")
 
     def get_data_sources(self) -> dict[str, str]:
         """
@@ -448,7 +582,7 @@ class StandardTrainingStrategy(TrainingStrategy):
         참고: prev_conditions는 데이터셋에서 자동으로 추가됨
         """
         return {"latents": "latent_conditions", "conditions": "text_conditions"}
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
         # 1) Latents 언팩
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
 
@@ -460,12 +594,24 @@ class StandardTrainingStrategy(TrainingStrategy):
         if F <= 0 or H <= 0 or W <= 0:
             raise ValueError(f"Invalid metadata from dataset: F={F}, H={H}, W={W}")
 
+        # [SG-PATCH:64TOKEN] Handle prev conditions based on SOS configuration
+        sos_use = getattr(self.conditioning_config, 'sos_use', True)  # Default True for backward compatibility
+        
         prev_lat = None
-        if batch.get("prev_conditions", None) is not None:
-            prev_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
+        prev_conditions = batch.get("prev_conditions")
+        if prev_conditions is not None and sos_use and not prev_conditions.get("_is_sos_disabled", False):
+            # Only use prev conditions if SOS is enabled and not explicitly disabled
+            prev_lat, _, _, _, _ = _unpack_latent_entry(prev_conditions)
+            logger.debug(f"Using prev conditions (sos_use=1)")
+        elif not sos_use or (prev_conditions and prev_conditions.get("_is_sos_disabled", False)):
+            # SOS disabled: don't use prev conditions even if available
+            logger.debug(f"Ignoring prev conditions (sos_use=0)")
 
         # 2) Conditions 언팩 (scene-level이면 curr와 동일)
         prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
+        
+        # [SG-PATCH:CONSISTENCY] Extract consistency conditions if available
+        consistency_conditions = batch.get("consistency", None)
         
         
  
@@ -476,7 +622,13 @@ class StandardTrainingStrategy(TrainingStrategy):
             raise ValueError("Unexpected sigma shape; expected (B,1,1) style broadcast.")
         sigmas = sigmas.view(curr_lat.shape[0], 1, 1)          # (B,1,1)
 
-        noise = torch.randn_like(curr_lat, device=curr_lat.device)  # (B, Cseq, D)
+        # [SG-PATCH:DTYPE] Ensure dtype consistency for all tensors
+        model_dtype = torch.bfloat16  # Default LTX model dtype
+        curr_lat = curr_lat.to(model_dtype)
+        prev_lat = prev_lat.to(model_dtype)
+        sigmas = sigmas.to(model_dtype)
+
+        noise = torch.randn_like(curr_lat, device=curr_lat.device, dtype=model_dtype)  # (B, Cseq, D)
         # CRITICAL FIX: Correct flow matching interpolation
         # Flow matching: x_t = (1-t) * x_0 + t * noise
         noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise       # (B, Cseq, D)
@@ -491,136 +643,16 @@ class StandardTrainingStrategy(TrainingStrategy):
         )  # (B, Cseq) True=clean keep
         noisy_curr = torch.where(first_mask_curr.unsqueeze(-1), curr_lat, noisy_curr)
 
-        # 5) Token-aware processing: Apply tokens if enabled and prev_lat exists
-        token_metadata = None
-        token_positions = None
+        # 5) prev + curr concat
+        concat_lat, Pseq, _ = _concat_prev_curr(prev_lat, noisy_curr)  # (B, P+C, D)
 
-        if self.enable_token_processing and prev_lat is not None:
-            logger.info(f"🎭 MULTI-SHOT TOKEN PROCESSING ENABLED")
-            logger.info(f"🎭   Input shapes: prev_lat={prev_lat.shape}, curr_lat={noisy_curr.shape}")
-            logger.info(f"🎭   Video dimensions: F={F}, H={H}, W={W}")
-
-            # Check for scenario metadata in batch
-            scenario = batch.get("scenario", None)
-            logger.info(f"🎭 STANDARD BATCH SCENARIO CHECK: scenario='{scenario}', enable_token_processing={self.enable_token_processing}")
-            if scenario:
-                logger.info(f"🎬 SCENARIO-BASED PROCESSING: '{scenario}'")
-
-                # Convert latents to shot format for scenario processing
-                B = prev_lat.shape[0]
-                prev_reshaped = prev_lat.view(B, F, H, W, -1)[0]  # (F, H, W, D)
-                curr_reshaped = noisy_curr.view(B, F, H, W, -1)[0]  # (F, H, W, D)
-
-                # Create shot latents dict
-                shot_latents = {
-                    "prev_shot": prev_reshaped,
-                    "curr_shot": curr_reshaped
-                }
-
-                # Apply scenario-based preprocessing
-                from ltxv_trainer.token_utils import preprocess_with_scenario, create_scenario_conditioning_mask
-                tokenized_sequence, token_metadata = preprocess_with_scenario(
-                    shot_latents=shot_latents,
-                    scenario=scenario,
-                    token_embeddings=self.token_embeddings,
-                    device=curr_lat.device
-                )
-
-                # Create scenario conditioning mask (curr_shot is target)
-                base_bool_mask, base_strength_mask = create_scenario_conditioning_mask(
-                    metadata=token_metadata,
-                    conditioning_strength=1.0,
-                    stable_token_strength=0.5,
-                    transition_token_strength=0.8,
-                    target_shot="curr_shot",
-                    device=curr_lat.device
-                )
-
-            else:
-                logger.info(f"🎭 DEFAULT SHOT-ADAPTER PROCESSING")
-
-                # Convert from (B, Seq, D) to (F, H, W, D) for shot-adapter token processing
-                B = prev_lat.shape[0]
-                prev_reshaped = prev_lat.view(B, F, H, W, -1)[0]  # Take first batch item: (F, H, W, D)
-                curr_reshaped = noisy_curr.view(B, F, H, W, -1)[0]  # Take first batch item: (F, H, W, D)
-                logger.info(f"🎭   Reshaped for token processing: prev={prev_reshaped.shape}, curr={curr_reshaped.shape}")
-
-                # Apply shot-adapter token preprocessing
-                logger.info(f"🎭   Applying shot-adapter token preprocessing...")
-                from ltxv_trainer.token_utils import preprocess_shot_adapter_with_tokens, create_shot_adapter_conditioning_mask
-                tokenized_sequence, token_metadata = preprocess_shot_adapter_with_tokens(
-                    prev_shot_latents=prev_reshaped,
-                    curr_shot_latents=curr_reshaped,
-                    token_embeddings=self.token_embeddings,
-                    device=curr_lat.device
-                )
-
-                # Create shot-adapter conditioning mask
-                base_bool_mask, base_strength_mask = create_shot_adapter_conditioning_mask(
-                    metadata=token_metadata,
-                    conditioning_strength=1.0,
-                    stable_token_strength=0.5,
-                    transition_token_strength=0.8,
-                    device=curr_lat.device
-                )
-
-            # Extract token positions for loss computation
-            from ltxv_trainer.token_utils import extract_token_positions
-            token_positions = extract_token_positions(token_metadata)
-            logger.info(f"🎭   Token positions extracted: {token_positions}")
-
-            # Convert back to (B, Seq, D) format for transformer
-            total_frames = tokenized_sequence.shape[0]
-            seq_len = total_frames * H * W
-            tokenized_flat = tokenized_sequence.view(total_frames, -1)  # (Total_F, H*W*D)
-            tokenized_flat = tokenized_flat.view(seq_len, -1)  # (Total_F*H*W, D)
-            concat_lat = tokenized_flat.unsqueeze(0).expand(B, -1, -1)  # (B, Total_F*H*W, D)
-            logger.info(f"🎭   Converted back to training format: {concat_lat.shape}")
-
-            # Expand spatial dimensions: each frame position -> H*W positions
-            conditioning_mask = base_bool_mask.repeat_interleave(H * W)  # (Total_F*H*W,)
-            conditioning_mask = conditioning_mask.unsqueeze(0).expand(B, -1)  # (B, Total_F*H*W)
-            logger.info(f"🎭   Boolean conditioning mask expanded to training format: {conditioning_mask.shape}")
-
-            # Store strength mask for attention/loss weighting
-            token_strength_mask = base_strength_mask.repeat_interleave(H * W)  # (Total_F*H*W,)
-            token_strength_mask = token_strength_mask.unsqueeze(0).expand(B, -1)  # (B, Total_F*H*W)
-            logger.info(f"🎭   Strength mask expanded to training format: {token_strength_mask.shape}")
-
-            # Calculate previous sequence length for coordinate generation
-            if hasattr(token_metadata, 'prev_with_stables_frames'):
-                Pseq = token_metadata['prev_with_stables_frames'] * H * W
-            else:
-                # For scenario-based processing, find previous sequence length
-                prev_shot_range = token_metadata['shot_ranges'].get('prev_shot', (0, 0))
-                Pseq = prev_shot_range[1] * H * W
-
-            logger.info(f"🎭 ✅ MULTI-SHOT TOKEN PROCESSING COMPLETED!")
-            logger.info(f"🎭   Total frames: {total_frames}")
-            logger.info(f"🎭   Previous sequence length: {Pseq}")
-            logger.info(f"🎭   Stable tokens: enforce intra-shot continuity")
-            logger.info(f"🎭   Transition tokens: model inter-shot transitions")
-            logger.info(f"🚀   Prev sequence length for video coords: {Pseq}")
-            logger.info(f"🚀   Final batch shape: {concat_lat.shape}, conditioning shape: {conditioning_mask.shape}")
-
+        # 6) conditioning mask 구성
+        #    prev 전체 True(조건), curr은 first_frame만 True
+        if Pseq > 0:
+            prev_mask = torch.ones(curr_lat.shape[0], Pseq, dtype=torch.bool, device=curr_lat.device)  # (B, Pseq)=True
+            conditioning_mask = torch.cat([prev_mask, first_mask_curr], dim=1)  # (B, P+C)
         else:
-            # Standard concatenation without tokens
-            if self.use_tokens:
-                logger.info(f"⚠️  TOKEN PROCESSING SKIPPED: No prev_lat available (single shot scenario)")
-            else:
-                logger.info(f"ℹ️  STANDARD PROCESSING: Tokens disabled, using traditional concatenation")
-
-            concat_lat, Pseq, _ = _concat_prev_curr(prev_lat, noisy_curr)  # (B, P+C, D)
-            logger.info(f"ℹ️   Standard concatenation result: {concat_lat.shape}, Pseq={Pseq}")
-
-            # Standard conditioning mask
-            if Pseq > 0:
-                prev_mask = torch.ones(curr_lat.shape[0], Pseq, dtype=torch.bool, device=curr_lat.device)  # (B, Pseq)=True
-                conditioning_mask = torch.cat([prev_mask, first_mask_curr], dim=1)  # (B, P+C)
-                logger.info(f"ℹ️   Standard conditioning mask: prev_region={Pseq} (all True), curr_region={first_mask_curr.shape[1]} (first frame conditioning)")
-            else:
-                conditioning_mask = first_mask_curr  # (B, C)
-                logger.info(f"ℹ️   Single shot conditioning mask: {conditioning_mask.shape} (first frame conditioning only)")
+            conditioning_mask = first_mask_curr  # (B, C)
 
         # 7) 타깃 구성: Only current part targets (no prev padding needed)
         targets = noise - curr_lat   # (B, Cseq, D) - Only current part targets
@@ -631,6 +663,9 @@ class StandardTrainingStrategy(TrainingStrategy):
 
         # 9) ROPE scale & video coords (검증 파이프라인과 동일한 방식)
         rope_scale = get_rope_scale_factors(fps)
+
+        # [SG-PATCH:COORDS] Coordinate mode branching
+        coord_mode = getattr(self.conditioning_config, 'coord_mode', 'prev_plus_curr')  # Default to prev_plus_curr
 
         if Pseq > 0:
             # VAE compression ratios
@@ -652,30 +687,46 @@ class StandardTrainingStrategy(TrainingStrategy):
             if latent_num_frames <= 0 or latent_height <= 0 or latent_width <= 0:
                 raise ValueError(f"Invalid latent dimensions: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
 
-            # Generate video coordinates based on actual sequence length
-            # For token processing: use the actual tokenized sequence frames
-            # For standard processing: use 2 * latent_num_frames (prev + curr)
-            if self.enable_token_processing and token_metadata is not None:
-                # Use the actual tokenized sequence frames count
-                total_frames = token_metadata['total_frames']
-                logger.info(f"🎭 Using tokenized sequence frames for video coords: {total_frames}")
-            else:
-                # Standard: prev + curr frames
-                total_frames = 2 * latent_num_frames
-                logger.info(f"ℹ️  Using standard frames for video coords: {total_frames}")
+            # Prepare video IDs for combined sequence (prev + curr)
+            # Note: We need to generate coordinates for 2x sequence length
+            combined_seq_len = concat_lat.shape[1]  # prev_seq + curr_seq
+            single_shot_seq_len = latent_num_frames * latent_height * latent_width
+            
 
-            scaled_video_ids = prepare_video_coords(
-                batch_size=concat_lat.shape[0],
-                num_frames=total_frames,
-                height=latent_height,
-                width=latent_width,
-                patch_size=transformer_spatial_patch_size,
-                patch_size_t=transformer_temporal_patch_size,
-                scale_factor=vae_spatial_compression_ratio,
-                scale_factor_t=vae_temporal_compression_ratio,
-                frame_index=0,
-                device=concat_lat.device,
-            )
+            # [SG-PATCH:COORDS] Generate coordinates based on coordinate mode
+            if coord_mode == "prev_plus_curr":
+                # Standard mode: concatenate prev and curr coordinates
+                total_latent_frames = latent_num_frames * 2  # prev + curr frames
+                scaled_video_ids = prepare_video_coords(
+                    batch_size=concat_lat.shape[0],
+                    num_frames=total_latent_frames,
+                    height=latent_height,
+                    width=latent_width,
+                    patch_size=transformer_spatial_patch_size,
+                    patch_size_t=transformer_temporal_patch_size,
+                    scale_factor=vae_spatial_compression_ratio,
+                    scale_factor_t=vae_temporal_compression_ratio,
+                    frame_index=0,
+                    device=concat_lat.device,
+                )
+            elif coord_mode == "curr_twice":
+                # Alternative mode: current coordinates repeated twice
+                base_coords = prepare_video_coords(
+                    batch_size=concat_lat.shape[0],
+                    num_frames=latent_num_frames,
+                    height=latent_height,
+                    width=latent_width,
+                    patch_size=transformer_spatial_patch_size,
+                    patch_size_t=transformer_temporal_patch_size,
+                    scale_factor=vae_spatial_compression_ratio,
+                    scale_factor_t=vae_temporal_compression_ratio,
+                    frame_index=0,
+                    device=concat_lat.device,
+                )
+                # Concatenate along temporal dimension
+                scaled_video_ids = torch.cat([base_coords, base_coords], dim=2)
+            else:
+                raise ValueError(f"Unknown coordinate mode: {coord_mode}")
 
             # Apply ROPE scaling and convert to final format
             video_coords = scaled_video_ids.float()
@@ -700,14 +751,13 @@ class StandardTrainingStrategy(TrainingStrategy):
             rope_interpolation_scale=rope_scale,
             video_coords=video_coords,
             prev_seq_len=Pseq,
-            token_metadata=token_metadata,
-            token_positions=token_positions,
+            consistency=consistency_conditions,  # [SG-PATCH:CONSISTENCY] Include consistency conditions
         )
         
         
         
 
-    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
+    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch, global_step: int = 0) -> Tensor:
         """
         Direct MSE on current part only (no masking needed)
         - model_pred: (B, curr_seq, D) - only current part prediction
@@ -726,8 +776,18 @@ class StandardTrainingStrategy(TrainingStrategy):
             # No prev part, use full conditioning mask
             curr_conditioning_mask = batch.conditioning_mask  # (B, curr_seq)
         
+        # Extract current part from model prediction if needed (for multishot)
+        target_seq_len = batch.targets.shape[1]
+        if model_pred.shape[1] > target_seq_len:
+            # Model predicted full sequence, extract current part (last target_seq_len tokens)
+            model_pred_curr = model_pred[:, -target_seq_len:]
+            print(f"DEBUG: Extracted current part from model_pred: {model_pred.shape} -> {model_pred_curr.shape}")
+        else:
+            # Model prediction already matches target length
+            model_pred_curr = model_pred
+
         # Compute loss only on non-conditioning tokens of current part
-        loss = (model_pred - batch.targets).pow(2)                          # (B, curr_seq, D)
+        loss = (model_pred_curr - batch.targets).pow(2)                     # (B, curr_seq, D)
         loss_mask = (~curr_conditioning_mask.unsqueeze(-1)).float()         # (B, curr_seq, 1)
         masked_loss = loss * loss_mask                                      # Apply mask
         
@@ -749,25 +809,13 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
     - Video coordinates are doubled to handle concatenated sequence
     """
 
-    def __init__(self, conditioning_config: ConditioningConfig, hidden_dim: int = 128, enable_token_processing: bool = True):
+    def __init__(self, conditioning_config: ConditioningConfig):
         """Initialize the modified reference strategy.
 
         Args:
             conditioning_config: Configuration for conditioning behavior
-            hidden_dim: Hidden dimension for token embeddings
-            enable_token_processing: Whether to enable token processing
         """
         super().__init__(conditioning_config)
-        self.enable_token_processing = enable_token_processing
-
-        # Initialize token embeddings for multi-shot video generation
-        if self.enable_token_processing:
-            from ltxv_trainer.token_utils import VideoTokenEmbeddings
-            self.token_embeddings = VideoTokenEmbeddings(hidden_dim=hidden_dim)
-            logger.info(f"🎭 ReferenceVideo strategy token processing ENABLED with hidden_dim={hidden_dim}")
-        else:
-            self.token_embeddings = None
-            logger.info("⚠️  ReferenceVideo strategy token processing DISABLED")
 
     def get_data_sources(self) -> dict[str, str]:
         """Modified reference training requires latents, text conditions, and prev conditions."""
@@ -777,102 +825,51 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             # Note: prev_conditions will be automatically added by dataset
         }
 
-    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler, vae=None) -> TrainingBatch:
-        """Prepare batch for modified reference training with prev latents and text conditions."""
+    def prepare_batch(self, batch: dict[str, Any], timestep_sampler: TimestepSampler) -> TrainingBatch:
+        """Prepare batch for new algorithm: prev, transition, curr all noisy."""
         # 1) Unpack current shot latents
         curr_lat, F, H, W, fps = _unpack_latent_entry(batch["latent_conditions"])
         B, curr_seq_len, D = curr_lat.shape
 
-        # 1.1) Apply VAE normalization if available
-        if vae is not None:
-            # Convert sequence format to 5D for normalization
-            curr_lat_5d = _unpack_latents(curr_lat, F, H, W)
-
-            # Get VAE normalization parameters
-            latents_mean = getattr(vae.config, 'latents_mean', None)
-            latents_std = getattr(vae.config, 'latents_std', None)
-            scaling_factor = getattr(vae.config, 'scaling_factor', 1.0)
-
-            if latents_mean is not None and latents_std is not None:
-                # Convert to tensors if needed
-                if not isinstance(latents_mean, torch.Tensor):
-                    latents_mean = torch.tensor(latents_mean, device=curr_lat.device, dtype=curr_lat.dtype)
-                if not isinstance(latents_std, torch.Tensor):
-                    latents_std = torch.tensor(latents_std, device=curr_lat.device, dtype=curr_lat.dtype)
-
-                # Apply normalization
-                curr_lat_5d = _normalize_latents(curr_lat_5d, latents_mean, latents_std, scaling_factor)
-                logger.info(f"🔧 Applied VAE normalization to current latents")
-
-            # Convert back to sequence format
-            curr_lat = _pack_latents(curr_lat_5d)
-
-        B, curr_seq_len, D = curr_lat.shape
-
-        # Debug print batch metadata
-        logger.info(f"ReferenceVideo batch metadata: F={F}, H={H}, W={W}, fps={fps}")
+        # Debug print batch metadata  
+        logger.info(f"New algorithm batch metadata: F={F}, H={H}, W={W}, fps={fps}")
         logger.info(f"Current latent shape: {curr_lat.shape}")
 
-        # Validate metadata
-        if F <= 0 or H <= 0 or W <= 0:
-            raise ValueError(f"Invalid metadata from dataset: F={F}, H={H}, W={W}")
-
-        # Check if we have previous conditions
-        has_prev = batch.get("prev_conditions") is not None
-        logger.info(f"Has previous conditions: {has_prev}")
-        
-        # 2) Get previous shot latents or use SOS token
-        ref_lat = None
-        if batch.get("prev_conditions") is not None:
-            # Use previous shot as reference
-            ref_lat, _, _, _, _ = _unpack_latent_entry(batch["prev_conditions"])
-
-            # 2.1) Apply VAE normalization to reference latents too
-            if vae is not None:
-                # Convert sequence format to 5D for normalization
-                ref_lat_5d = _unpack_latents(ref_lat, F, H, W)
-
-                # Get VAE normalization parameters (same as above)
-                latents_mean = getattr(vae.config, 'latents_mean', None)
-                latents_std = getattr(vae.config, 'latents_std', None)
-                scaling_factor = getattr(vae.config, 'scaling_factor', 1.0)
-
-                if latents_mean is not None and latents_std is not None:
-                    # Convert to tensors if needed
-                    if not isinstance(latents_mean, torch.Tensor):
-                        latents_mean = torch.tensor(latents_mean, device=ref_lat.device, dtype=ref_lat.dtype)
-                    if not isinstance(latents_std, torch.Tensor):
-                        latents_std = torch.tensor(latents_std, device=ref_lat.device, dtype=ref_lat.dtype)
-
-                    # Apply normalization
-                    ref_lat_5d = _normalize_latents(ref_lat_5d, latents_mean, latents_std, scaling_factor)
-                    logger.info(f"🔧 Applied VAE normalization to reference latents")
-
-                # Convert back to sequence format
-                ref_lat = _pack_latents(ref_lat_5d)
-
-            # logger.debug(f"Using previous shot as reference: {ref_lat.shape}")
+        # 2) Handle previous conditions
+        prev_conditions = batch.get("prev_conditions")
+        if prev_conditions is not None:
+            ref_lat, _, _, _, _ = _unpack_latent_entry(prev_conditions)
+            _, ref_seq_len, _ = ref_lat.shape
         else:
-            # First shot: generate Gaussian noise as reference
-            ref_lat = torch.randn(B, curr_seq_len, D, device=curr_lat.device, dtype=curr_lat.dtype)
-            logger.info(f"Generated Gaussian noise SOS as reference: {ref_lat.shape}")
+            # No previous shot - create random latents for prev and transition
+            ref_lat = torch.randn_like(curr_lat)
+            ref_seq_len = curr_lat.shape[1]
         
-        ref_seq_len = ref_lat.shape[1]
+        # 3) Create transition latents
+        transition_lat = cosine_weighted_diff(curr_lat, ref_lat)
+        # ❌ OLD: transition_lat = (1 - lambda_t) * ref_lat + lambda_t * curr_lat
+
+        # ✅ NEW: Transition should be INDEPENDENT noise
+        # This forces the model to learn semantic connection, not visual interpolation
+        # transition_lat = torch.randn_like(curr_lat)
+
+        logger.info(f"[TRANSITION] Created independent transition latents (no interpolation)")
+
         
-        # 3) Unpack text conditions (same as StandardTrainingStrategy)
-        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
-        
-        # 4) Sample timesteps and add noise to current shot only
+        # 4) Sample timesteps and add noise to ALL parts
         sigmas = timestep_sampler.sample_for(curr_lat)
         if sigmas.dim() > 3:
             raise ValueError("Unexpected sigma shape")
         sigmas = sigmas.view(B, 1, 1)  # (B, 1, 1)
         
-        noise = torch.randn_like(curr_lat, device=curr_lat.device)
-        # CRITICAL FIX: Correct flow matching interpolation
-        # Flow matching: x_t = (1-t) * x_0 + t * noise, where t ∈ [0,1]
-        # Here: x_t = (1-sigma) * curr_lat + sigma * noise
-        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise  # X0 in PC-CFM
+        # [SG-PATCH:DTYPE] Ensure dtype consistency
+        model_dtype = torch.bfloat16  # Default LTX model dtype
+        curr_lat = curr_lat.to(model_dtype)
+        ref_lat = ref_lat.to(model_dtype)
+        transition_lat = transition_lat.to(model_dtype)
+        sigmas = sigmas.to(model_dtype)
+        
+        
         
         # 5) Apply first frame conditioning to current shot
         target_conditioning_mask = self._create_first_frame_conditioning_mask(
@@ -882,122 +879,46 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             width=W,
             device=curr_lat.device,
         )
+
+        # Generate noise for all three parts
+        noise_prev = torch.randn_like(ref_lat)
+        noise_transition = torch.randn_like(transition_lat)
+        noise_curr = torch.randn_like(curr_lat)
+
+        # Apply noise to ALL parts (new algorithm)
+        noisy_prev = (1 - sigmas) * ref_lat + sigmas * noise_prev  
+        noisy_transition = (1 - sigmas) * transition_lat + sigmas * noise_transition  
+        noisy_curr = (1 - sigmas) * curr_lat + sigmas * noise_curr  
+
+        noisy_prev = torch.where(target_conditioning_mask.unsqueeze(-1), ref_lat, noisy_prev)
+        noisy_transition = torch.where(target_conditioning_mask.unsqueeze(-1), transition_lat, noisy_transition)
         noisy_curr = torch.where(target_conditioning_mask.unsqueeze(-1), curr_lat, noisy_curr)
-
-        # 5.5) Token processing for reference video strategy
-        token_metadata = None
-        token_positions = None
-
-        if self.enable_token_processing:
-            logger.info(f"🎭 REFERENCE VIDEO TOKEN PROCESSING ENABLED")
-            logger.info(f"🎭   Input shapes: ref_lat={ref_lat.shape}, noisy_curr={noisy_curr.shape}")
-            logger.info(f"🎭   Video dimensions: F={F}, H={H}, W={W}")
-
-            # Check for scenario metadata in batch
-            scenario = batch.get("scenario", None)
-            logger.info(f"🎭 REFERENCE VIDEO BATCH SCENARIO CHECK: scenario='{scenario}', enable_token_processing={self.enable_token_processing}")
-            if scenario:
-                logger.info(f"🎬 REFERENCE VIDEO SCENARIO PROCESSING: '{scenario}'")
-
-                # Convert latents to shot format for scenario processing
-                ref_reshaped = ref_lat.view(B, F, H, W, -1)[0]  # (F, H, W, D)
-                curr_reshaped = noisy_curr.view(B, F, H, W, -1)[0]  # (F, H, W, D)
-
-                # Create shot latents dict
-                shot_latents = {
-                    "ref_shot": ref_reshaped,
-                    "curr_shot": curr_reshaped
-                }
-
-                # Apply scenario-based preprocessing
-                from ltxv_trainer.token_utils import preprocess_with_scenario, create_scenario_conditioning_mask
-                tokenized_sequence, token_metadata = preprocess_with_scenario(
-                    shot_latents=shot_latents,
-                    scenario=scenario,
-                    token_embeddings=self.token_embeddings,
-                    device=curr_lat.device
-                )
-
-                # Create scenario conditioning mask (curr_shot is target)
-                base_bool_mask, base_strength_mask = create_scenario_conditioning_mask(
-                    metadata=token_metadata,
-                    conditioning_strength=1.0,
-                    stable_token_strength=0.5,
-                    transition_token_strength=0.8,
-                    target_shot="curr_shot",
-                    device=curr_lat.device
-                )
-
-                # Convert back to training format
-                total_frames = tokenized_sequence.shape[0]
-                seq_len = total_frames * H * W
-                tokenized_flat = tokenized_sequence.view(total_frames, -1)
-                tokenized_flat = tokenized_flat.view(seq_len, -1)
-                combined_latents = tokenized_flat.unsqueeze(0).expand(B, -1, -1)
-
-                # Expand boolean conditioning mask for timesteps
-                conditioning_mask = base_bool_mask.repeat_interleave(H * W)
-                conditioning_mask = conditioning_mask.unsqueeze(0).expand(B, -1)
-
-                # Store strength mask for later attention/loss weighting
-                token_strength_mask = base_strength_mask.repeat_interleave(H * W)
-                token_strength_mask = token_strength_mask.unsqueeze(0).expand(B, -1)
-
-                logger.info(f"🎭 REFERENCE VIDEO TOKEN PROCESSING COMPLETED!")
-                logger.info(f"🎭   Tokenized sequence: {combined_latents.shape}")
-
-            else:
-                logger.info(f"🎭 DEFAULT REFERENCE VIDEO PROCESSING (no tokens)")
-
-                # Default: concatenate without tokens
-                combined_latents = torch.cat([ref_lat, noisy_curr], dim=1)
-
-                # Create combined conditioning mask
-                ref_conditioning_mask = torch.ones(B, ref_seq_len, dtype=torch.bool, device=curr_lat.device)
-                conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
-
-        else:
-            # 6) Create combined conditioning mask (original behavior)
-            # Reference tokens are always conditioning
-            ref_conditioning_mask = torch.ones(B, ref_seq_len, dtype=torch.bool, device=curr_lat.device)
-            conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
-
-            # 9) Concatenate reference and noisy current in sequence dimension
-            combined_latents = torch.cat([ref_lat, noisy_curr], dim=1)  # (B, ref_seq + curr_seq, D)
         
-        # 7) Create timesteps based on boolean conditioning mask
+        conditioning_mask = torch.cat([target_conditioning_mask, target_conditioning_mask, target_conditioning_mask], dim = 1)
+        
+
+        
+
+        
+        # 5) Unpack text conditions
+        prompt_embeds, prompt_attention_mask = _unpack_condition_entry(batch["text_conditions"])
+        
+        
+        # 7) Create timesteps for all parts (same timestep for consistency)
         sampled_t = sigmas.squeeze(-1).squeeze(-1)  # (B,)
-        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_t)
-
-        # 7.5) Create attention mask for transformer attention/loss weighting
-        if self.enable_token_processing and 'token_strength_mask' in locals():
-            # Apply strength-based attention mask for transformer attention
-            attention_mask = self.apply_strength_to_attention_mask(
-                attention_mask=conditioning_mask,
-                strength_mask=token_strength_mask
-            )
-            logger.info(f"🎭 Applied strength-based attention mask for token processing")
-        else:
-            # Default: use boolean mask as attention mask
-            attention_mask = conditioning_mask.float()
-            logger.info(f"🎭 Using boolean conditioning mask as attention mask")
-
-        # 8) Store components for PC-CFM loss (not regular targets)
-        # We need to store: X0 (noisy), X1c (clean curr), X1p (prev/SOS)
+        timesteps = sampled_t.unsqueeze(1).expand(B, curr_seq_len * 3)  # (B, total_seq)
+        
+        # 8) Store targets for all three parts
         targets = {
-            # CRITICAL FIX: Flow matching velocity target v = x_1 - x_0
-            # For interpolated path x_t = (1-t)*x_0 + t*x_1, velocity is v = x_1 - x_0
-            'XO-X1c' : noise - curr_lat,  # v = clean - noise (direction toward clean)
-            'X0': noisy_curr,      # Initial noisy version
-            'X1c': curr_lat,       # Clean current shot  
-            'X1p': ref_lat,
-            'X1p-X1c': ref_lat - curr_lat,        # Previous shot or SOS token
-            'X0-X1p+X1c' : noise - ref_lat - curr_lat 
+            "ref_target": noise_prev - ref_lat,
+            "transition_target": noise_transition - transition_lat,
+            "curr_target": noise_curr - curr_lat
         }
         
-        # Note: combined_latents is now set in token processing section above
+        # 9) Concatenate all three parts in sequence dimension
+        combined_latents = torch.cat([noisy_prev, noisy_transition, noisy_curr], dim=1)  # (B, 3*seq, D)
         
-        # 10) Prepare video coordinates (검증 파이프라인과 동일한 방식)
+        # 10) Prepare video coordinates for combined sequence
         rope_scale_factors = get_rope_scale_factors(fps)
 
         # VAE compression ratios
@@ -1012,28 +933,16 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         latent_width = W
 
         # Debug prints
-        logger.info(f"ReferenceVideo - Dataset latent dims (already compressed): F={F}, H={H}, W={W}")
-        logger.info(f"ReferenceVideo - Using as latent dims: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
+        logger.info(f"New algorithm - Dataset latent dims: F={F}, H={H}, W={W}")
+        logger.info(f"Combined sequence length: {combined_latents.shape[1]}")
 
         # Check for invalid latent dimensions
         if latent_num_frames <= 0 or latent_height <= 0 or latent_width <= 0:
             raise ValueError(f"Invalid latent dimensions: frames={latent_num_frames}, height={latent_height}, width={latent_width}")
 
-        # Generate video coordinates based on actual sequence length
-        # For token processing: use the actual tokenized sequence frames
-        # For standard processing: use 2 * latent_num_frames (reference + current)
-        if self.enable_token_processing and token_metadata is not None:
-            # Use the actual tokenized sequence frames count
-            total_frames = token_metadata['total_frames']
-            logger.info(f"🎭 ReferenceVideo using tokenized sequence frames for video coords: {total_frames}")
-        else:
-            # Standard: reference + current frames
-            total_frames = 2 * latent_num_frames
-            logger.info(f"ℹ️  ReferenceVideo using standard frames for video coords: {total_frames}")
-
-        scaled_video_ids = prepare_video_coords(
+        base_coords = prepare_video_coords(
             batch_size=B,
-            num_frames=total_frames,
+            num_frames=latent_num_frames,
             height=latent_height,
             width=latent_width,
             patch_size=transformer_spatial_patch_size,
@@ -1044,15 +953,56 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             device=curr_lat.device,
         )
 
-        # Apply ROPE scaling and convert to final format
+        logger.info(f"base coords shape : {base_coords.shape}")
+
+        # 안전한 오프셋 (frame 인덱스 범위 이후로 밀기)
+        offset = base_coords[:, 0].max(dim=1, keepdim=True)[0] + 1
+
+        coords_prev = base_coords.clone()
+        coords_trans = base_coords.clone()
+        coords_curr = base_coords.clone()
+
+        # --------------------------------------------------------------
+        # [SG-PATCH: TEMPORAL OFFSET FIX]
+        # transition은 prev와 curr의 중간 시점으로 배치
+        # --------------------------------------------------------------
+        coords_trans[:, 0] = coords_trans[:, 0] + offset * 0.5
+        coords_curr[:, 0]  = coords_curr[:, 0] + offset
+        # coords_prev[:, 0] *= 0.5   # 선택적 정규화 (필요 시만 사용)
+
+        # --------------------------------------------------------------
+        # [SG-PATCH: PHASE CHANNEL]
+        # 각 세그먼트 구간에 명시적 phase 값을 부여 (0=prev, 0.5=trans, 1=curr)
+        # --------------------------------------------------------------
+        phase_prev = torch.zeros_like(coords_prev[:, :1])          # (B, 1, Seq)
+        phase_trans = torch.full_like(coords_trans[:, :1], 0.5)
+        phase_curr = torch.ones_like(coords_curr[:, :1])
+
+        # phase channel을 좌표에 추가 → shape: (B, 4, Seq)
+        coords_prev = torch.cat([coords_prev, phase_prev], dim=1)
+        coords_trans = torch.cat([coords_trans, phase_trans], dim=1)
+        coords_curr = torch.cat([coords_curr, phase_curr], dim=1)
+
+        # --------------------------------------------------------------
+        # [SG-PATCH: CONCAT ALL SEGMENTS]
+        # 모든 구간을 시간 순서대로 결합
+        # --------------------------------------------------------------
+        scaled_video_ids = torch.cat([coords_prev, coords_trans, coords_curr], dim=2)  # (B, 4, 3*S_single)
+        logger.info(f"scaled base coords shape : {scaled_video_ids.shape}")
+
+        # --------------------------------------------------------------
+        # [SG-PATCH: APPLY ROPE SCALE]
+        # 기존대로 spatial, temporal scaling 적용
+        # --------------------------------------------------------------
         video_coords = scaled_video_ids.float()
-        video_coords[:, 0] = video_coords[:, 0] * rope_scale_factors[0]
-        video_coords[:, 1] = video_coords[:, 1] * rope_scale_factors[1]
-        video_coords[:, 2] = video_coords[:, 2] * rope_scale_factors[2]
+        video_coords[:, 0] *= rope_scale_factors[0]   # time
+        video_coords[:, 1] *= rope_scale_factors[1]   # height
+        video_coords[:, 2] *= rope_scale_factors[2]   # width
+        # phase(3번째 축)는 scaling 없이 그대로 유지
         
         return TrainingBatch(
             latents=combined_latents,
-            targets=targets,  # Changed: now contains PC-CFM components
+            targets=targets,  
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
             timesteps=timesteps,
@@ -1065,58 +1015,58 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
             rope_interpolation_scale=rope_scale_factors,
             video_coords=video_coords,
             prev_seq_len=ref_seq_len,
-            token_metadata=token_metadata,
-            token_positions=token_positions,
         )
 
-    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
-        """Compute PC-CFM loss on target portion only."""
-        # Extract target portion from model prediction (last part corresponds to current shot)
-        target_seq_len = batch.targets['X1c'].shape[1]  # Current shot sequence length
-        target_pred = model_pred[:, -target_seq_len:]  # Extract current shot prediction
+    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch, global_step: int = 0) -> Tensor:
+        """Compute loss for new algorithm: all three parts (prev, transition, curr) contribute to loss."""
         
-        # Get PC-CFM loss components
-        # X0 = batch.targets['X0']   # Noisy current shot
-        X1c = batch.targets['X1c'] # Clean current shot
-        X1p = batch.targets['X1p'] # Previous shot or SOS token
+        # Extract target lengths for each part
+        target_ref_seq_len = batch.targets['ref_target'].shape[1]
+        target_transition_seq_len = batch.targets['transition_target'].shape[1]
+        target_curr_seq_len = batch.targets['curr_target'].shape[1]
         
-        # Apply PC-CFM loss: target = (X1c - X0) + lambda * (X1p - X1c)
-        # CRITICAL FIX: Use proper lambda value for PC-CFM (typical range: 0.1-1.0)
-        if X1p.shape[1] != X1c.shape[1]:
-            # If reference (X1p) has different sequence length, we need to handle it
-            # This can happen when prev shot has different length than current shot
-            if X1p.shape[1] > X1c.shape[1]:
-                # Truncate reference to match current shot length
-                X1p = X1p[:, :X1c.shape[1], :]
-            else:
-                # Pad reference to match current shot length (repeat last frame)
-                pad_len = X1c.shape[1] - X1p.shape[1]
-                last_frame = X1p[:, -1:, :].repeat(1, pad_len, 1)
-                X1p = torch.cat([X1p, last_frame], dim=1)
+        # Split model predictions for each part
+        pred_ref = model_pred[:, :target_ref_seq_len]
+        pred_transition = model_pred[:, target_ref_seq_len:target_ref_seq_len+target_transition_seq_len]
+        pred_curr = model_pred[:, -target_curr_seq_len:]
+        
+        # Get targets for each part
+        target_ref = batch.targets['ref_target']
+        target_transition = batch.targets['transition_target']
+        target_curr = batch.targets['curr_target']
                 
-        # CRITICAL FIX: Re-enable PC-CFM loss with proper lambda
-        # Standard PC-CFM: target = (X1c - X0) + λ(X1p - X1c) = XO-X1 + λ(X1p - X1c)
+        # Compute MSE loss for each part
+        ref_loss = (target_ref - pred_ref).pow(2)
+        transition_loss = (target_transition - pred_transition).pow(2)
+        curr_loss = (target_curr - pred_curr).pow(2)
         
-        lambda_val = 0.3  # Balance between current and previous shot influence - non-zero for temporal coherence
-        pc_cfm_target = batch.targets["XO-X1c"] + lambda_val * batch.targets["X0-X1p+X1c"]
+        # Extract conditioning masks for each part from batch.conditioning_mask
+        ref_conditioning_mask = batch.conditioning_mask[:, :target_ref_seq_len]
+        transition_conditioning_mask = batch.conditioning_mask[:, target_ref_seq_len:target_ref_seq_len+target_transition_seq_len]
+        curr_conditioning_mask = batch.conditioning_mask[:, -target_curr_seq_len:]
+        
+        # Create loss masks (invert conditioning mask - True where loss should be applied)
+        ref_mask = (~ref_conditioning_mask.unsqueeze(-1)).float()
+        transition_mask = (~transition_conditioning_mask.unsqueeze(-1)).float()
+        curr_mask = (~curr_conditioning_mask.unsqueeze(-1)).float()
+        
+        # Apply masks to losses
+        masked_ref_loss = ref_loss * ref_mask
+        masked_transition_loss = transition_loss * transition_mask
+        masked_curr_loss = curr_loss * curr_mask
         
         
-        # Extract target portion conditioning mask for masking
-        target_conditioning_mask = batch.conditioning_mask[:, -target_seq_len:]
-        logger.info(f"target pred : {target_pred.shape} real target : {pc_cfm_target.shape}")
-        # Compute MSE loss between model prediction and PC-CFM target
-        loss = (target_pred - pc_cfm_target).pow(2)
-        
-        # Apply mask to exclude conditioning tokens from loss
-        loss_mask = (~target_conditioning_mask.unsqueeze(-1)).float()
-        masked_loss = loss * loss_mask
-        
-        # Compute mean loss over valid (non-conditioning) tokens
-        num_valid_tokens = loss_mask.sum()
-        if num_valid_tokens > 0:
-            return masked_loss.sum() / num_valid_tokens
+        transition_weight = 3.0
+        # Calculate total loss
+        total_tokens = ref_mask.sum() +  transition_mask.sum() + curr_mask.sum()
+        if total_tokens > 0:
+            total_loss = (masked_ref_loss.sum() + transition_weight * masked_transition_loss.sum() + masked_curr_loss.sum()) / total_tokens
         else:
-            return torch.tensor(0.0, device=loss.device, requires_grad=True)
+            total_loss = torch.tensor(0.0, device=model_pred.device, requires_grad=True)
+            
+        logger.info(f"total_loss({total_loss}) = ref loss({masked_ref_loss.sum()}) + transition loss({masked_transition_loss.sum()}) + curr loss({masked_curr_loss.sum()})")
+        
+        return total_loss
 
 
 def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingStrategy:

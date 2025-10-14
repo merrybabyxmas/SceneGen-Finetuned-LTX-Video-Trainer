@@ -7,77 +7,92 @@ model:
   # load_checkpoint: outputs/checkpoints/lora_weights_step_01500.safetensors  # Resume from checkpoint
 
 lora:
-  rank: 128  
-  alpha: 128  
-  dropout: 0.1  
+  rank: 128
+  alpha: 128
+  dropout: 0.1
   target_modules: ["to_q","to_k","to_v","to_out.0"]
 
 # SceneGen multishot conditioning configuration
 conditioning:
   mode: "reference_video"  # Use reference_video mode (will be handled by SG_training_strategy)
-  first_frame_conditioning_p: 0.1
+  first_frame_conditioning_p: 0.1   # Balanced independence (30%)
+  lambda_val: 0.00   # Minimal but present continuity (2%)
+  reference_noise_level: 0.00   # Moderate noise for diversity without chaos   
 
 optimization:
-  learning_rate: 2e-4  
-  steps: 5
+  learning_rate: 1e-5  
+  steps: 10000
   batch_size: 1
   gradient_accumulation_steps: 1  
-  max_grad_norm: 1  
+  max_grad_norm: 0 
   optimizer_type: "adamw"
   scheduler_type: "linear"
   scheduler_params: {}
   enable_gradient_checkpointing: true   
 
 acceleration:
-  mixed_precision_mode: "bf16"
+  mixed_precision_mode: "bf16" 
   load_text_encoder_in_8bit: false
   compile_with_inductor: false
   compilation_mode: "reduce-overhead"
 
 data:
-  preprocessed_data_root: "/home/jeongseon38/datasets/videos/splits/.precomputed"
+  preprocessed_data_root: "/home/jeongseon39/MLLAB/video_gen/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 4
-  dataset_size: 1000  # Set to a number (e.g., 10) to limit dataset size for testing
+  dataset_size: 100
 
 validation:
-  prompts: ["a professional portrait video of the earth"]
-  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  prompts: [
+  "professional portrait video of young man playing acoustic guitar in a clean studio setting, solid neutral background, detailed face, clear fingers, sharp focus, cinematic quality, 4K, realistic lighting, smooth clean background, no noise, stable composition",
+  "professional portrait video of a clip of a dentist performing dental work on someone, detailed face",
+  "professional portrait video of a a superhero fights another superhero in a movie, a superhero flying to the jungle and fighting",
+  "professional portrait video of a a guy dressed as a character from the assassin creed video game sings, a guy sings in an assassins creed music video"]
+  negative_prompt: "blurry face, unclear hands, low resolution, pixelated, compressed, low quality, worst quality, artifact, distorted, poor lighting, noise, grain, static, flickering, unstable motion, temporal inconsistency, frame drops, noisy background, cluttered background, messy background, background artifacts, background noise, random patterns in background, unstable background, repetitive content, duplicate poses, identical composition, same angle, similar framing, copy paste, repeated elements"
   images: null
   reference_videos: null
-  video_dims: [768, 448, 17]
-  seed: 42
-  inference_steps: 50
-  interval: 2
+  video_dims: [768, 448, 25]
+  seed: 42  # Fixed seed for consistent but different pattern from before  
+  inference_steps: 50  # Increased for higher quality
+  interval: 1000  # More frequent validation to monitor improvements
   videos_per_prompt: 1
-  guidance_scale: 3.5
+  guidance_scale: 3.5   # Balanced for prompt adherence and quality
   skip_initial_validation: True
-  enable_multi_shot: True
+  enable_multi_shot: false
   num_shots: 3
   sos_latent_dim: 128
-  starts_with: "batch"  # Options: "sos" (generate SOS latents) or "batch" (use current training batch's prev condition)
-  save_full_sequence: true  # Save full denoising sequence from noise to final result
+  starts_with: "sos"  # Use actual training data instead of SOS tokens for better quality 
+  save_full_sequence: true  
 
 checkpoints:
   interval: 500
-  keep_last_n: 3
+  keep_last_n: 5
 
 hub:
-  push_to_hub: True
-  hub_model_id: "merrybabyxmas/SceneGen-PC-CFM"
+  push_to_hub: false
+  hub_model_id: "urjeongseon/ltxv_finetuned"
 
 flow_matching:
   timestep_sampling_mode: "shifted_logit_normal"
   timestep_sampling_params: {}
 
 wandb:
-  enabled: True
-  project: "ltxv-scenegen-pc-cfm"
-  entity: "mw990909-sogang-university"
+  enabled: false
+  project: "ltxv-scenegen-training"
+  entity: "jeongseon-sogang-university"
   tags: ["ltxv", "scenegen", "pc-cfm", "2b"]
   log_validation_videos: true
 
 debug:
-  enable_debug_frames: true
-  debug_gpu_id: 1  # Physical GPU 3 maps to PyTorch GPU 2 when using CUDA_VISIBLE_DEVICES=1,2,3
-  debug_interval: 2
+  enable_debug_frames: false
+  debug_gpu_id: 1 
+  debug_interval: 500
   enable_batch_visualization: true
+
+# Output directory configuration
+output_dir: "/home/jeongseon39/dongwoo/scenegen2/outputs"
+
+# Logging configuration
+logging:
+  save_logs: true  # Set to false to disable file logging
+  log_dir: "/home/jeongseon39/MLLAB/scenegen/outputs/logs"
+  log_level: "INFO"

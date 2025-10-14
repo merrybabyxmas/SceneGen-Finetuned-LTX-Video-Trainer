@@ -15,199 +15,6 @@ import torch.nn.functional as F
 import re
 
 
-
-# --------------------------
-# Packing/unpacking functions (from SGMultiShotPipeline)
-# --------------------------
-def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
-    """
-    Pack latents from [B, C, F, H, W] to [B, F // p_t * H // p * W // p, C * p_t * p * p].
-    """
-    batch_size, num_channels, num_frames, height, width = latents.shape
-    post_patch_num_frames = num_frames // patch_size_t
-    post_patch_height = height // patch_size
-    post_patch_width = width // patch_size
-    latents = latents.reshape(
-        batch_size,
-        -1,
-        post_patch_num_frames,
-        patch_size_t,
-        post_patch_height,
-        patch_size,
-        post_patch_width,
-        patch_size,
-    )
-    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-    return latents
-
-
-def _unpack_latents(
-    latents: torch.Tensor, num_frames: int, height: int, width: int, patch_size: int = 1, patch_size_t: int = 1
-) -> torch.Tensor:
-    """
-    Unpack latents from [B, S, D] to [B, C, F, H, W].
-    """
-    batch_size = latents.size(0)
-    latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
-    latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-    return latents
-
-
-def _normalize_latents(
-    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-) -> torch.Tensor:
-    """Normalize latents across the channel dimension [B, C, F, H, W]"""
-    latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-    latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-    latents = (latents - latents_mean) * scaling_factor / latents_std
-    return latents
-
-# ---------- SOS token utilities ----------
-def _trunc_normal_(tensor: torch.Tensor, std: float = 0.02):
-    with torch.no_grad():
-        size = tensor.shape
-        tmp = tensor.new_empty(size + (4,)).normal_()
-        valid = (tmp < 2) & (tmp > -2)
-        ind = valid.max(-1, keepdim=True)[1]
-        tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
-        tensor.data.mul_(std)
-    return tensor
-
-
-def _sinusoidal_pos_emb(n_positions: int, dim: int) -> torch.Tensor:
-    pe = torch.zeros(n_positions, dim)
-    position = torch.arange(0, n_positions, dtype=torch.float32).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-
-class SOSTokenLatents(nn.Module):
-    def __init__(self, d_model: int = 128, sos_config=None):
-        super().__init__()
-        self.d_model = d_model
-        
-        # Get config values or use defaults
-        if sos_config is not None:
-            alpha_val = getattr(sos_config, 'alpha', 0.2)
-            base_std = getattr(sos_config, 'base_std', 0.05)
-            pe_dim = getattr(sos_config, 'pe_dim', None)
-            use_zero_init = getattr(sos_config, 'use_zero_init', False)
-            learnable_offset_enabled = getattr(sos_config, 'learnable_offset', True)
-        else:
-            alpha_val = 0.2
-            base_std = 0.05
-            pe_dim = None
-            use_zero_init = False
-            learnable_offset_enabled = True
-        
-        if use_zero_init:
-            base_token = torch.zeros(1, d_model)
-        else:
-            base_token = torch.empty(1, d_model)
-            _trunc_normal_(base_token, std=base_std)
-        self.register_buffer('base', base_token)
-        self.register_buffer('alpha', torch.tensor(alpha_val))
-
-        pe_dim = pe_dim or min(64, d_model)
-        self.pe_proj = nn.Linear(pe_dim, d_model, bias=False)
-        if use_zero_init:
-            nn.init.zeros_(self.pe_proj.weight)
-        else:
-            nn.init.xavier_uniform_(self.pe_proj.weight)
-        for param in self.pe_proj.parameters():
-            param.requires_grad = True
-
-        # Learnable offset parameter (hybrid approach)
-        if learnable_offset_enabled:
-            self.learnable_offset = nn.Parameter(torch.zeros(1, self.d_model))
-        else:
-            self.register_buffer('learnable_offset', torch.zeros(1, self.d_model))
-
-    def _sinusoidal_1d(self, n: int, d: int, device) -> torch.Tensor:
-        half = max(d // 2, 1)
-        pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)   # [n,1]
-        i = torch.arange(half, device=device, dtype=torch.float32)               # [half]
-        div = torch.exp(-math.log(10000.0) * i / max(half, 1))
-        emb = torch.cat([torch.sin(pos * div), torch.cos(pos * div)], dim=1)
-        if emb.shape[1] < d:
-            emb = F.pad(emb, (0, d - emb.shape[1]))
-        elif emb.shape[1] > d:
-            emb = emb[:, :d]
-        return emb
-
-    def _forward_grid(self, batch_size: int, num_frames: int, height: int, width: int, device=None) -> torch.Tensor:
-        """Return [B, D, F, H, W]"""
-        if device is None:
-            device = self.base.device
-        B, F, H, W = batch_size, num_frames, height, width
-        D = self.d_model
-        seq_len = F * H * W
-
-        pe_dim = self.pe_proj.in_features
-        d_t = pe_dim // 3
-        d_h = pe_dim // 3
-        d_w = pe_dim - d_t - d_h
-
-        Et = self._sinusoidal_1d(F, d_t, device)  # [F, d_t]
-        Eh = self._sinusoidal_1d(H, d_h, device)  # [H, d_h]
-        Ew = self._sinusoidal_1d(W, d_w, device)  # [W, d_w]
-
-        Etg = Et[:, None, None, :]
-        Ehg = Eh[None, :, None, :]
-        Ewg = Ew[None, None, :, :]
-        pe3d = torch.cat(
-            [Etg.expand(F, H, W, -1),
-             Ehg.expand(F, H, W, -1),
-             Ewg.expand(F, H, W, -1)],
-            dim=-1
-        ).reshape(seq_len, pe_dim)
-
-        pe_c = self.pe_proj(pe3d)                             # [Seq, D]
-        base = self.base.to(device).expand(seq_len, -1)       # [Seq, D]
-        # Hybrid approach: base + positional encoding + learnable offset
-        sos_seq = base + self.alpha.to(device) * pe_c + self.learnable_offset.to(device)  # [Seq, D]
-
-        sos_ch_first = sos_seq.transpose(0, 1).reshape(D, F, H, W)  # [D,F,H,W]
-        sos = sos_ch_first.unsqueeze(0).expand(B, -1, -1, -1, -1).contiguous()
-        return sos.clamp(-1.0, 1.0)
-
-    def _forward_seq(self, seq_len: int, shape: tuple[int, int, int], device=None) -> torch.Tensor:
-        """
-        Always use grid forward, then flatten with pack_latents.
-        Returns [Seq, D] with spatio-temporal info.
-        """
-        F, H, W = shape
-        assert seq_len == F * H * W, f"seq_len={seq_len}, but shape={shape} not matching"
-        # [1, D, F, H, W]
-        sos_grid = self._forward_grid(batch_size=1, num_frames=F, height=H, width=W, device=device)
-        # → pack to [1, Seq, D]
-        sos_seq = _pack_latents(sos_grid, patch_size=1, patch_size_t=1)  # [1, Seq, D]
-        return sos_seq.squeeze(0)  # [Seq, D]
-
-    def forward(self, *args, **kwargs):
-        if 'seq_len' in kwargs:
-            shape = kwargs.get('shape', None)
-            if shape is None:
-                raise ValueError("When using seq_len mode, you must also provide shape=(F,H,W)")
-            return self._forward_seq(seq_len=int(kwargs['seq_len']), shape=shape, device=kwargs.get('device', None))
-        required = ('batch_size', 'num_frames', 'height', 'width')
-        if all(k in kwargs for k in required):
-            return self._forward_grid(
-                batch_size=int(kwargs['batch_size']),
-                num_frames=int(kwargs['num_frames']),
-                height=int(kwargs['height']),
-                width=int(kwargs['width']),
-                device=kwargs.get('device', None),
-            )
-        raise TypeError(
-            "SOSTokenLatents.forward expected either "
-            "`seq_len=<int>, shape=(F,H,W)` or "
-            "`batch_size=<int>, num_frames=<int>, height=<int>, width=<int>`."
-        )
-
-
 PRECOMPUTED_DIR_NAME = ".precomputed"
 
 
@@ -231,8 +38,6 @@ class PrecomputedDataset(Dataset):
         sos_sources: Optional[set[str]] = None,
         num_shots: int = 0,  # 더이상 사용하지 않지만, 외부 호환을 위해 인자 유지
         dataset_size: Optional[int] = None,  # 데이터셋 크기 제한
-        d_model: int = 128,
-        sos_config=None  # SOS token configuration
     ) -> None:
         super().__init__()
         self.data_root = self._setup_data_root(data_root)
@@ -259,7 +64,6 @@ class PrecomputedDataset(Dataset):
         self._prepare_prev_links()
         self._validate_entries()
         self._limit_dataset_size()
-        self.sos_generator = SOSTokenLatents(d_model=d_model, sos_config=sos_config)
 
     # ---------- setup helpers ----------
     @staticmethod
@@ -349,23 +153,18 @@ class PrecomputedDataset(Dataset):
             # 누적
             tmp_map[video_id][shot_idx] = per_source_rel
 
-        # 정렬하여 entries 구축 - 첫 번째 샷은 제외
+        # 정렬하여 entries 구축
         for video_id, shots_dict in tmp_map.items():
             shot_list = sorted(shots_dict.keys())
-            # Build _key_to_rel for all shots (needed for prev_shot lookup)
             for sidx in shot_list:
-                per_source_rel = shots_dict[sidx]
-                for output_key, rel in per_source_rel.items():
-                    self._key_to_rel[(video_id, sidx, output_key)] = rel
-            
-            # Only add entries from second shot onwards (skip first shot)
-            for sidx in shot_list[1:]:  # Start from second shot
                 per_source_rel = shots_dict[sidx]
                 self.entries.append({
                     "video_id": video_id,
                     "shot_idx": sidx,
                     "per_source_rel": per_source_rel,
                 })
+                for output_key, rel in per_source_rel.items():
+                    self._key_to_rel[(video_id, sidx, output_key)] = rel
             self._video_to_shots[video_id] = shot_list
 
         # 전역 정렬 (video_id, shot_idx)
@@ -422,6 +221,58 @@ class PrecomputedDataset(Dataset):
         video_id = entry["video_id"]
         shot_idx = entry["shot_idx"]
         prev_shot_idx = entry["prev_shot_idx"]
+
+        result = {}
+
+        # 현재 샷 데이터 로드
+        for dir_name, output_key in self.data_sources.items():
+            source_root = self.source_paths[dir_name]
+            try:
+                rel_data = entry["per_source_rel"][output_key]
+                data_path = source_root / rel_data
+                data = torch.load(data_path, map_location="cpu", weights_only=True)
+                result[output_key] = data
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {output_key} from {data_path}: {e}") from e
+
+        # 이전 샷 데이터 로드 (latents만 처리)
+        prev_ok = False
+        if "latents" in self.data_sources:
+            latents_output_key = self.data_sources["latents"]
+            source_root = self.source_paths["latents"]
+
+            if prev_shot_idx is not None:
+                try:
+                    key = (video_id, prev_shot_idx, latents_output_key)
+                    rel_prev = self._key_to_rel[key]
+                    prev_path = source_root / rel_prev
+                    prev_data = torch.load(prev_path, map_location="cpu", weights_only=True)
+                    result["prev_conditions"] = prev_data
+                    prev_ok = True
+                except Exception as e:
+                    logging.warning(f"[SKIP] failed to load prev shot {prev_shot_idx} for video {video_id}: {e}")
+                    # skip this entire sample
+                    
+                    # 이전 샷 로딩 실패시 SOS 사용
+                    curr_data = result[latents_output_key]
+                    result["prev_conditions"] = self._make_sos_like(curr_data)
+                    
+            else:
+                # 첫 번째 샷 → skip (prev 없음)
+                logging.info(f"[SKIP] first shot (no prev) for video {video_id}, skipping index {index}")
+            
+                curr_data = result[latents_output_key]
+                result["prev_conditions"] = self._make_sos_like(curr_data)
+                
+
+        result["scenario"] = "ref_shot,transition,curr_shot"
+        result["idx"] = index
+        return result
+        import pprint
+        entry = self.entries[index]
+        video_id = entry["video_id"]
+        shot_idx = entry["shot_idx"]
+        prev_shot_idx = entry["prev_shot_idx"]
         
         # print(f"curr shot idx : {shot_idx} "
         #       f"prev shot idx : {prev_shot_idx}")
@@ -444,26 +295,34 @@ class PrecomputedDataset(Dataset):
             latents_output_key = self.data_sources["latents"]
             source_root = self.source_paths["latents"]
             
-            # prev_shot_idx는 항상 존재함 (첫 번째 샷은 이미 필터링됨)
-            try:
-                key = (video_id, prev_shot_idx, latents_output_key)
-                rel_prev = self._key_to_rel[key]
-                prev_path = source_root / rel_prev
-                prev_data = torch.load(prev_path, map_location="cpu", weights_only=True)
-                result["prev_conditions"] = prev_data
-            except Exception as e:
-                raise RuntimeError(f"Failed to load prev shot {prev_shot_idx}: {e}") from e
+            if prev_shot_idx is not None:
+                # 이전 샷이 있는 경우 로드
+                try:
+                    key = (video_id, prev_shot_idx, latents_output_key)
+                    rel_prev = self._key_to_rel[key]
+                    prev_path = source_root / rel_prev
+                    prev_data = torch.load(prev_path, map_location="cpu", weights_only=True)
+                    result["prev_conditions"] = prev_data
+                except Exception as e:
+                    logging.warning(f"Failed to load prev shot {prev_shot_idx}: {e}, using SOS")
+                    # 이전 샷 로딩 실패시 SOS 사용
+                    curr_data = result[latents_output_key]
+                    result["prev_conditions"] = self._make_sos_like(curr_data)
+            else:
+                # 첫 번째 샷인 경우 SOS 토큰 생성
+                curr_data = result[latents_output_key]
+                result["prev_conditions"] = self._make_sos_like(curr_data)
                     
         # Add scenario metadata for token processing
-        # prev_shot_idx는 항상 존재함 (첫 번째 샷은 이미 필터링됨)
-        result["scenario"] = "ref_shot,transition,curr_shot"
+        if prev_shot_idx is not None:
+            # Multi-shot scenario: prev_shot -> stable -> transition -> curr_shot -> stable
+            result["scenario"] = "ref_shot,transition,curr_shot"
+        else:
+            # Single shot scenario: just curr_shot (첫 번째 샷)
+            result["scenario"] = "ref_shot,transition,curr_shot"
 
         result["idx"] = index
         return result
-    
-    
-    
-    
     # ---------- helpers ----------
     def _make_sos_like(self, ref: torch.Tensor) -> torch.Tensor:
         """
@@ -539,7 +398,7 @@ class PrecomputedDataset(Dataset):
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
-    ds = PrecomputedDataset("/home/scenegen44/MLLAB/dataset/videos/splits/.precomputed")
+    ds = PrecomputedDataset("/home/jeongseon39/MLLAB/video_gen/datasets/videos/splits/.precomputed")
     # loader = DataLoader(ds, batch_size=4, shuffle=True)
     # for batch in loader:
     #     print(batch)
@@ -558,3 +417,20 @@ if __name__ == "__main__":
         
         
         
+        
+        
+"""
+prev : 뭔가를 넣어야하는 곳(sos를 넣잔아)
+curr : 항상 있음
+
+prev : prev
+curr : curr
+
+
+[None, shot1], [s1, s2],,,
+
+-> [s1,s2] 
+
+
+
+"""

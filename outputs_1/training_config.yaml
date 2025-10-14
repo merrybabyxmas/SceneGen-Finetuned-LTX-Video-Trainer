@@ -1,0 +1,103 @@
+acceleration:
+  compilation_mode: reduce-overhead
+  compile_with_inductor: false
+  load_text_encoder_in_8bit: false
+  mixed_precision_mode: bf16
+  quantization: null
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+conditioning:
+  attention_slice_size: null
+  enable_attention_slicing: true
+  enable_memory_efficient_attention: true
+  first_frame_conditioning_p: 0.1
+  lambda_val: 0.02
+  mode: reference_video
+  reference_latents_dir: ref_latents
+  reference_noise_level: 0.08
+data:
+  dataset_size: 1500
+  num_dataloader_workers: 4
+  preprocessed_data_root: /home/jeongseon39/MLLAB/video_gen/datasets/videos/splits/.precomputed
+debug:
+  debug_gpu_id: 1
+  debug_interval: 500
+  enable_batch_visualization: true
+  enable_debug_frames: false
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+hub:
+  hub_model_id: urjeongseon/ltxv_finetuned
+  push_to_hub: false
+logging:
+  log_dir: /home/jeongseon39/MLLAB/scenegen/outputs/logs
+  log_level: INFO
+  save_logs: true
+lora:
+  alpha: 128
+  dropout: 0.1
+  rank: 128
+  target_modules:
+  - to_q
+  - to_k
+  - to_v
+  - to_out.0
+model:
+  load_checkpoint: null
+  model_source: !!python/object/apply:ltxv_trainer.model_loader.LtxvModelVersion
+  - LTXV_2B_0.9.5
+  training_mode: lora
+optimization:
+  batch_size: 1
+  enable_gradient_checkpointing: true
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.0
+  optimizer_type: adamw
+  scheduler_params: {}
+  scheduler_type: cosine
+  steps: 7000
+output_dir: /home/jeongseon39/dongwoo/scenegen2/outputs
+seed: 42
+validation:
+  enable_multi_shot: false
+  guidance_scale: 5.5
+  images: null
+  inference_steps: 100
+  interval: 200
+  negative_prompt: blurry face, unclear hands, low resolution, pixelated, compressed,
+    low quality, worst quality, artifact, distorted, poor lighting, noise, grain,
+    static, flickering, unstable motion, temporal inconsistency, frame drops, noisy
+    background, cluttered background, messy background, background artifacts, background
+    noise, random patterns in background, unstable background, repetitive content,
+    duplicate poses, identical composition, same angle, similar framing, copy paste,
+    repeated elements
+  num_shots: 3
+  prompts:
+  - professional portrait video of young man playing acoustic guitar in a clean studio
+    setting, solid neutral background, detailed face, clear fingers, sharp focus,
+    cinematic quality, 4K, realistic lighting, smooth clean background, no noise,
+    stable composition
+  reference_videos: null
+  save_full_sequence: true
+  seed: 42
+  skip_initial_validation: true
+  sos_latent_dim: 128
+  starts_with: sos
+  video_dims: !!python/tuple
+  - 768
+  - 448
+  - 25
+  videos_per_prompt: 1
+wandb:
+  enabled: false
+  entity: jeongseon-sogang-university
+  log_validation_videos: true
+  project: ltxv-scenegen-training
+  tags:
+  - ltxv
+  - scenegen
+  - pc-cfm
+  - 2b

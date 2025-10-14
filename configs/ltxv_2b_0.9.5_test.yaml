@@ -28,7 +28,7 @@ acceleration:
   compilation_mode: "reduce-overhead"
 
 data:
-  preprocessed_data_root: "/home/jeongseon38/datasets/videos/splits/.precomputed"
+  preprocessed_data_root: "/home/jeongseon39/MLLAB/video_gen/datasets/videos/splits/.precomputed"
   num_dataloader_workers: 4
   dataset_size: 1000  # ⭐ TESTING: Use only 10 samples
 
@@ -54,7 +54,7 @@ checkpoints:
 
 hub:
   push_to_hub: False  # DISABLED for testing
-  hub_model_id: "merrybabyxmas/SceneGen-Finetuned"
+  hub_model_id: "urjeongseon/ltxv_finetuned"
 
 flow_matching:
   timestep_sampling_mode: "shifted_logit_normal"  # CHANGED from shifted_logit_normal to uniform for stability
@@ -62,8 +62,8 @@ flow_matching:
 
 wandb:
   enabled: True  # Enabled with correct entity
-  project: "ltxv-scenegen-training-test"
-  entity: "mw990909-sogang-university"  # Correct entity name from wandb account
+  project: "ltxv-scenegen-training"
+  entity: "jeongseon-sogang-university"
   tags: ["ltxv", "scenegen", "lora", "2b", "test", "small-dataset"]
   log_validation_videos: true
 

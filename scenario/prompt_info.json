@@ -1,0 +1,978 @@
+{
+  "video_20250923_122551_t2v_shot1_step_000005_20250923_122551": {
+    "video_filename": "t2v_shot1_step_000005_20250923_122551.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_122551.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122551",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122603_t2v_shot1_step_000005_20250923_122602": {
+    "video_filename": "t2v_shot1_step_000005_20250923_122602.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_122602.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_122603",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122622_v2v_shot1_step_000005_20250923_122622": {
+    "video_filename": "v2v_shot1_step_000005_20250923_122622.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000005_20250923_122622.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122622",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122655_t2v_shot1_step_000010_20250923_122655": {
+    "video_filename": "t2v_shot1_step_000010_20250923_122655.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_122655.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122655",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122706_t2v_shot1_step_000010_20250923_122706": {
+    "video_filename": "t2v_shot1_step_000010_20250923_122706.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_122706.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_122706",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122726_v2v_shot1_step_000010_20250923_122726": {
+    "video_filename": "v2v_shot1_step_000010_20250923_122726.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000010_20250923_122726.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122726",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122758_t2v_shot1_step_000015_20250923_122757": {
+    "video_filename": "t2v_shot1_step_000015_20250923_122757.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_122757.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122758",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122809_t2v_shot1_step_000015_20250923_122809": {
+    "video_filename": "t2v_shot1_step_000015_20250923_122809.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_122809.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_122809",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122829_v2v_shot1_step_000015_20250923_122829": {
+    "video_filename": "v2v_shot1_step_000015_20250923_122829.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000015_20250923_122829.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122829",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122901_t2v_shot1_step_000020_20250923_122900": {
+    "video_filename": "t2v_shot1_step_000020_20250923_122900.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_122900.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122901",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122912_t2v_shot1_step_000020_20250923_122912": {
+    "video_filename": "t2v_shot1_step_000020_20250923_122912.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_122912.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_122912",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_122932_v2v_shot1_step_000020_20250923_122931": {
+    "video_filename": "v2v_shot1_step_000020_20250923_122931.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000020_20250923_122931.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_122932",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123119_t2v_shot1_step_000005_20250923_123119": {
+    "video_filename": "t2v_shot1_step_000005_20250923_123119.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_123119.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123119",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123128_t2v_shot1_step_000005_20250923_123128": {
+    "video_filename": "t2v_shot1_step_000005_20250923_123128.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_123128.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123128",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123148_v2v_shot1_step_000005_20250923_123148": {
+    "video_filename": "v2v_shot1_step_000005_20250923_123148.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000005_20250923_123148.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123148",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123219_t2v_shot1_step_000010_20250923_123219": {
+    "video_filename": "t2v_shot1_step_000010_20250923_123219.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_123219.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123219",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123229_t2v_shot1_step_000010_20250923_123228": {
+    "video_filename": "t2v_shot1_step_000010_20250923_123228.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_123228.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123229",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123248_v2v_shot1_step_000010_20250923_123248": {
+    "video_filename": "v2v_shot1_step_000010_20250923_123248.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000010_20250923_123248.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123248",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123318_t2v_shot1_step_000015_20250923_123318": {
+    "video_filename": "t2v_shot1_step_000015_20250923_123318.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_123318.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123318",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123328_t2v_shot1_step_000015_20250923_123327": {
+    "video_filename": "t2v_shot1_step_000015_20250923_123327.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_123327.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123328",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123347_v2v_shot1_step_000015_20250923_123347": {
+    "video_filename": "v2v_shot1_step_000015_20250923_123347.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000015_20250923_123347.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123347",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123417_t2v_shot1_step_000020_20250923_123417": {
+    "video_filename": "t2v_shot1_step_000020_20250923_123417.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_123417.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123417",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123427_t2v_shot1_step_000020_20250923_123426": {
+    "video_filename": "t2v_shot1_step_000020_20250923_123426.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_123426.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123427",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123447_v2v_shot1_step_000020_20250923_123446": {
+    "video_filename": "v2v_shot1_step_000020_20250923_123446.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000020_20250923_123446.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123447",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123556_t2v_shot1_step_000005_20250923_123555": {
+    "video_filename": "t2v_shot1_step_000005_20250923_123555.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_123555.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123556",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123604_t2v_shot1_step_000005_20250923_123604": {
+    "video_filename": "t2v_shot1_step_000005_20250923_123604.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_123604.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123604",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123624_v2v_shot1_step_000005_20250923_123624": {
+    "video_filename": "v2v_shot1_step_000005_20250923_123624.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000005_20250923_123624.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123624",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123654_t2v_shot1_step_000010_20250923_123653": {
+    "video_filename": "t2v_shot1_step_000010_20250923_123653.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_123653.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123654",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123702_t2v_shot1_step_000010_20250923_123702": {
+    "video_filename": "t2v_shot1_step_000010_20250923_123702.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_123702.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123702",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123722_v2v_shot1_step_000010_20250923_123722": {
+    "video_filename": "v2v_shot1_step_000010_20250923_123722.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000010_20250923_123722.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123722",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123750_t2v_shot1_step_000015_20250923_123750": {
+    "video_filename": "t2v_shot1_step_000015_20250923_123750.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_123750.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123750",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123759_t2v_shot1_step_000015_20250923_123758": {
+    "video_filename": "t2v_shot1_step_000015_20250923_123758.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_123758.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1",
+    "timestamp": "20250923_123759",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123819_v2v_shot1_step_000015_20250923_123818": {
+    "video_filename": "v2v_shot1_step_000015_20250923_123818.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000015_20250923_123818.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123819",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123847_t2v_shot1_step_000020_20250923_123847": {
+    "video_filename": "t2v_shot1_step_000020_20250923_123847.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_123847.mp4",
+    "prompt": "a professional portrait video of the earth",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123847",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_123954_t2v_shot1_step_000005_20250923_123954": {
+    "video_filename": "t2v_shot1_step_000005_20250923_123954.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_123954.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_123954",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124003_t2v_shot1_step_000005_20250923_124002": {
+    "video_filename": "t2v_shot1_step_000005_20250923_124002.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000005_20250923_124002.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1",
+    "timestamp": "20250923_124003",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124023_v2v_shot1_step_000005_20250923_124022": {
+    "video_filename": "v2v_shot1_step_000005_20250923_124022.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000005_20250923_124022.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124023",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124052_t2v_shot1_step_000010_20250923_124052": {
+    "video_filename": "t2v_shot1_step_000010_20250923_124052.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_124052.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124052",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124101_t2v_shot1_step_000010_20250923_124100": {
+    "video_filename": "t2v_shot1_step_000010_20250923_124100.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000010_20250923_124100.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1",
+    "timestamp": "20250923_124101",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124121_v2v_shot1_step_000010_20250923_124120": {
+    "video_filename": "v2v_shot1_step_000010_20250923_124120.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000010_20250923_124120.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124121",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124149_t2v_shot1_step_000015_20250923_124149": {
+    "video_filename": "t2v_shot1_step_000015_20250923_124149.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_124149.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124149",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124157_t2v_shot1_step_000015_20250923_124157": {
+    "video_filename": "t2v_shot1_step_000015_20250923_124157.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000015_20250923_124157.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1",
+    "timestamp": "20250923_124157",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124217_v2v_shot1_step_000015_20250923_124217": {
+    "video_filename": "v2v_shot1_step_000015_20250923_124217.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000015_20250923_124217.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124217",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124246_t2v_shot1_step_000020_20250923_124246": {
+    "video_filename": "t2v_shot1_step_000020_20250923_124246.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_124246.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124246",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124254_t2v_shot1_step_000020_20250923_124254": {
+    "video_filename": "t2v_shot1_step_000020_20250923_124254.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000020_20250923_124254.mp4",
+    "prompt": "a professional portrait video of the people playing minecraft",
+    "scenario": "shot1",
+    "timestamp": "20250923_124254",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_124314_v2v_shot1_step_000020_20250923_124314": {
+    "video_filename": "v2v_shot1_step_000020_20250923_124314.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000020_20250923_124314.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_124314",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125244_t2v_shot1_step_000100_20250923_125243": {
+    "video_filename": "t2v_shot1_step_000100_20250923_125243.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000100_20250923_125243.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_125244",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125252_t2v_shot1_step_000100_20250923_125252": {
+    "video_filename": "t2v_shot1_step_000100_20250923_125252.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000100_20250923_125252.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1",
+    "timestamp": "20250923_125252",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125401_v2v_shot1_step_000100_20250923_125401": {
+    "video_filename": "v2v_shot1_step_000100_20250923_125401.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000100_20250923_125401.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_125401",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125704_t2v_shot1_step_000200_20250923_125703": {
+    "video_filename": "t2v_shot1_step_000200_20250923_125703.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000200_20250923_125703.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_125704",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125712_t2v_shot1_step_000200_20250923_125712": {
+    "video_filename": "t2v_shot1_step_000200_20250923_125712.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000200_20250923_125712.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1",
+    "timestamp": "20250923_125712",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_125732_v2v_shot1_step_000200_20250923_125732": {
+    "video_filename": "v2v_shot1_step_000200_20250923_125732.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000200_20250923_125732.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_125732",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130052_t2v_shot1_step_000300_20250923_130052": {
+    "video_filename": "t2v_shot1_step_000300_20250923_130052.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000300_20250923_130052.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_130052",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130100_t2v_shot1_step_000300_20250923_130100": {
+    "video_filename": "t2v_shot1_step_000300_20250923_130100.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000300_20250923_130100.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1",
+    "timestamp": "20250923_130100",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130120_v2v_shot1_step_000300_20250923_130120": {
+    "video_filename": "v2v_shot1_step_000300_20250923_130120.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000300_20250923_130120.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_130120",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130548_t2v_shot1_step_000400_20250923_130548": {
+    "video_filename": "t2v_shot1_step_000400_20250923_130548.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000400_20250923_130548.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_130548",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130556_t2v_shot1_step_000400_20250923_130556": {
+    "video_filename": "t2v_shot1_step_000400_20250923_130556.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000400_20250923_130556.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1",
+    "timestamp": "20250923_130556",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130701_v2v_shot1_step_000400_20250923_130701": {
+    "video_filename": "v2v_shot1_step_000400_20250923_130701.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000400_20250923_130701.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_130701",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130934_t2v_shot1_step_000500_20250923_130934": {
+    "video_filename": "t2v_shot1_step_000500_20250923_130934.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000500_20250923_130934.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_130934",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_130942_t2v_shot1_step_000500_20250923_130942": {
+    "video_filename": "t2v_shot1_step_000500_20250923_130942.mp4",
+    "video_path": "./scenario/t2v_shot1_step_000500_20250923_130942.mp4",
+    "prompt": "a professional portrait video of a guy playing an instrument",
+    "scenario": "shot1",
+    "timestamp": "20250923_130942",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  },
+  "video_20250923_131002_v2v_shot1_step_000500_20250923_131002": {
+    "video_filename": "v2v_shot1_step_000500_20250923_131002.mp4",
+    "video_path": "./scenario/v2v_shot1_step_000500_20250923_131002.mp4",
+    "prompt": null,
+    "scenario": "shot1,transition,shot2",
+    "timestamp": "20250923_131002",
+    "generation_params": {
+      "fps": 24,
+      "frame_count": 17,
+      "resolution": {
+        "width": 768,
+        "height": 448
+      }
+    },
+    "generation_type": "SGMultiShotPipeline"
+  }
+}
